@@ -1,4 +1,6 @@
-
+import { useState } from 'react'
+import Honeypots from './pages/Honeypots' 
+import Profiles from './pages/Profiles'
 import CRTWarp from './components/CRTWarp'
 import Sidebar from './components/layout/Sidebar'
 import Topbar from './components/layout/Topbar'
@@ -11,6 +13,9 @@ const stats = [
 ]
 
 function App() {
+  const [currentPage, setCurrentPage] = useState<
+  'Dashboard' | 'Honeypots' | 'Profiles'
+>('Dashboard')
   return (
     <main className="relative min-h-screen overflow-hidden bg-[#100a09] text-[#e8dfda]">
       <div className="pointer-events-none fixed inset-0 z-0">
@@ -39,12 +44,16 @@ function App() {
       </div>
 
       <div className="relative z-10 flex min-h-screen">
-        <Sidebar />
+      <Sidebar
+  activePage={currentPage}
+  onNavigate={setCurrentPage}
+/>
 
         <div className="min-w-0 flex-1">
           <Topbar />
 
-          <section className="space-y-6 p-6">
+          {currentPage === 'Dashboard' ? (
+  <section className="space-y-6 p-6">
             <div>
               <p className="text-sm text-white/45">
                 Welcome back, Operator
@@ -136,7 +145,12 @@ function App() {
                 </div>
               </section>
             </div>
-          </section>
+            </section>
+) : currentPage === 'Honeypots' ? (
+  <Honeypots />
+) : (
+  <Profiles />
+)}
         </div>
       </div>
     </main>
