@@ -1,8 +1,10 @@
 import FuzzyText from '../FuzzyText'
-type PageName = 'Dashboard' | 'Honeypots' | 'Profiles'
+type PageName = 'Dashboard' | 'Honeypots' | 'Profiles' | 'ConnectServer' | 'CreateHoneypot'
 
 const navItems = [
   { label: 'Dashboard', icon: '◫' },
+  { label: 'Connect Server', icon: '⌘' },
+  { label: 'Create Honeypot', icon: '+' },
   { label: 'Honeypots', icon: '⌘' },
   { label: 'Profiles', icon: '◎' },
   { label: 'Live Feed', icon: '⌁' },
@@ -42,22 +44,32 @@ export default function Sidebar({
 
       <nav className="flex flex-col gap-1">
         {navItems.map((item) => {
-          const isActive = item.label === activePage
+          const isActive =
+          item.label === 'Connect Server'
+            ? activePage === 'ConnectServer'
+            : item.label === 'Create Honeypot'
+              ? activePage === 'CreateHoneypot'
+              : item.label === activePage
           const isAvailable =
   item.label === 'Dashboard' ||
+  item.label === 'Create Honeypot' ||
   item.label === 'Honeypots' ||
-  item.label === 'Profiles'
+  item.label === 'Profiles'  ||
+  item.label === 'Connect Server'
 
           return (
             <button
               key={item.label}
               type="button"
               disabled={!isAvailable}
-              onClick={() => {
-                if (item.label === 'Dashboard') onNavigate('Dashboard')
-                if (item.label === 'Honeypots') onNavigate('Honeypots')
-                if (item.label === 'Profiles') onNavigate('Profiles')
-              }}
+              
+onClick={() => {
+  if (item.label === 'Dashboard') onNavigate('Dashboard')
+  if (item.label === 'Honeypots') onNavigate('Honeypots')
+  if (item.label === 'Create Honeypot') onNavigate('CreateHoneypot')
+  if (item.label === 'Profiles') onNavigate('Profiles')
+  if (item.label === 'Connect Server') onNavigate('ConnectServer')
+}}
               className={`flex items-center gap-3 rounded-lg px-3 py-3 text-left text-sm transition ${
                 isActive
                   ? 'border border-orange-500/20 bg-orange-500/10 text-[#f1a36b]'

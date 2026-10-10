@@ -1,3 +1,6 @@
+import { initialHoneypots, type Honeypot } from './data/honeypots'
+import ConnectServer from './pages/ConnectServer'
+import CreateHoneypot from './pages/CreateHoneypot'
 import Auth from './pages/Auth'
 import { useState } from 'react'
 import Honeypots from './pages/Honeypots' 
@@ -15,8 +18,13 @@ const stats = [
 
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false)
+  const [honeypots, setHoneypots] = useState<Honeypot[]>(initialHoneypots)
   const [currentPage, setCurrentPage] = useState<
-  'Dashboard' | 'Honeypots' | 'Profiles'
+  | 'Dashboard'
+  | 'Honeypots'
+  | 'Profiles'
+  | 'ConnectServer'
+  | 'CreateHoneypot'
 >('Dashboard')
   return (
     <main className="relative min-h-screen overflow-hidden bg-[#100a09] text-[#e8dfda]">
@@ -151,7 +159,15 @@ function App() {
             </div>
             </section>
 ) : currentPage === 'Honeypots' ? (
-  <Honeypots />
+  <Honeypots honeypots={honeypots} />
+) : currentPage === 'ConnectServer' ? (
+  <ConnectServer />
+) : currentPage === 'CreateHoneypot' ? (
+  <CreateHoneypot
+  onCreateHoneypot={(newHoneypot) => {
+    setHoneypots((current) => [newHoneypot, ...current])
+  }}
+/>
 ) : (
   <Profiles />
 )}
