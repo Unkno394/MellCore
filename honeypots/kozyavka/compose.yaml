@@ -1,0 +1,21 @@
+services:
+  honeypot:
+    build: .
+    ports:
+      - "127.0.0.1:2222:2222"
+    volumes:
+      - ./config/docker.json:/etc/honeyforge/config.json:ro
+    environment:
+      RUST_LOG: info
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    stop_grace_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

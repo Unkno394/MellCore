@@ -1,0 +1,6 @@
+{
+  "bind_address": "0.0.0.0",
+  "port": 2222,
+  "banner": "SSH-2.0-OpenSSH_9.6",
+  "trap_id": "9a8a8262-556b-43c4-a73f-736c32556721"
+}
