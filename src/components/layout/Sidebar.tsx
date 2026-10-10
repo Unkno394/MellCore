@@ -28,7 +28,7 @@ export default function Sidebar({
 
         <div>
           <div className="text-sm font-bold tracking-[0.2em] text-[#f1a36b]">
-            HONEYPOT
+          MellCore
           </div>
           <div className="mt-1 text-[10px] uppercase tracking-widest text-white/40">
             Threat monitoring

@@ -1,3 +1,4 @@
+import Auth from './pages/Auth'
 import { useState } from 'react'
 import Honeypots from './pages/Honeypots' 
 import Profiles from './pages/Profiles'
@@ -13,6 +14,7 @@ const stats = [
 ]
 
 function App() {
+  const [isAuthenticated, setIsAuthenticated] = useState(false)
   const [currentPage, setCurrentPage] = useState<
   'Dashboard' | 'Honeypots' | 'Profiles'
 >('Dashboard')
@@ -43,7 +45,9 @@ function App() {
         />
       </div>
 
-      <div className="relative z-10 flex min-h-screen">
+      {isAuthenticated ? (
+  <div className="relative z-10 flex min-h-screen">
+
       <Sidebar
   activePage={currentPage}
   onNavigate={setCurrentPage}
@@ -152,7 +156,12 @@ function App() {
   <Profiles />
 )}
         </div>
-      </div>
+        </div>
+) : (
+  <div className="relative z-10">
+    <Auth onAuthenticated={() => setIsAuthenticated(true)} />
+  </div>
+)}
     </main>
   )
 }
