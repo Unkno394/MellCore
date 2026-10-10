@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "batch_id": "6a6ee3a5-c08d-4940-a285-1e02d47583a7",
+  "agent_id": "2f506e90-273e-485c-8a22-1b38f8c54b16",
+  "server_id": "1d7056ee-e381-41cf-833c-7c1c9e4b8a6b",
+  "events": [
+    {
+      "event_id": "a1545ba0-c65a-42c9-b7e3-7b8d07c01d28",
+      "trap_id": "550e8400-e29b-41d4-a716-446655440000",
+      "session_id": "cowrie-session-123",
+      "sequence_no": 1,
+      "event_type": "auth.failed",
+      "occurred_at": "2026-10-10T11:59:59.123456Z",
+      "source_ip": "192.0.2.15",
+      "source_port": 50124,
+      "destination_port": 22,
+      "protocol": "tcp",
+      "service_type": "ssh",
+      "payload": { "username": "admin" },
+      "metadata": {
+        "source": "cowrie",
+        "source_event_type": "cowrie.login.failed"
+      }
+    }
+  ]
+}

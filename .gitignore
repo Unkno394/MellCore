@@ -1,1 +1,27 @@
 /target
+
+# All nested Rust packages retain their own Cargo.lock files.
+target/
+**/target/
+
+# Local configuration and credentials (reviewed examples may be committed).
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Runtime data, logs and temporary files.
+*.log
+*.dump
+*.sqlite
+*.sqlite3
+*.db
+events.jsonl
+data/
+tmp/
+__pycache__/
+*.pyc
+*.tmp
+*.swp
+.DS_Store
