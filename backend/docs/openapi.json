@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "HoneyForge Backend",
-    "description": "Management API: public name/email/password registration, email login and Bearer JWT. Public registration always grants user role. SMTP supports password reset and one-time email verification. REQUIRE_EMAIL_VERIFICATION enables a verification gate without changing API shapes. CORS permits only the configured FRONTEND_URL origin. Profiles are shared templates; only administrators modify them. Servers and traps are scoped to the authenticated owner; Viewer is read-only. Registration and desired state do not deploy anything. Port reservations are exclusive per registered server/protocol/port; dispatcher backends use distinct TCP ports. SSH deployment, dispatcher execution and telemetry ingestion are not implemented.",
+    "description": "Management API and internal telemetry ingestion. Public registration always grants user role. Email login uses Bearer JWT. Profiles are shared templates; only administrators modify them. Servers and traps are owner-scoped. Registration and desired state do not deploy anything. Port reservations are exclusive per registered server/protocol/port; dispatcher backends use distinct TCP ports. Pritvoryashka telemetry uses an independent opaque bearer token, validates trap/server ownership and is stored idempotently in PostgreSQL. SSH deployment and dispatcher execution are not implemented.",
     "license": {
       "name": ""
     },
@@ -1673,6 +1673,97 @@
         ]
       }
     },
+    "/api/v1/traps/{trap_id}/events": {
+      "get": {
+        "tags": [
+          "telemetry"
+        ],
+        "operationId": "list",
+        "parameters": [
+          {
+            "name": "trap_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttackEventPage"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Trap missing or owned by another user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/api/v1/traps/{trap_id}/runtime-config": {
       "get": {
         "tags": [
@@ -1696,7 +1787,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/KozyavkaRuntimeConfig"
+                  "$ref": "#/components/schemas/RuntimeConfig"
                 }
               }
             }
@@ -2082,7 +2173,7 @@
         "operationId": "ready",
         "responses": {
           "200": {
-            "description": "Management database ready; telemetry pipeline not yet implemented",
+            "description": "Management database and telemetry storage schema are ready",
             "content": {
               "application/json": {
                 "schema": {
@@ -2102,6 +2193,77 @@
             }
           }
         }
+      }
+    },
+    "/internal/v1/telemetry/batches": {
+      "post": {
+        "tags": [
+          "telemetry"
+        ],
+        "summary": "Internal agent endpoint. The bearer token is independent from user JWTs.",
+        "operationId": "ingest",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TelemetryBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "telemetry_bearer": []
+          }
+        ]
       }
     }
   },
@@ -2158,6 +2320,27 @@
           }
         ],
         "description": "Internal canonical record, created only after sender/trap authorization.\nOn retries storage MUST reuse the first persisted record and its timestamps."
+      },
+      "AttackEventPage": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttackEvent"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          }
+        }
       },
       "CommandType": {
         "type": "string",
@@ -2218,6 +2401,14 @@
           }
         },
         "additionalProperties": false
+      },
+      "CredentialCapture": {
+        "type": "string",
+        "enum": [
+          "none",
+          "username",
+          "password"
+        ]
       },
       "DesiredState": {
         "type": "string",
@@ -2356,6 +2547,28 @@
           }
         },
         "additionalProperties": false
+      },
+      "IngestResponse": {
+        "type": "object",
+        "required": [
+          "batch_id",
+          "accepted_events",
+          "duplicate_events"
+        ],
+        "properties": {
+          "accepted_events": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "batch_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "duplicate_events": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
       },
       "JobPhase": {
         "type": "string",
@@ -2540,6 +2753,68 @@
           }
         }
       },
+      "PritvoryashkaRuntimeConfig": {
+        "type": "object",
+        "required": [
+          "bind",
+          "health_bind",
+          "trap_id",
+          "server_id",
+          "agent_id",
+          "hostname",
+          "host_key",
+          "auth",
+          "telemetry",
+          "max_connections",
+          "idle_timeout_seconds",
+          "max_input_bytes"
+        ],
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "auth": {
+            "$ref": "#/components/schemas/RuntimeAuth"
+          },
+          "bind": {
+            "type": "string"
+          },
+          "health_bind": {
+            "type": "string"
+          },
+          "host_key": {
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "idle_timeout_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_connections": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "max_input_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "server_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "telemetry": {
+            "$ref": "#/components/schemas/RuntimeTelemetry"
+          },
+          "trap_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
       "Profile": {
         "type": "object",
         "required": [
@@ -2703,6 +2978,94 @@
           "direct",
           "dispatcher_backend"
         ]
+      },
+      "RuntimeAuth": {
+        "type": "object",
+        "required": [
+          "policy",
+          "capture",
+          "max_attempts"
+        ],
+        "properties": {
+          "capture": {
+            "$ref": "#/components/schemas/CredentialCapture"
+          },
+          "max_attempts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "password_env": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "policy": {
+            "type": "string"
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "RuntimeConfig": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/KozyavkaRuntimeConfig"
+          },
+          {
+            "$ref": "#/components/schemas/PritvoryashkaRuntimeConfig"
+          }
+        ]
+      },
+      "RuntimeTelemetry": {
+        "type": "object",
+        "required": [
+          "queue_capacity",
+          "batch_size",
+          "flush_interval_ms",
+          "max_event_bytes"
+        ],
+        "properties": {
+          "batch_size": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endpoint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "flush_interval_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "jsonl_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_event_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "queue_capacity": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "token_env": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
       },
       "Server": {
         "type": "object",
@@ -3303,6 +3666,11 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "JWT"
+      },
+      "telemetry_bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque agent token"
       }
     }
   }

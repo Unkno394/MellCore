@@ -123,3 +123,41 @@ fn frontend_origin_paths_and_smtp_tls_are_explicit_and_secrets_redacted() {
     assert_eq!(smtp.smtp.as_ref().unwrap().port, 587);
     assert!(!format!("{smtp:?}").contains("never-log"));
 }
+
+#[test]
+fn telemetry_public_endpoint_is_operator_controlled_and_requires_https_or_loopback() {
+    let secret = "x".repeat(32);
+    assert!(
+        config(&[
+            ("TELEMETRY_INGEST_TOKEN", &secret),
+            (
+                "TELEMETRY_PUBLIC_ENDPOINT",
+                "https://honeyforge.example/internal/v1/telemetry/batches",
+            ),
+        ])
+        .is_ok()
+    );
+    assert!(
+        config(&[
+            ("TELEMETRY_INGEST_TOKEN", &secret),
+            (
+                "TELEMETRY_PUBLIC_ENDPOINT",
+                "http://127.0.0.1:8080/internal/v1/telemetry/batches",
+            ),
+        ])
+        .is_ok()
+    );
+    for endpoint in [
+        "http://honeyforge.example/internal/v1/telemetry/batches",
+        "https://user:secret@honeyforge.example/internal/v1/telemetry/batches",
+        "https://honeyforge.example/wrong",
+    ] {
+        let error = config(&[
+            ("TELEMETRY_INGEST_TOKEN", &secret),
+            ("TELEMETRY_PUBLIC_ENDPOINT", endpoint),
+        ])
+        .unwrap_err();
+        assert_eq!(error.key, "TELEMETRY_PUBLIC_ENDPOINT");
+        assert!(!error.to_string().contains("secret"));
+    }
+}

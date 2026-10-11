@@ -12,7 +12,9 @@ pub mod password_reset;
 pub mod infrastructure;
 pub mod resources;
 
+pub mod dispatcher;
 pub mod email_verification;
 pub mod kozyavka;
 pub mod mail;
-pub mod dispatcher;
+pub mod pritvoryashka;
+pub mod runtime;

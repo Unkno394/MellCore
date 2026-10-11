@@ -105,6 +105,9 @@ impl ProfileInput {
         if self.honeypot_type == "kozyavka" {
             crate::kozyavka::validate_profile(self.level, &self.service_type, &self.config)?;
         }
+        if self.honeypot_type == "pritvoryashka" {
+            crate::pritvoryashka::validate_profile(self.level, &self.service_type, &self.config)?;
+        }
         Ok(())
     }
 }

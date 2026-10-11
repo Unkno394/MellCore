@@ -1,0 +1,27 @@
+{
+  "bind": "127.0.0.1:2222",
+  "health_bind": "127.0.0.1:9091",
+  "trap_id": "550e8400-e29b-41d4-a716-446655440000",
+  "server_id": "1d7056ee-e381-41cf-833c-7c1c9e4b8a6b",
+  "agent_id": "2f506e90-273e-485c-8a22-1b38f8c54b16",
+  "hostname": "srv-app-01",
+  "host_key": "./honeypots/pritvoryashka/host_ed25519",
+  "auth": {
+    "policy": "accept_all",
+    "capture": "username",
+    "max_attempts": 6
+  },
+  "telemetry": {
+    "endpoint": null,
+    "token_env": null,
+    "jsonl_path": "./pritvoryashka-events.jsonl",
+    "queue_capacity": 1024,
+    "batch_size": 50,
+    "flush_interval_ms": 500,
+    "max_event_bytes": 65536
+  },
+  "max_connections": 128,
+  "idle_timeout_seconds": 600,
+  "max_input_bytes": 8192
+}
+

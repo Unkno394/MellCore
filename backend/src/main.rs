@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api::router(&config)
     };
     let listener = TcpListener::bind(config.bind).await?;
-    tracing::info!(address = %listener.local_addr()?, management_database = database.is_some(), "HTTP listener started; telemetry is not yet available");
+    tracing::info!(address = %listener.local_addr()?, management_database = database.is_some(), telemetry_ingestion = config.telemetry_ingest_token.is_some(), "HTTP listener started");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await?;

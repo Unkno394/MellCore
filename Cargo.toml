@@ -1,5 +1,12 @@
 [workspace]
-members = ["crates/hf-core", "crates/hf-services", "crates/hf-center", "crates/hf-agent", "crates/hf-dispatcher"]
+members = [
+    "crates/hf-core",
+    "crates/hf-services",
+    "crates/hf-center",
+    "crates/hf-agent",
+    "crates/hf-dispatcher",
+    "honeypots/pritvoryashka",
+]
 exclude = ["backend", "honeypots/kozyavka"]
 resolver = "3"
 

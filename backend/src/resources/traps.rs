@@ -28,6 +28,10 @@ async fn snapshot(
         crate::kozyavka::validate_profile(profile.level, &profile.service_type, &effective)?;
         crate::kozyavka::validate_ports(&input.ports)?;
     }
+    if profile.honeypot_type == "pritvoryashka" {
+        crate::pritvoryashka::validate_profile(profile.level, &profile.service_type, &effective)?;
+        crate::pritvoryashka::validate_ports(&input.ports)?;
+    }
     Ok((profile, effective))
 }
 async fn reserve(

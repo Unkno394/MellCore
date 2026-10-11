@@ -1,4 +1,4 @@
-use super::{PASSWORD, Session, login, profile, request};
+use super::{PASSWORD, Session, TELEMETRY_TOKEN, login, profile, request};
 use axum::{Router, http::StatusCode};
 use honeyforge_backend::{
     api::{AppState, router_with_state},
@@ -395,12 +395,13 @@ pub async fn run(parent: &sqlx::PgPool, url: &str, config: &Config) {
         call(&app, "GET", &path, Some(&a), Value::Null, 200).await,
         sa
     );
-    // Multi-port failed replacement rolls back config/version and every reservation.
+    // A multi-port replacement that collides with the server's dispatcher
+    // listener rolls back config/version and every reservation.
     let mut bad_update = trap(
         profile_id,
         vec![
             binding(8081, "tcp", "direct"),
-            binding(9000, "tcp", "direct"),
+            binding(4000, "tcp", "direct"),
         ],
     );
     bad_update["name"] = json!("rolled back");
@@ -665,6 +666,169 @@ pub async fn run(parent: &sqlx::PgPool, url: &str, config: &Config) {
     assert_eq!(runtime["port"], 2224);
     assert_eq!(runtime["banner"], "SSH-2.0-kozyavka");
     call(&app, "DELETE", &kp, Some(&a), Value::Null, 204).await;
+
+    // Native Middle profile exports a directly consumable runtime config and its
+    // canonical events are accepted idempotently by the existing backend.
+    let middle_profile = honeyforge_backend::pritvoryashka::PROFILE_ID.to_string();
+    let middle_catalog = call(
+        &app,
+        "GET",
+        &format!("/api/v1/profiles/{middle_profile}"),
+        Some(&a),
+        Value::Null,
+        200,
+    )
+    .await;
+    assert_eq!(middle_catalog["level"], "medium");
+    let middle_input = json!({
+        "name":"Pritvoryashka",
+        "profile_id":middle_profile,
+        "config":{},
+        "desired_state":"stopped",
+        "ports":[{"host_port":2223,"target_port":2222,"transport":"tcp","route_mode":"direct"}]
+    });
+    let middle = call(
+        &app,
+        "POST",
+        "/api/v1/traps",
+        Some(&a),
+        json!({"server_id":sid2,"trap":middle_input}),
+        201,
+    )
+    .await;
+    let middle_path = format!("/api/v1/traps/{}", middle["trap_id"].as_str().unwrap());
+    let middle_runtime = call(
+        &app,
+        "GET",
+        &format!("{middle_path}/runtime-config"),
+        Some(&a),
+        Value::Null,
+        200,
+    )
+    .await;
+    assert_eq!(middle_runtime["bind"], "0.0.0.0:2222");
+    assert_eq!(middle_runtime["auth"]["policy"], "accept_all");
+    assert_eq!(
+        middle_runtime["telemetry"]["endpoint"],
+        "http://127.0.0.1:8080/internal/v1/telemetry/batches"
+    );
+    assert_eq!(
+        middle_runtime["telemetry"]["token_env"],
+        "PRITVORYASHKA_TELEMETRY_TOKEN"
+    );
+    let telemetry = Session {
+        token: TELEMETRY_TOKEN.into(),
+    };
+    let event_id = Uuid::new_v4();
+    let batch_id = Uuid::new_v4();
+    let event = json!({
+        "event_id":event_id,
+        "trap_id":middle["trap_id"],
+        "session_id":Uuid::new_v4().to_string(),
+        "sequence_no":1,
+        "event_type":"command.executed",
+        "occurred_at":chrono::Utc::now(),
+        "source_ip":"192.0.2.15",
+        "source_port":50124,
+        "destination_port":2222,
+        "protocol":"tcp",
+        "service_type":"ssh",
+        "payload":{"command":"pwd"},
+        "metadata":{"source":"pritvoryashka"}
+    });
+    let batch = json!({
+        "schema_version":1,
+        "batch_id":batch_id,
+        "agent_id":sid2,
+        "server_id":sid2,
+        "events":[event]
+    });
+    let accepted = call(
+        &app,
+        "POST",
+        "/internal/v1/telemetry/batches",
+        Some(&telemetry),
+        batch.clone(),
+        202,
+    )
+    .await;
+    assert_eq!(accepted["accepted_events"], 1);
+    let replay = call(
+        &app,
+        "POST",
+        "/internal/v1/telemetry/batches",
+        Some(&telemetry),
+        batch.clone(),
+        202,
+    )
+    .await;
+    assert_eq!(replay["duplicate_events"], 1);
+    let mut same_event_new_batch = batch.clone();
+    same_event_new_batch["batch_id"] = json!(Uuid::new_v4());
+    let replay = call(
+        &app,
+        "POST",
+        "/internal/v1/telemetry/batches",
+        Some(&telemetry),
+        same_event_new_batch,
+        202,
+    )
+    .await;
+    assert_eq!(replay["duplicate_events"], 1);
+    let wrong = Session {
+        token: "wrong-telemetry-token".into(),
+    };
+    call(
+        &app,
+        "POST",
+        "/internal/v1/telemetry/batches",
+        Some(&wrong),
+        batch,
+        401,
+    )
+    .await;
+    let events_path = format!("{middle_path}/events");
+    call(&app, "GET", &events_path, None, Value::Null, 401).await;
+    call(
+        &app,
+        "GET",
+        &events_path,
+        Some(&telemetry),
+        Value::Null,
+        401,
+    )
+    .await;
+    call(&app, "GET", &events_path, Some(&b), Value::Null, 404).await;
+    let events = call(&app, "GET", &events_path, Some(&a), Value::Null, 200).await;
+    assert_eq!(events["items"].as_array().unwrap().len(), 1);
+    assert_eq!(events["items"][0]["event_id"], event_id.to_string());
+    assert_eq!(events["items"][0]["payload"]["command"], "pwd");
+    assert!(events["next_cursor"].is_null());
+    call(
+        &app,
+        "GET",
+        &format!("{events_path}?limit=0"),
+        Some(&a),
+        Value::Null,
+        422,
+    )
+    .await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM attack_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    sqlx::query("DELETE FROM attack_events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM telemetry_batches")
+        .execute(&pool)
+        .await
+        .unwrap();
+    call(&app, "DELETE", &middle_path, Some(&a), Value::Null, 204).await;
 
     // Demotion preserves reads but removes all mutation rights and revokes old JWT.
     let account_path = format!("/api/v1/users/{}", a_user["id"].as_str().unwrap());

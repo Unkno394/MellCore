@@ -8,6 +8,7 @@ target/
 .env
 .env.*
 !.env.example
+pritvoryashka.json
 *.pem
 *.key
 
@@ -18,6 +19,8 @@ target/
 *.sqlite3
 *.db
 events.jsonl
+pritvoryashka-events.jsonl
+honeypots/pritvoryashka/host_*
 data/
 tmp/
 __pycache__/

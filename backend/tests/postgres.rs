@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 const ORIGIN: &str = "http://127.0.0.1:8080";
 const PASSWORD: &str = "test-only-long-password";
+const TELEMETRY_TOKEN: &str = "test-only-telemetry-token-32-bytes-long";
 
 struct Session {
     token: String,
@@ -104,6 +105,10 @@ async fn postgres_management_and_security_end_to_end() {
             "APP_ORIGIN" => Some(ORIGIN.into()),
             "JWT_SECRET" => Some("test-only-signing-secret-at-least-32-bytes".into()),
             "LOGIN_PER_MINUTE" => Some("100".into()),
+            "TELEMETRY_INGEST_TOKEN" => Some(TELEMETRY_TOKEN.into()),
+            "TELEMETRY_PUBLIC_ENDPOINT" => {
+                Some("http://127.0.0.1:8080/internal/v1/telemetry/batches".into())
+            }
             _ => None,
         })
     })
@@ -467,14 +472,14 @@ async fn postgres_management_and_security_end_to_end() {
     )
     .await
     .1;
-    assert_eq!(third_page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(third_page["items"].as_array().unwrap().len(), 2);
     assert!(third_page["next_cursor"].is_null());
     let unique: std::collections::HashSet<_> = [&first_page, &second_page, &third_page]
         .into_iter()
         .flat_map(|page| page["items"].as_array().unwrap())
         .map(|item| item["id"].as_str().unwrap())
         .collect();
-    assert_eq!(unique.len(), 5);
+    assert_eq!(unique.len(), 6);
     assert_eq!(
         request(&app, "DELETE", &path, Some(&admin), Value::Null)
             .await

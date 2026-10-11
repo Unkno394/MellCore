@@ -30,6 +30,8 @@ pub struct Config {
     pub log_filter: String,
     pub http_max_body_bytes: usize,
     pub telemetry: TelemetryLimits,
+    pub telemetry_ingest_token: Option<Secret>,
+    pub telemetry_public_endpoint: Option<String>,
     pub integration_mode: IntegrationMode,
     pub database_url: Option<Secret>,
     pub database_allow_insecure_local: bool,
@@ -223,6 +225,45 @@ impl Config {
                 reason: "requires at least 32 bytes of random secret material",
             });
         }
+        let telemetry_ingest_token = lookup("TELEMETRY_INGEST_TOKEN")?
+            .filter(|value| !value.is_empty())
+            .map(Secret);
+        if telemetry_ingest_token
+            .as_ref()
+            .is_some_and(|secret| secret.expose().len() < 32)
+        {
+            return Err(ConfigError {
+                key: "TELEMETRY_INGEST_TOKEN",
+                reason: "requires at least 32 bytes of random secret material",
+            });
+        }
+        let telemetry_public_endpoint =
+            lookup("TELEMETRY_PUBLIC_ENDPOINT")?.filter(|value| !value.is_empty());
+        if let Some(endpoint) = &telemetry_public_endpoint {
+            let url =
+                url::Url::parse(endpoint).map_err(|_| parse_error("TELEMETRY_PUBLIC_ENDPOINT"))?;
+            let loopback = url.host_str().is_some_and(|host| {
+                host == "localhost"
+                    || host
+                        .trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            });
+            if url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || url.path() != "/internal/v1/telemetry/batches"
+                || (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
+                || telemetry_ingest_token.is_none()
+            {
+                return Err(ConfigError {
+                    key: "TELEMETRY_PUBLIC_ENDPOINT",
+                    reason: "requires the telemetry batch path, HTTPS (or loopback HTTP), and TELEMETRY_INGEST_TOKEN",
+                });
+            }
+        }
         let smtp_host = lookup("SMTP_HOST")?;
         let smtp_user = lookup("SMTP_USERNAME")?;
         let smtp_password = lookup("SMTP_PASSWORD")?;
@@ -261,6 +302,8 @@ impl Config {
             log_filter,
             http_max_body_bytes,
             telemetry,
+            telemetry_ingest_token,
+            telemetry_public_endpoint,
             integration_mode: get("INTEGRATION_MODE", "mock")?
                 .parse()
                 .map_err(|_| parse_error("INTEGRATION_MODE"))?,

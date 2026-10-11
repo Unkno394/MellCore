@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod profiles;
 pub mod servers;
+pub mod telemetry;
 pub mod traps;
 pub mod users;
 
@@ -115,9 +116,9 @@ pub struct HealthResponse {
     info(
         title = "HoneyForge Backend",
         version = "0.1.0",
-        description = "Management API: public name/email/password registration, email login and Bearer JWT. Public registration always grants user role. SMTP supports password reset and one-time email verification. REQUIRE_EMAIL_VERIFICATION enables a verification gate without changing API shapes. CORS permits only the configured FRONTEND_URL origin. Profiles are shared templates; only administrators modify them. Servers and traps are scoped to the authenticated owner; Viewer is read-only. Registration and desired state do not deploy anything. Port reservations are exclusive per registered server/protocol/port; dispatcher backends use distinct TCP ports. SSH deployment, dispatcher execution and telemetry ingestion are not implemented."
+        description = "Management API and internal telemetry ingestion. Public registration always grants user role. Email login uses Bearer JWT. Profiles are shared templates; only administrators modify them. Servers and traps are owner-scoped. Registration and desired state do not deploy anything. Port reservations are exclusive per registered server/protocol/port; dispatcher backends use distinct TCP ports. Pritvoryashka telemetry uses an independent opaque bearer token, validates trap/server ownership and is stored idempotently in PostgreSQL. SSH deployment and dispatcher execution are not implemented."
     ),
-    paths(live, ready, auth::register, auth::verify_email, auth::resend_verification, auth::forgot_password, auth::reset_password, auth::login, auth::me, auth::logout, users::create, users::list, users::get, users::update, users::delete, profiles::create, profiles::list, profiles::get, profiles::update, profiles::delete, servers::create, servers::list, servers::get, servers::update, servers::delete, servers::ports, traps::create, traps::list, traps::get, traps::update, traps::delete, traps::runtime_config),
+    paths(live, ready, auth::register, auth::verify_email, auth::resend_verification, auth::forgot_password, auth::reset_password, auth::login, auth::me, auth::logout, users::create, users::list, users::get, users::update, users::delete, profiles::create, profiles::list, profiles::get, profiles::update, profiles::delete, servers::create, servers::list, servers::get, servers::update, servers::delete, servers::ports, traps::create, traps::list, traps::get, traps::update, traps::delete, traps::runtime_config, telemetry::ingest, telemetry::list),
     modifiers(&SecuritySchemes),
     components(schemas(
         HealthResponse,
@@ -151,6 +152,15 @@ impl utoipa::Modify for SecuritySchemes {
                         .build(),
                 ),
             );
+            components.add_security_scheme(
+                "telemetry_bearer",
+                utoipa::openapi::security::SecurityScheme::Http(
+                    utoipa::openapi::security::HttpBuilder::new()
+                        .scheme(utoipa::openapi::security::HttpAuthScheme::Bearer)
+                        .bearer_format("opaque agent token")
+                        .build(),
+                ),
+            );
         }
     }
 }
@@ -171,6 +181,7 @@ pub fn router_with_state(state: AppState) -> Router {
     let mut app = Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
+        .route("/internal/v1/telemetry/batches", post(telemetry::ingest))
         .route("/api/v1/auth/register", post(auth::register))
         .route("/api/v1/auth/verify-email", post(auth::verify_email))
         .route(
@@ -195,6 +206,7 @@ pub fn router_with_state(state: AppState) -> Router {
             "/api/v1/traps/{trap_id}/runtime-config",
             get(traps::runtime_config),
         )
+        .route("/api/v1/traps/{trap_id}/events", get(telemetry::list))
         .route(
             "/api/v1/traps/{trap_id}",
             get(traps::get).put(traps::update).delete(traps::delete),
@@ -253,7 +265,7 @@ async fn live() -> Json<HealthResponse> {
     })
 }
 
-#[utoipa::path(get, path = "/health/ready", tag = "health", responses((status=200, description="Management database ready; telemetry pipeline not yet implemented", body=HealthResponse), (status = 503, description = "Management database unavailable", body = ErrorResponse)))]
+#[utoipa::path(get, path = "/health/ready", tag = "health", responses((status=200, description="Management database and telemetry storage schema are ready", body=HealthResponse), (status = 503, description = "Management database unavailable", body = ErrorResponse)))]
 async fn ready(State(state): State<AppState>, Extension(id): Extension<RequestId>) -> Response {
     if let Some(pool) = state.database {
         return match tokio::time::timeout(

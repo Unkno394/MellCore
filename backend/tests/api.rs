@@ -55,7 +55,7 @@ async fn documentation_is_disabled_by_default() {
 }
 
 #[tokio::test]
-async fn openapi_contains_contracts_but_no_fictitious_ingestion_endpoint() {
+async fn openapi_contains_management_and_telemetry_contracts() {
     let response = router(&config(true))
         .oneshot(
             Request::builder()
@@ -71,7 +71,11 @@ async fn openapi_contains_contracts_but_no_fictitious_ingestion_endpoint() {
     assert!(body["components"]["schemas"]["TelemetryBatch"].is_object());
     assert!(body["components"]["schemas"]["AttackEvent"].is_object());
     assert!(body["paths"]["/health/live"]["get"].is_object());
-    assert!(body["paths"]["/internal/v1/telemetry/batches"].is_null());
+    assert!(body["paths"]["/internal/v1/telemetry/batches"]["post"].is_object());
+    assert_eq!(
+        body["paths"]["/internal/v1/telemetry/batches"]["post"]["security"],
+        serde_json::json!([{"telemetry_bearer":[]}])
+    );
     assert_eq!(
         body["components"]["securitySchemes"]["bearer"]["scheme"],
         "bearer"
@@ -94,6 +98,7 @@ async fn openapi_contains_contracts_but_no_fictitious_ingestion_endpoint() {
         "/api/v1/traps",
         "/api/v1/traps/{trap_id}",
         "/api/v1/traps/{trap_id}/runtime-config",
+        "/api/v1/traps/{trap_id}/events",
     ] {
         for operation in body["paths"][route].as_object().unwrap().values() {
             assert_eq!(operation["security"], serde_json::json!([{"bearer":[]}]));
@@ -204,17 +209,19 @@ async fn unsupported_methods_have_a_json_error() {
 
 #[tokio::test]
 async fn telemetry_is_never_acknowledged_before_storage_exists() {
+    let body = include_bytes!("../docs/examples/telemetry-v1.json");
     let response = router(&config(false))
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/internal/v1/telemetry/batches")
-                .body(Body::empty())
+                .header("content-type", "application/json")
+                .body(Body::from(&body[..]))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

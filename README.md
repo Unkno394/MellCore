@@ -5,6 +5,8 @@ Initial Rust workspace for the center-to-agent enrollment path.
 - `hf-core`: ports and protocol-independent domain contracts.
 - `hf-center`: HTTP control-plane skeleton, one-time enrollment-token issuer, and bootstrap adapter boundary.
 - `hf-agent`: registration client using the transport port.
+- `honeypots/pritvoryashka`: native Rust Middle Interaction SSH honeypot with an isolated virtual shell and telemetry.
+- `hf-core::math`: domain-independent ratios, percentages, Jaccard similarity and overlapping subsequence matching.
 
 Build the agent for the VPS target, then run the center:
 

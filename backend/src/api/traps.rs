@@ -13,14 +13,17 @@ use axum::{
 use uuid::Uuid;
 
 /// Export configuration only. No deployment or actual-state transition occurs.
-#[utoipa::path(get,path="/api/v1/traps/{trap_id}/runtime-config",tag="traps",security(("bearer"=[])),params(("trap_id"=Uuid,Path)),responses((status=200,body=crate::kozyavka::RuntimeConfig),(status=401,body=crate::errors::ErrorResponse),(status=403,body=crate::errors::ErrorResponse),(status=404,body=crate::errors::ErrorResponse),(status=409,description="No adapter for this profile",body=crate::errors::ErrorResponse),(status=422,body=crate::errors::ErrorResponse),(status=503,body=crate::errors::ErrorResponse)))]
+#[utoipa::path(get,path="/api/v1/traps/{trap_id}/runtime-config",tag="traps",security(("bearer"=[])),params(("trap_id"=Uuid,Path)),responses((status=200,body=crate::runtime::RuntimeConfig),(status=401,body=crate::errors::ErrorResponse),(status=403,body=crate::errors::ErrorResponse),(status=404,body=crate::errors::ErrorResponse),(status=409,description="No adapter for this profile",body=crate::errors::ErrorResponse),(status=422,body=crate::errors::ErrorResponse),(status=503,body=crate::errors::ErrorResponse)))]
 pub async fn runtime_config(
     State(state): State<AppState>,
     principal: Principal,
     Path(id): Path<Uuid>,
-) -> Result<Json<crate::kozyavka::RuntimeConfig>, AppError> {
+) -> Result<Json<crate::runtime::RuntimeConfig>, AppError> {
     let trap = resources::traps::get(state.pool()?, &principal, id).await?;
-    Ok(Json(crate::kozyavka::runtime_config(&trap)?))
+    Ok(Json(crate::runtime::for_trap(
+        &trap,
+        state.config.telemetry_public_endpoint.clone(),
+    )?))
 }
 
 #[utoipa::path(post,path="/api/v1/traps",tag="traps",security(("bearer"=[])),request_body=CreateTrap,responses((status=201,body=Trap),(status=401,body=crate::errors::ErrorResponse),(status=403,body=crate::errors::ErrorResponse),(status=404,description="Missing or owned by another user",body=crate::errors::ErrorResponse),(status=409,body=crate::errors::ErrorResponse),(status=422,body=crate::errors::ErrorResponse),(status=503,body=crate::errors::ErrorResponse)))]

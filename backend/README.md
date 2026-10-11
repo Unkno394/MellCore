@@ -19,9 +19,11 @@
 - CRUD собственных серверов и ловушек, снимки профилей, статусы и резервирование
   портов SSH/ловушек/будущего dispatcher. SSH credentials только по ссылке.
 - Профиль kozyavka для существующей отдельной Low-ловушки и экспорт её конфигурации.
-- Независимый JSON-контракт будущей телеметрии.
+- Pritvoryashka: отдельная Rust Middle Interaction SSH-ловушка с виртуальным
+  shell/VFS, adaptive deception и совместимой телеметрией.
+- Приём телеметрии v1 в PostgreSQL с проверкой trap/server и дедупликацией.
 
-**Ещё не реализованы:** агенты, ClickHouse, приём телеметрии, WebSocket,
+**Ещё не реализованы:** ClickHouse, WebSocket,
 SSH-развёртывание, HFSP, Hysteria 2, TCP Dispatcher и инфраструктурные исполнители.
 INTEGRATION_MODE=mock выбирает будущий режим; MockExecutor ещё не подключён.
 Режим real завершает запуск с integration_not_configured.
@@ -92,7 +94,8 @@ JWT_SECRET обязателен для API с PostgreSQL; migrate/bootstrap-admi
 Остановите старый API, сделайте резервную копию БД и выполните migrate с
 существующим DATABASE_URL в согласованное окно обслуживания. Добавочные миграции:
 002 — открытая авторизация, 003 — собственные серверы/ловушки/резервы портов,
-004 — подтверждение email, 005 — профиль kozyavka. Исходные миграции, UUID,
+004 — подтверждение email, 005 — профиль kozyavka, 006 — группы портов dispatcher,
+202610110001 — профиль Pritvoryashka и хранилище телеметрии. Исходные миграции, UUID,
 хеши паролей, роли, профили и аудит сохраняются.
 Не пересоздавайте БД и volume.
 
@@ -134,7 +137,9 @@ SESSION_TTL_SECONDS больше не используются.
 | /api/v1/servers, /{server_id} | CRUD собственных серверов |
 | /api/v1/servers/{server_id}/ports | GET резервов портов |
 | /api/v1/traps, /{trap_id} | CRUD собственных экземпляров ловушек |
-| /api/v1/traps/{trap_id}/runtime-config | GET JSON-конфигурации kozyavka |
+| /api/v1/traps/{trap_id}/runtime-config | GET JSON-конфигурации kozyavka или Pritvoryashka |
+| /api/v1/traps/{trap_id}/events | GET сохранённых событий собственной ловушки по JWT |
+| POST /internal/v1/telemetry/batches | Приём TelemetryBatch v1 по отдельному bearer token |
 | /docs/, /openapi.json | DOCS_ENABLED=true, только loopback bind |
 
 Авторизация: `Authorization: Bearer <access_token>`. Cookie и токены в URL не
@@ -240,7 +245,8 @@ api/ — HTTP/OpenAPI; auth.rs — пароли/JWT; password_reset.rs и email_
 очереди одноразовых токенов; mail.rs — SMTP;
 management/ — пользователи, профили, транзакции; storage.rs — PostgreSQL;
 resources/ — серверы/ловушки/порты; kozyavka.rs — конфигурационный адаптер Low;
-infrastructure.rs — будущие интерфейсы; telemetry.rs — контракт событий.
+pritvoryashka.rs и runtime.rs — адаптер Middle; infrastructure.rs — будущие
+интерфейсы; telemetry.rs — контракт событий; api/telemetry.rs — приём событий.
 
 - [Архитектура](docs/architecture.md).
 - [Контракт телеметрии](docs/telemetry-contract.md).
@@ -248,6 +254,7 @@ infrastructure.rs — будущие интерфейсы; telemetry.rs — ко
 - [Контракт и сопоставление frontend Евы](docs/frontend-integration.md).
 - [Серверы и ловушки](docs/resources-api.md).
 - [kozyavka](docs/kozyavka.md).
+- [Pritvoryashka](../honeypots/pritvoryashka/README.md).
 - [OpenAPI для frontend](docs/openapi.json).
 
 Следующий этап: согласованные страницы frontend, SMTP Леры и инфраструктурный
