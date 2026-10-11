@@ -9,6 +9,8 @@ anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 hf-core = { path = "../hf-core" }
+hf-services = { path = "../hf-services" }
+kazik-protocol = { path = "../kazik-protocol" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

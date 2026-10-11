@@ -1,0 +1,21 @@
+# Copy to a root-owned file on the HoneyForge center host and replace every CHANGE_ME value.
+# Hysteria owns public QUIC/TLS; Kazik packets exit only to the loopback UDP receiver.
+listen: :443
+
+acme:
+  domains:
+    - CHANGE_ME_hysteria.example.com
+  email: CHANGE_ME@example.com
+
+auth:
+  type: http
+  http:
+    # The Center must listen on loopback and expose this endpoint before Hysteria starts.
+    url: http://127.0.0.1:8080/v1/hysteria/auth
+
+# Unknown QUIC clients see an ordinary upstream site instead of a HoneyForge interface.
+masquerade:
+  type: proxy
+  proxy:
+    url: https://CHANGE_ME.example.com/
+    rewriteHost: true

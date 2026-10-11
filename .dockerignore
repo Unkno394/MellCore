@@ -1,0 +1,8 @@
+.git
+target
+**/target
+backend/target
+*.tar
+*.tar.gz
+*.qcow2
+*.img

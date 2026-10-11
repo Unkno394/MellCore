@@ -8,6 +8,10 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 hf-core = { path = "../hf-core" }
+kazik-protocol = { path = "../kazik-protocol" }
+rusqlite.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true

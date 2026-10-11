@@ -11,6 +11,7 @@ axum.workspace = true
 base64.workspace = true
 clap.workspace = true
 hf-core = { path = "../hf-core" }
+kazik-protocol = { path = "../kazik-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

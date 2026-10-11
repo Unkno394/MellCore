@@ -50,6 +50,28 @@ curl --fail http://127.0.0.1:9091/health/live
 curl --fail http://127.0.0.1:9091/health/ready
 ```
 
+## Развёртывание агентом
+
+Агент разворачивает Middle-профиль через `DeployPritvoryashka`: генерирует
+root-owned Compose-проект, отдельный runtime-каталог для SSH host key и публикует
+выбранный внешний TCP-порт. `agent_id` в runtime-конфиге берётся из локальной
+зарегистрированной identity агента, а не из команды центра.
+
+Собери образ один раз на CI/центральной машине из корня репозитория и передай
+архив центру при запуске. VPS получает только уже собранный образ через первое
+SSH-подключение:
+
+```sh
+docker build -f honeypots/pritvoryashka/Dockerfile -t honeyforge-pritvoryashka:local .
+docker save honeyforge-pritvoryashka:local -o pritvoryashka-image.tar
+HF_PRITVORYASHKA_IMAGE_ARCHIVE=pritvoryashka-image.tar hf-center ...
+```
+
+Контейнер создаёт уникальный ED25519 host key в смонтированном runtime-каталоге
+при первом старте. Внешний port sharing работает через `TcpPortGroup`: у member
+указывается `trap_kind: "pritvoryashka"`; отсутствующее поле сохраняет старый
+вариант `kozyavka` для обратной совместимости.
+
 ## Команды
 
 Поддержаны `pwd`, `ls`, `cd`, `cat`, `echo`, `whoami`, `id`, `uname`,

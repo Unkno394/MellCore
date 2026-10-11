@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>HoneyForge — подключение VPS</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; background:#101419; color:#e7edf3; }
+    body { max-width:900px; margin:36px auto; padding:0 18px; }
+    h1 { margin-bottom:4px; } p { color:#aebbc8; line-height:1.45; }
+    section { background:#182028; border:1px solid #2d3a46; border-radius:12px; padding:20px; margin:18px 0; }
+    fieldset { border:0; padding:0; margin:14px 0; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+    label { display:grid; gap:5px; font-size:.9rem; color:#c8d3dd; }
+    label.wide { grid-column:1 / -1; }
+    input, select, textarea, button { box-sizing:border-box; border-radius:7px; border:1px solid #40505e; background:#0e141a; color:#f0f4f8; padding:10px; font:inherit; }
+    textarea { min-height:90px; resize:vertical; } button { cursor:pointer; background:#2b7b58; border-color:#3da875; font-weight:650; }
+    button:hover { background:#359466; } button:disabled { opacity:.55; cursor:wait; }
+    .hint { font-size:.85rem; } #status { white-space:pre-wrap; padding:12px; border-radius:7px; background:#0c1116; min-height:22px; }
+    .hidden { display:none; } code { color:#9fd7b6; }
+    @media(max-width:650px) { fieldset { grid-template-columns:1fr; } label.wide { grid-column:auto; } }
+  </style>
+</head>
+<body>
+  <h1>HoneyForge</h1>
+  <p>Минимальная операторская панель. Сначала устанавливает агент по SSH, затем ставит Low или Middle SSH-ловушку через уже зарегистрированный агент.</p>
+
+  <section>
+    <h2>1. Подключить VPS</h2>
+    <p class="hint">Нужен SHA256 fingerprint SSH host key. Пароль/ключ уходят только в запрос bootstrap и не сохраняются браузером.</p>
+    <form id="bootstrap-form">
+      <fieldset>
+        <label>IP / hostname<input id="host" required placeholder="203.0.113.10 или 2001:db8::10"></label>
+        <label>SSH порт<input id="ssh-port" type="number" min="1" max="65535" value="22" required></label>
+        <label>SSH логин<input id="ssh-user" value="root" required></label>
+        <label>Способ входа<select id="auth-kind"><option value="password">Пароль</option><option value="key">Приватный ключ PEM</option></select></label>
+        <label id="password-label" class="wide">SSH пароль<input id="ssh-password" type="password" autocomplete="new-password"></label>
+        <label id="key-label" class="wide hidden">Приватный ключ PEM<textarea id="ssh-key" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></label>
+        <label class="wide">Fingerprint сервера<input id="fingerprint" required placeholder="SHA256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></label>
+      </fieldset>
+      <button>Установить агент</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>2. Поставить ловушку</h2>
+    <p class="hint">После bootstrap подожди пока агент зарегистрируется. Для dev control-plane введи <code>HF_CONTROL_TOKEN</code>; он не сохраняется.</p>
+    <form id="trap-form">
+      <fieldset>
+        <label>Agent ID<input id="agent-id" required placeholder="Появится после bootstrap"></label>
+        <label>Control token<input id="control-token" type="password" required></label>
+        <label>Уровень<select id="trap-kind"><option value="low">Low — баннер SSH</option><option value="middle">Middle — Pritvoryashka SSH</option></select></label>
+        <label>Внешний TCP порт<input id="trap-port" type="number" min="1" max="65535" value="2222" required></label>
+        <label id="banner-label" class="wide">SSH banner Low<input id="banner" value="SSH-2.0-OpenSSH_9.6" maxlength="253"></label>
+        <label id="hostname-label" class="wide hidden">Имя сервера Middle<input id="middle-hostname" value="srv-app-01" maxlength="64"></label>
+        <label id="server-id-label" class="wide hidden">Server ID Middle<input id="server-id"></label>
+      </fieldset>
+      <button>Поставить ловушку</button>
+    </form>
+  </section>
+
+  <section><strong>Статус</strong><div id="status">Готово.</div></section>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const status = message => $('status').textContent = message;
+    const uuid = () => crypto.randomUUID();
+    $('server-id').value = uuid();
+
+    function setAuthFields() {
+      const key = $('auth-kind').value === 'key';
+      $('password-label').classList.toggle('hidden', key);
+      $('key-label').classList.toggle('hidden', !key);
+    }
+    function setTrapFields() {
+      const middle = $('trap-kind').value === 'middle';
+      $('banner-label').classList.toggle('hidden', middle);
+      $('hostname-label').classList.toggle('hidden', !middle);
+      $('server-id-label').classList.toggle('hidden', !middle);
+    }
+    $('auth-kind').onchange = setAuthFields;
+    $('trap-kind').onchange = setTrapFields;
+
+    async function request(url, options) {
+      const response = await fetch(url, options);
+      const body = await response.text();
+      if (!response.ok) throw new Error(`${response.status}: ${body || response.statusText}`);
+      return body ? JSON.parse(body) : null;
+    }
+
+    $('bootstrap-form').onsubmit = async event => {
+      event.preventDefault();
+      const key = $('auth-kind').value === 'key';
+      const body = {
+        host: $('host').value.trim(), ssh_port: Number($('ssh-port').value),
+        ssh_user: $('ssh-user').value.trim(), known_host_sha256: $('fingerprint').value.trim(),
+        ssh_password: key ? null : $('ssh-password').value,
+        ssh_private_key: key ? $('ssh-key').value : null,
+        ssh_key_passphrase: null
+      };
+      if ((key && !body.ssh_private_key) || (!key && !body.ssh_password)) return status('Заполни SSH-данные.');
+      event.submitter.disabled = true; status('Подключаюсь по SSH и устанавливаю агент…');
+      try {
+        const result = await request('/v1/agents/bootstrap', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
+        $('agent-id').value = result.agent_id;
+        $('ssh-password').value = ''; $('ssh-key').value = '';
+        status(`Bootstrap запущен. Agent ID: ${result.agent_id}\nПодожди 10–20 секунд регистрации агента, затем поставь ловушку.`);
+      } catch (error) { status(`Ошибка bootstrap: ${error.message}`); }
+      finally { event.submitter.disabled = false; }
+    };
+
+    $('trap-form').onsubmit = async event => {
+      event.preventDefault();
+      const agentId = $('agent-id').value.trim();
+      const port = Number($('trap-port').value);
+      const low = $('trap-kind').value === 'low';
+      const command = low ? {
+        type:'deploy_kozyavka', command_id:uuid(), trap_id:uuid(), host_port:port,
+        container_port:2222, banner:$('banner').value, publish_address:'0.0.0.0'
+      } : {
+        type:'deploy_pritvoryashka', command_id:uuid(), trap_id:uuid(), server_id:$('server-id').value.trim(),
+        host_port:port, publish_address:'0.0.0.0', hostname:$('middle-hostname').value.trim(), max_connections:128
+      };
+      event.submitter.disabled = true; status('Ставлю команду в очередь агента…');
+      try {
+        const result = await request(`/v1/agents/${encodeURIComponent(agentId)}/commands`, {
+          method:'POST', headers:{'content-type':'application/json','x-honeyforge-control-token':$('control-token').value}, body:JSON.stringify(command)
+        });
+        status(`Команда ${result.status}: ${result.message_id}\nАгент заберёт её на ближайшем heartbeat (до 20 секунд).`);
+      } catch (error) { status(`Ошибка постановки ловушки: ${error.message}`); }
+      finally { event.submitter.disabled = false; }
+    };
+  </script>
+</body>
+</html>

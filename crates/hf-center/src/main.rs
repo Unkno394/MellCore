@@ -1,18 +1,28 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{Write, copy},
     net::{SocketAddr, TcpStream},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
-use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use axum::{
+    Json, Router,
+    extract::{Path as RoutePath, State},
+    http::{HeaderMap, StatusCode},
+    response::Html,
+    routing::{get, post},
+};
 use base64::Engine as _;
 use clap::Parser;
 use hf_core::{
     AgentCommand, AgentRegistration, BootstrapScript, CoreError, HighUbuntuDeployment,
-    RemoteBootstrap, SshBootstrapTarget,
+    HysteriaConnection, RegisteredAgent, RemoteBootstrap, SshBootstrapTarget,
 };
+use kazik_protocol::{AckDisposition, Acknowledgement, KazikBody, KazikEnvelope};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ssh2::Session;
@@ -25,18 +35,37 @@ use uuid::Uuid;
 struct Args {
     #[arg(long, env = "HF_CENTER_LISTEN", default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
+    /// UDP receiver behind Hysteria. Keep it loopback-only; Hysteria terminates public QUIC/TLS.
+    #[arg(long, env = "HF_KAZIK_UDP_LISTEN", default_value = "127.0.0.1:44000")]
+    kazik_udp_listen: SocketAddr,
     /// Statically built hf-agent artifact to upload during first installation.
     #[arg(long, env = "HF_AGENT_BINARY")]
     agent_binary: PathBuf,
     /// OCI/Docker archive of a prebuilt honeyforge-low image. This avoids compiling it on a VPS.
     #[arg(long, env = "HF_KOZYAVKA_IMAGE_ARCHIVE")]
     kozyavka_image_archive: Option<PathBuf>,
+    /// OCI/Docker archive of the prebuilt Middle SSH trap image.
+    #[arg(long, env = "HF_PRITVORYASHKA_IMAGE_ARCHIVE")]
+    pritvoryashka_image_archive: Option<PathBuf>,
     /// Statically built Dispatcher artifact. Required before a VPS can host shared-port groups.
     #[arg(long, env = "HF_DISPATCHER_BINARY")]
     dispatcher_binary: Option<PathBuf>,
     /// Tar.gz with `high-ubuntu-ssh`; copied to a VPS during bootstrap for later High commands.
     #[arg(long, env = "HF_HIGH_UBUNTU_RECIPE_ARCHIVE")]
     high_ubuntu_recipe_archive: Option<PathBuf>,
+    /// Statically built Hysteria binary uploaded only during the initial SSH bootstrap.
+    #[arg(long, env = "HF_HYSTERIA_BINARY")]
+    hysteria_binary: Option<PathBuf>,
+    /// Public Hysteria endpoint issued to each newly registered agent.
+    #[arg(long, env = "HF_HYSTERIA_SERVER")]
+    hysteria_server: Option<String>,
+    /// TLS SNI verified by the Hysteria client.
+    #[arg(long, env = "HF_HYSTERIA_SNI")]
+    hysteria_sni: Option<String>,
+    /// Shared secret for the temporary internal control-plane command endpoint. Leave unset to
+    /// disable the endpoint until the panel's normal authentication is connected.
+    #[arg(long, env = "HF_CONTROL_TOKEN")]
+    control_token: Option<String>,
     /// HTTPS URL agents use after first installation. This is not the SSH address.
     #[arg(long, env = "HF_PUBLIC_CENTER_URL")]
     public_center_url: String,
@@ -45,8 +74,13 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     enrollment_tokens: Arc<Mutex<HashMap<String, Uuid>>>,
+    agent_credentials: Arc<Mutex<HashMap<Uuid, String>>>,
     bootstrapper: Arc<dyn RemoteBootstrap>,
     public_center_url: Arc<str>,
+    hysteria_connection: Option<HysteriaConnection>,
+    control_token: Option<Arc<str>>,
+    pending_commands: Arc<Mutex<HashMap<Uuid, VecDeque<KazikEnvelope>>>>,
+    kazik_sequence: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,10 +118,28 @@ struct BootstrapResponse {
     status: &'static str,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct RegistrationResponse {
-    agent_id: Uuid,
-    transport_credential: String,
+/// Request body Hysteria sends to `auth.type: http`. The remote address and rate are
+/// intentionally not used as identity; only the issued per-agent credential authorizes access.
+#[derive(Debug, Deserialize)]
+struct HysteriaAuthRequest {
+    auth: String,
+    #[allow(dead_code)]
+    addr: Option<String>,
+    #[allow(dead_code)]
+    tx: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct HysteriaAuthResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueuedCommandResponse {
+    message_id: Uuid,
+    status: &'static str,
 }
 
 fn default_ssh_port() -> u16 {
@@ -98,8 +150,10 @@ fn default_ssh_port() -> u16 {
 struct SshBootstrapper {
     agent_binary: PathBuf,
     kozyavka_image_archive: Option<PathBuf>,
+    pritvoryashka_image_archive: Option<PathBuf>,
     dispatcher_binary: Option<PathBuf>,
     high_ubuntu_recipe_archive: Option<PathBuf>,
+    hysteria_binary: Option<PathBuf>,
 }
 
 #[async_trait::async_trait]
@@ -111,16 +165,20 @@ impl RemoteBootstrap for SshBootstrapper {
     ) -> Result<(), CoreError> {
         let agent_binary = self.agent_binary.clone();
         let kozyavka_image_archive = self.kozyavka_image_archive.clone();
+        let pritvoryashka_image_archive = self.pritvoryashka_image_archive.clone();
         let dispatcher_binary = self.dispatcher_binary.clone();
         let high_ubuntu_recipe_archive = self.high_ubuntu_recipe_archive.clone();
+        let hysteria_binary = self.hysteria_binary.clone();
         tokio::task::spawn_blocking(move || {
             run_ssh_install(
                 target,
                 script,
                 agent_binary,
                 kozyavka_image_archive,
+                pritvoryashka_image_archive,
                 dispatcher_binary,
                 high_ubuntu_recipe_archive,
+                hysteria_binary,
             )
         })
         .await
@@ -141,23 +199,73 @@ async fn main() -> anyhow::Result<()> {
     {
         anyhow::bail!("HF_PUBLIC_CENTER_URL must be a non-empty URL without quotes or newlines");
     }
+    let hysteria_connection = match (args.hysteria_server, args.hysteria_sni) {
+        (Some(server), Some(sni)) => {
+            validate_hysteria_value("HF_HYSTERIA_SERVER", &server)?;
+            validate_hysteria_value("HF_HYSTERIA_SNI", &sni)?;
+            if args.hysteria_binary.is_none() {
+                anyhow::bail!("HF_HYSTERIA_BINARY is required with Hysteria endpoint settings");
+            }
+            Some(HysteriaConnection { server, sni })
+        }
+        (None, None) => {
+            if args.hysteria_binary.is_some() {
+                anyhow::bail!(
+                    "HF_HYSTERIA_SERVER and HF_HYSTERIA_SNI are required with HF_HYSTERIA_BINARY"
+                );
+            }
+            None
+        }
+        _ => anyhow::bail!("HF_HYSTERIA_SERVER and HF_HYSTERIA_SNI must be supplied together"),
+    };
+    let control_token = args.control_token.map(Arc::<str>::from);
     let listen = args.listen;
+    let kazik_udp_listen = args.kazik_udp_listen;
+    let state = AppState {
+        enrollment_tokens: Arc::default(),
+        agent_credentials: Arc::default(),
+        bootstrapper: Arc::new(SshBootstrapper {
+            agent_binary: args.agent_binary,
+            kozyavka_image_archive: args.kozyavka_image_archive,
+            pritvoryashka_image_archive: args.pritvoryashka_image_archive,
+            dispatcher_binary: args.dispatcher_binary,
+            high_ubuntu_recipe_archive: args.high_ubuntu_recipe_archive,
+            hysteria_binary: args.hysteria_binary,
+        }),
+        public_center_url: Arc::from(args.public_center_url),
+        hysteria_connection,
+        control_token,
+        pending_commands: Arc::default(),
+        kazik_sequence: Arc::new(AtomicU64::new(1)),
+    };
+    tokio::spawn(kazik_udp_receiver(kazik_udp_listen, state.clone()));
     let app = Router::new()
+        .route("/", get(dev_panel))
         .route("/v1/agents/bootstrap", post(bootstrap))
         .route("/v1/agents/register", post(register))
-        .with_state(AppState {
-            enrollment_tokens: Arc::default(),
-            bootstrapper: Arc::new(SshBootstrapper {
-                agent_binary: args.agent_binary,
-                kozyavka_image_archive: args.kozyavka_image_archive,
-                dispatcher_binary: args.dispatcher_binary,
-                high_ubuntu_recipe_archive: args.high_ubuntu_recipe_archive,
-            }),
-            public_center_url: Arc::from(args.public_center_url),
-        });
+        .route("/v1/hysteria/auth", post(hysteria_auth))
+        .route("/v1/agents/{agent_id}/commands", post(queue_command))
+        .with_state(state);
     info!(address = %listen, "HoneyForge center listening");
     let listener = tokio::net::TcpListener::bind(listen).await?;
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn dev_panel() -> Html<&'static str> {
+    Html(include_str!("../../../deploy/dev-panel/index.html"))
+}
+
+fn validate_hysteria_value(name: &str, value: &str) -> anyhow::Result<()> {
+    if value.trim().is_empty()
+        || value != value.trim()
+        || value.len() > 253
+        || value
+            .chars()
+            .any(|c| c.is_control() || c == '"' || c == '\\')
+    {
+        anyhow::bail!("{name} contains an unsafe value");
+    }
     Ok(())
 }
 
@@ -289,7 +397,7 @@ fn validate_initial_high(request: &BootstrapRequest) -> Result<(), StatusCode> {
 async fn register(
     State(state): State<AppState>,
     Json(request): Json<AgentRegistration>,
-) -> Result<Json<RegistrationResponse>, StatusCode> {
+) -> Result<Json<RegisteredAgent>, StatusCode> {
     let Some(agent_id) = state
         .enrollment_tokens
         .lock()
@@ -298,11 +406,184 @@ async fn register(
     else {
         return Err(StatusCode::UNAUTHORIZED);
     };
-    // Provision an individual Hysteria credential here; it must be revocable by agent_id.
-    Ok(Json(RegistrationResponse {
+    // Provision an individual Hysteria/Kazik credential here; it is checked alongside agent_id.
+    let transport_credential = format!("hf-dev-{}", Uuid::new_v4());
+    state
+        .agent_credentials
+        .lock()
+        .await
+        .insert(agent_id, transport_credential.clone());
+    Ok(Json(RegisteredAgent {
         agent_id,
-        transport_credential: format!("hf-dev-{}", Uuid::new_v4()),
+        transport_credential,
+        hysteria: state.hysteria_connection.clone(),
     }))
+}
+
+async fn hysteria_auth(
+    State(state): State<AppState>,
+    Json(request): Json<HysteriaAuthRequest>,
+) -> Json<HysteriaAuthResponse> {
+    let credentials = state.agent_credentials.lock().await;
+    let agent_id = credentials
+        .iter()
+        .find_map(|(agent_id, credential)| (credential == &request.auth).then_some(*agent_id));
+    Json(HysteriaAuthResponse {
+        ok: agent_id.is_some(),
+        id: agent_id.map(|value| value.to_string()),
+    })
+}
+
+/// This is deliberately disabled unless `HF_CONTROL_TOKEN` is configured. It is an internal
+/// bridge for the panel/control-plane service, not an internet-facing substitute for user auth.
+async fn queue_command(
+    State(state): State<AppState>,
+    RoutePath(agent_id): RoutePath<Uuid>,
+    headers: HeaderMap,
+    Json(command): Json<AgentCommand>,
+) -> Result<Json<QueuedCommandResponse>, StatusCode> {
+    let Some(expected_token) = &state.control_token else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let supplied_token = headers
+        .get("x-honeyforge-control-token")
+        .and_then(|value| value.to_str().ok());
+    if supplied_token != Some(expected_token.as_ref()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let credential = state
+        .agent_credentials
+        .lock()
+        .await
+        .get(&agent_id)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
+    let envelope = KazikEnvelope::new(agent_id, credential, now, KazikBody::Command { command });
+    let message_id = envelope.message_id;
+    state
+        .pending_commands
+        .lock()
+        .await
+        .entry(agent_id)
+        .or_default()
+        .push_back(envelope);
+    Ok(Json(QueuedCommandResponse {
+        message_id,
+        status: "queued",
+    }))
+}
+
+async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
+    let socket = match tokio::net::UdpSocket::bind(listen).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            tracing::error!(%error, %listen, "cannot bind Kazik UDP receiver");
+            return;
+        }
+    };
+    info!(%listen, "Kazik UDP receiver listening behind transport adapters");
+    let mut buffer = vec![0_u8; hf_core::HFSP_HEADER_LEN + hf_core::HFSP_MAX_PAYLOAD_LEN];
+    loop {
+        let (length, peer) = match socket.recv_from(&mut buffer).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "Kazik UDP receive failed");
+                continue;
+            }
+        };
+        let Ok((envelope, sequence, _)) = KazikEnvelope::decode_hfsp(&buffer[..length]) else {
+            tracing::warn!(%peer, "discarded malformed Kazik packet");
+            continue;
+        };
+        let authorized = state
+            .agent_credentials
+            .lock()
+            .await
+            .get(&envelope.agent_id)
+            .is_some_and(|credential| credential == &envelope.transport_credential);
+        if !authorized {
+            tracing::warn!(agent_id = %envelope.agent_id, %peer, "discarded Kazik packet with invalid agent credential");
+            continue;
+        }
+        if let KazikBody::Ack(ack) = &envelope.body {
+            if matches!(
+                ack.disposition,
+                AckDisposition::Applied | AckDisposition::Duplicate
+            ) {
+                let mut pending = state.pending_commands.lock().await;
+                if let Some(commands) = pending.get_mut(&envelope.agent_id) {
+                    commands.retain(|command| command.message_id != ack.acknowledged_message_id);
+                }
+            }
+            continue;
+        }
+        let disposition = match &envelope.body {
+            KazikBody::Telemetry { events } => {
+                tracing::info!(agent_id = %envelope.agent_id, events = events.len(), "Kazik telemetry accepted");
+                AckDisposition::Accepted
+            }
+            KazikBody::Heartbeat { .. } => AckDisposition::Accepted,
+            KazikBody::Register(_) | KazikBody::Command { .. } | KazikBody::Error { .. } => {
+                AckDisposition::Rejected
+            }
+            KazikBody::Ack(_) => unreachable!(),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_default();
+        let reply = KazikEnvelope::new(
+            envelope.agent_id,
+            envelope.transport_credential,
+            now,
+            KazikBody::Ack(Acknowledgement {
+                acknowledged_message_id: envelope.message_id,
+                disposition,
+                detail: None,
+            }),
+        );
+        match reply.encode_hfsp(0, sequence) {
+            Ok(packet) => {
+                if let Err(error) = socket.send_to(&packet, peer).await {
+                    tracing::warn!(%error, %peer, "could not send Kazik ACK");
+                }
+            }
+            Err(error) => tracing::error!(%error, "could not encode Kazik ACK"),
+        }
+        if matches!(envelope.body, KazikBody::Heartbeat { .. }) {
+            send_next_command(&socket, peer, &state, envelope.agent_id).await;
+        }
+    }
+}
+
+async fn send_next_command(
+    socket: &tokio::net::UdpSocket,
+    peer: SocketAddr,
+    state: &AppState,
+    agent_id: Uuid,
+) {
+    let command = state
+        .pending_commands
+        .lock()
+        .await
+        .get(&agent_id)
+        .and_then(|commands| commands.front().cloned());
+    let Some(command) = command else {
+        return;
+    };
+    let sequence = state.kazik_sequence.fetch_add(1, Ordering::Relaxed);
+    match command.encode_hfsp(sequence, 0) {
+        Ok(packet) => {
+            if let Err(error) = socket.send_to(&packet, peer).await {
+                tracing::warn!(%error, %agent_id, "could not forward queued Kazik command");
+            }
+        }
+        Err(error) => tracing::error!(%error, %agent_id, "could not encode queued Kazik command"),
+    }
 }
 
 fn render_install_script(token: &str, center_url: &str) -> String {
@@ -312,6 +593,7 @@ fn render_install_script(token: &str, center_url: &str) -> String {
     script.push_str(
         "\nif [ -f /tmp/hf-high-ubuntu-ssh.tar.gz ]; then\n  $SUDO install -d -m 0755 /usr/local/lib/honeyforge\n  $SUDO tar -xzf /tmp/hf-high-ubuntu-ssh.tar.gz -C /usr/local/lib/honeyforge\n  $SUDO chmod -R a-w /usr/local/lib/honeyforge/high-ubuntu-ssh/cloud-init\n  $SUDO find /usr/local/lib/honeyforge/high-ubuntu-ssh/scripts -type f -exec chmod 0755 {} \\;\n  rm -f /tmp/hf-high-ubuntu-ssh.tar.gz\nfi\nif [ -f /tmp/hf-initial-command.json ]; then\n  $SUDO install -d -m 0700 /var/lib/honeyforge/inbox\n  $SUDO install -m 0600 /tmp/hf-initial-command.json /var/lib/honeyforge/inbox/initial-high.json\n  rm -f /tmp/hf-initial-command.json\nfi\n",
     );
+    script.push_str("\nif [ -f /tmp/hysteria-bootstrap ]; then\n  $SUDO install -m 0755 /tmp/hysteria-bootstrap /usr/local/bin/hysteria\n  rm -f /tmp/hysteria-bootstrap\nfi\nif [ -f /tmp/hf-pritvoryashka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-pritvoryashka-image.tar\n  rm -f /tmp/hf-pritvoryashka-image.tar\nfi\n");
     script
 }
 
@@ -320,8 +602,10 @@ fn run_ssh_install(
     script: BootstrapScript,
     agent_binary: PathBuf,
     kozyavka_image_archive: Option<PathBuf>,
+    pritvoryashka_image_archive: Option<PathBuf>,
     dispatcher_binary: Option<PathBuf>,
     high_ubuntu_recipe_archive: Option<PathBuf>,
+    hysteria_binary: Option<PathBuf>,
 ) -> Result<(), CoreError> {
     let authentication = match &target.auth {
         hf_core::SshAuthentication::Password(_) => "password",
@@ -401,6 +685,10 @@ fn run_ssh_install(
         upload_file(&session, &archive, "/tmp/hf-kozyavka-image.tar", 0o600)?;
         debug!(host = %target.host, "kozyavka image archive upload completed");
     }
+    if let Some(archive) = pritvoryashka_image_archive {
+        upload_file(&session, &archive, "/tmp/hf-pritvoryashka-image.tar", 0o600)?;
+        debug!(host = %target.host, "pritvoryashka image archive upload completed");
+    }
     if let Some(dispatcher) = dispatcher_binary {
         upload_file(&session, &dispatcher, "/tmp/hf-dispatcher-bootstrap", 0o700)?;
         debug!(host = %target.host, "dispatcher artifact upload completed");
@@ -408,6 +696,10 @@ fn run_ssh_install(
     if let Some(archive) = high_ubuntu_recipe_archive {
         upload_file(&session, &archive, "/tmp/hf-high-ubuntu-ssh.tar.gz", 0o600)?;
         debug!(host = %target.host, "High Ubuntu recipe archive upload completed");
+    }
+    if let Some(binary) = hysteria_binary {
+        upload_file(&session, &binary, "/tmp/hysteria-bootstrap", 0o700)?;
+        debug!(host = %target.host, "Hysteria binary upload completed");
     }
     if let Some(command) = &script.initial_command_json {
         let mut remote = session
@@ -569,8 +861,11 @@ mod tests {
             assert!(script.contains(platform), "missing {platform} branch");
         }
         assert!(script.contains("docker-compose-plugin"));
+        assert!(script.contains("hf-pritvoryashka-image.tar"));
         assert!(script.contains("rc-update add hf-agent default"));
         assert!(script.contains("systemctl enable --now hf-agent.service"));
+        assert!(script.contains("/tmp/hysteria-bootstrap"));
+        assert!(script.contains("/usr/local/bin/hysteria"));
         assert!(script.contains("hf-high-ubuntu-ssh.tar.gz"));
         assert!(script.contains("/usr/local/lib/honeyforge"));
     }

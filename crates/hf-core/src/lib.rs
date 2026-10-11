@@ -20,6 +20,17 @@ pub struct RegisteredAgent {
     pub agent_id: Uuid,
     /// Credentials for the selected transport. Never use `agent_id` as authentication.
     pub transport_credential: String,
+    /// Settings issued after enrollment for the optional Hysteria transport service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hysteria: Option<HysteriaConnection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HysteriaConnection {
+    /// Public Hysteria endpoint in `host:port` form (IPv6 is bracketed).
+    pub server: String,
+    /// TLS server name the agent verifies; certificate verification is not disabled.
+    pub sni: String,
 }
 
 #[derive(Debug, Error)]
@@ -84,6 +95,7 @@ pub enum TrapTier {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentCommand {
     DeployKozyavka(KozyavkaDeployment),
+    DeployPritvoryashka(PritvoryashkaDeployment),
     DeployHighUbuntu(HighUbuntuDeployment),
     ResetHighUbuntu { command_id: Uuid, trap_id: Uuid },
     ReconcileTcpPortGroup(TcpPortGroup),
@@ -95,6 +107,7 @@ impl AgentCommand {
     pub fn command_id(&self) -> Uuid {
         match self {
             Self::DeployKozyavka(command) => command.command_id,
+            Self::DeployPritvoryashka(command) => command.command_id,
             Self::DeployHighUbuntu(command) => command.command_id,
             Self::ResetHighUbuntu { command_id, .. } => *command_id,
             Self::ReconcileTcpPortGroup(command) => command.command_id,
@@ -114,6 +127,25 @@ pub struct KozyavkaDeployment {
     pub banner: String,
     /// External direct listener is 0.0.0.0; Dispatcher members are loopback-only.
     pub publish_address: String,
+}
+
+/// Exact deployment data for the Middle-interaction SSH trap. The agent fills its own agent ID
+/// into the generated runtime configuration rather than trusting it from the control plane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PritvoryashkaDeployment {
+    pub command_id: Uuid,
+    pub trap_id: Uuid,
+    pub server_id: Uuid,
+    pub host_port: u16,
+    /// External direct listener is 0.0.0.0; Dispatcher members are loopback-only.
+    pub publish_address: String,
+    pub hostname: String,
+    #[serde(default = "default_pritvoryashka_connections")]
+    pub max_connections: u16,
+}
+
+fn default_pritvoryashka_connections() -> u16 {
+    128
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +169,18 @@ pub struct TcpPortGroupMember {
     pub trap_id: Uuid,
     pub backend_port: u16,
     pub weight: u8,
+    #[serde(default)]
+    pub trap_kind: SharedTcpTrapKind,
+}
+
+/// The Dispatcher only sees TCP targets; the agent needs this to recreate the correct recipe on
+/// a loopback backend port during a direct-listener → shared-listener transition.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedTcpTrapKind {
+    #[default]
+    Kozyavka,
+    Pritvoryashka,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

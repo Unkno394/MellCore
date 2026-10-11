@@ -1,6 +1,8 @@
 //! Infrastructure adapters. This crate may depend on sockets, processes and observability;
 //! `hf-core` never does.
 
+pub mod kazik_outbox;
+
 use std::{
     net::SocketAddr,
     sync::{
@@ -10,10 +12,13 @@ use std::{
 };
 
 use async_trait::async_trait;
-use hf_core::{PacketTransport, TransportError};
+use hf_core::{HFSP_HEADER_LEN, HFSP_MAX_PAYLOAD_LEN, PacketTransport, TransportError};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, UdpSocket},
+    net::{
+        TcpStream, UdpSocket,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
     sync::Mutex,
 };
 use tracing::{debug, warn};
@@ -68,6 +73,103 @@ impl PacketTransport for UdpTransport {
                 })?;
         buffer.truncate(length);
         Ok(buffer)
+    }
+}
+
+/// Length-prefixed, bidirectional TCP adapter for development or networks where UDP is absent.
+/// TCP itself is not encrypted: production users must place it inside TLS or another protected
+/// carrier. Kazik reliability remains enabled because an end-to-end ACK can still be lost after
+/// a center restart even if TCP delivered bytes to a previous process.
+#[derive(Debug)]
+pub struct TcpFramedTransport {
+    reader: Mutex<OwnedReadHalf>,
+    writer: Mutex<OwnedWriteHalf>,
+    name: &'static str,
+}
+
+impl TcpFramedTransport {
+    pub async fn connect(endpoint: SocketAddr) -> Result<Self, TransportError> {
+        let stream = TcpStream::connect(endpoint)
+            .await
+            .map_err(|error| TransportError {
+                transport: "tcp-framed",
+                message: error.to_string(),
+            })?;
+        let (reader, writer) = stream.into_split();
+        Ok(Self {
+            reader: Mutex::new(reader),
+            writer: Mutex::new(writer),
+            name: "tcp-framed",
+        })
+    }
+}
+
+#[async_trait]
+impl PacketTransport for TcpFramedTransport {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    async fn send(&self, packet: &[u8]) -> Result<(), TransportError> {
+        let maximum = HFSP_HEADER_LEN + HFSP_MAX_PAYLOAD_LEN;
+        if packet.len() > maximum {
+            return Err(TransportError {
+                transport: self.name,
+                message: "packet exceeds HFSP maximum length".into(),
+            });
+        }
+        let length = u32::try_from(packet.len()).map_err(|_| TransportError {
+            transport: self.name,
+            message: "packet length exceeds TCP framing limit".into(),
+        })?;
+        let mut writer = self.writer.lock().await;
+        writer
+            .write_all(&length.to_be_bytes())
+            .await
+            .map_err(|error| TransportError {
+                transport: self.name,
+                message: error.to_string(),
+            })?;
+        writer
+            .write_all(packet)
+            .await
+            .map_err(|error| TransportError {
+                transport: self.name,
+                message: error.to_string(),
+            })?;
+        writer.flush().await.map_err(|error| TransportError {
+            transport: self.name,
+            message: error.to_string(),
+        })
+    }
+
+    async fn receive(&self) -> Result<Vec<u8>, TransportError> {
+        let mut prefix = [0_u8; 4];
+        let mut reader = self.reader.lock().await;
+        reader
+            .read_exact(&mut prefix)
+            .await
+            .map_err(|error| TransportError {
+                transport: self.name,
+                message: error.to_string(),
+            })?;
+        let length = u32::from_be_bytes(prefix) as usize;
+        let maximum = HFSP_HEADER_LEN + HFSP_MAX_PAYLOAD_LEN;
+        if length > maximum {
+            return Err(TransportError {
+                transport: self.name,
+                message: "peer announced an oversized framed packet".into(),
+            });
+        }
+        let mut packet = vec![0_u8; length];
+        reader
+            .read_exact(&mut packet)
+            .await
+            .map_err(|error| TransportError {
+                transport: self.name,
+                message: error.to_string(),
+            })?;
+        Ok(packet)
     }
 }
 

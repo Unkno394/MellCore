@@ -1,7 +1,9 @@
 use std::{
     fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
     time::Duration,
 };
 
@@ -10,8 +12,16 @@ mod sandbox;
 use anyhow::Context;
 use clap::Parser;
 use hf_core::{
-    AgentCommand, AgentRegistration, CommandResult, CoreError, KozyavkaDeployment, RegisteredAgent,
-    RegistrationTransport, TcpPortGroup, TrapSpec,
+    AgentCommand, AgentRegistration, CommandResult, CoreError, HysteriaConnection,
+    KozyavkaDeployment, PacketTransport, PritvoryashkaDeployment, RegisteredAgent,
+    RegistrationTransport, SharedTcpTrapKind, TcpPortGroup, TrapSpec,
+};
+use hf_services::{
+    FailoverSender, HysteriaSocks5UdpTransport,
+    kazik_outbox::{SqliteKazikOutbox, send_pending_once},
+};
+use kazik_protocol::{
+    AckDisposition, Acknowledgement, AgentStatus, DurableOutbox, KazikBody, KazikEnvelope,
 };
 use sandbox::{LibvirtSandboxManager, UbuntuSshVm, default_recipe_dir};
 use serde::{Deserialize, Serialize};
@@ -44,17 +54,49 @@ struct Args {
         default_value = "honeyforge-low:local"
     )]
     kozyavka_image: String,
+    /// Immutable or locally loaded image reference for the Middle SSH honeypot.
+    #[arg(
+        long,
+        env = "HF_PRITVORYASHKA_IMAGE",
+        default_value = "honeyforge-pritvoryashka:local"
+    )]
+    pritvoryashka_image: String,
+    /// Local SOCKS5 UDP listener exposed by the Hysteria client. Both Kazik transport options
+    /// must be set to enable the persistent protocol loop.
+    #[arg(long, env = "HF_KAZIK_HYSTERIA_SOCKS")]
+    kazik_hysteria_socks: Option<SocketAddr>,
+    /// Center's loopback UDP Kazik receiver as reached through Hysteria.
+    #[arg(long, env = "HF_KAZIK_CENTER_UDP")]
+    kazik_center_udp: Option<SocketAddr>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AgentIdentity {
     agent_id: uuid::Uuid,
     transport_credential: String,
+    #[serde(default)]
+    hysteria: Option<HysteriaConnection>,
 }
 
 /// Infrastructure service. It owns project files but deliberately does not contain trap recipes.
+#[derive(Clone)]
 struct ComposeProjectStore {
     root: PathBuf,
+}
+
+#[derive(Clone)]
+enum SharedTcpDeployment {
+    Kozyavka(KozyavkaDeployment),
+    Pritvoryashka(PritvoryashkaDeployment),
+}
+
+impl SharedTcpDeployment {
+    fn trap_id(&self) -> uuid::Uuid {
+        match self {
+            Self::Kozyavka(deployment) => deployment.trap_id,
+            Self::Pritvoryashka(deployment) => deployment.trap_id,
+        }
+    }
 }
 
 impl ComposeProjectStore {
@@ -85,10 +127,17 @@ impl ComposeProjectStore {
         Ok(project_dir)
     }
 
-    fn apply(&self, command: AgentCommand, kozyavka_image: &str) -> anyhow::Result<CommandResult> {
+    fn apply(
+        &self,
+        command: AgentCommand,
+        kozyavka_image: &str,
+        pritvoryashka_image: &str,
+        agent_id: uuid::Uuid,
+    ) -> anyhow::Result<CommandResult> {
         let command_id = command.command_id();
         let trap_id = match &command {
             AgentCommand::DeployKozyavka(deployment) => deployment.trap_id,
+            AgentCommand::DeployPritvoryashka(deployment) => deployment.trap_id,
             AgentCommand::DeployHighUbuntu(deployment) => deployment.trap_id,
             AgentCommand::ResetHighUbuntu { trap_id, .. } => *trap_id,
             AgentCommand::ReconcileTcpPortGroup(group) => {
@@ -114,6 +163,10 @@ impl ComposeProjectStore {
                 ensure_docker_runtime()?;
                 self.deploy_kozyavka(deployment, kozyavka_image)
             }
+            AgentCommand::DeployPritvoryashka(deployment) => {
+                ensure_docker_runtime()?;
+                self.deploy_pritvoryashka(deployment, pritvoryashka_image, agent_id)
+            }
             AgentCommand::DeployHighUbuntu(deployment) => {
                 ensure_high_vm_runtime()?;
                 let base_image = PathBuf::from(deployment.base_image);
@@ -128,7 +181,7 @@ impl ComposeProjectStore {
             }
             AgentCommand::ReconcileTcpPortGroup(group) => {
                 ensure_docker_runtime()?;
-                self.reconcile_tcp_port_group(group, kozyavka_image)
+                self.reconcile_tcp_port_group(group, kozyavka_image, pritvoryashka_image, agent_id)
             }
             AgentCommand::StopTrap { .. } => self.compose_down(trap_id, false),
             AgentCommand::RemoveTrap { .. } => self.compose_down(trap_id, true),
@@ -169,13 +222,7 @@ impl ComposeProjectStore {
         if deployment.publish_address != "0.0.0.0" && deployment.publish_address != "127.0.0.1" {
             anyhow::bail!("kozyavka publish address must be 0.0.0.0 or 127.0.0.1");
         }
-        if image.is_empty()
-            || image.chars().any(|character| {
-                !(character.is_ascii_alphanumeric() || "._/-:@".contains(character))
-            })
-        {
-            anyhow::bail!("unsafe kozyavka image reference");
-        }
+        validate_container_image(image, "kozyavka")?;
         let project_dir = self.root.join(deployment.trap_id.to_string());
         fs::create_dir_all(&project_dir)?;
         atomic_write(
@@ -208,7 +255,83 @@ impl ComposeProjectStore {
         )
     }
 
-    fn reconcile_tcp_port_group(&self, group: TcpPortGroup, image: &str) -> anyhow::Result<()> {
+    fn deploy_pritvoryashka(
+        &self,
+        deployment: PritvoryashkaDeployment,
+        image: &str,
+        agent_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        if deployment.trap_id.is_nil()
+            || deployment.server_id.is_nil()
+            || deployment.host_port == 0
+            || !(1..=10_000).contains(&deployment.max_connections)
+            || deployment.hostname.is_empty()
+            || deployment.hostname.len() > 64
+            || !deployment
+                .hostname
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte))
+        {
+            anyhow::bail!("invalid pritvoryashka deployment command");
+        }
+        if deployment.publish_address != "0.0.0.0" && deployment.publish_address != "127.0.0.1" {
+            anyhow::bail!("pritvoryashka publish address must be 0.0.0.0 or 127.0.0.1");
+        }
+        validate_container_image(image, "pritvoryashka")?;
+        let project_dir = self.root.join(deployment.trap_id.to_string());
+        fs::create_dir_all(project_dir.join("runtime"))?;
+        atomic_write(
+            &project_dir.join("manifest.json"),
+            &serde_json::to_vec_pretty(&deployment)?,
+        )?;
+        let container_config = serde_json::json!({
+            "bind": "0.0.0.0:2222",
+            "health_bind": "127.0.0.1:9091",
+            "trap_id": deployment.trap_id,
+            "server_id": deployment.server_id,
+            "agent_id": agent_id,
+            "hostname": deployment.hostname,
+            "host_key": "/var/lib/pritvoryashka/host_ed25519",
+            "auth": {"policy": "accept_all", "capture": "username", "max_attempts": 6},
+            "telemetry": {
+                "endpoint": null,
+                "token_env": null,
+                "jsonl_path": "/var/lib/pritvoryashka/events.jsonl",
+                "queue_capacity": 1024,
+                "batch_size": 50,
+                "flush_interval_ms": 500,
+                "max_event_bytes": 65536
+            },
+            "max_connections": deployment.max_connections,
+            "idle_timeout_seconds": 600,
+            "max_input_bytes": 8192
+        });
+        atomic_write(
+            &project_dir.join("pritvoryashka.json"),
+            &serde_json::to_vec_pretty(&container_config)?,
+        )?;
+        let compose = format!(
+            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    ports:\n      - \"{}:{}:2222/tcp\"\n    volumes:\n      - ./pritvoryashka.json:/etc/honeyforge/pritvoryashka.json:ro\n      - ./runtime:/var/lib/pritvoryashka\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    init: true\n",
+            deployment.trap_id.simple(),
+            image,
+            deployment.publish_address,
+            deployment.host_port,
+        );
+        atomic_write(&project_dir.join("compose.yaml"), compose.as_bytes())?;
+        self.compose(
+            &project_dir,
+            deployment.trap_id,
+            ["up", "-d", "--remove-orphans"],
+        )
+    }
+
+    fn reconcile_tcp_port_group(
+        &self,
+        group: TcpPortGroup,
+        kozyavka_image: &str,
+        pritvoryashka_image: &str,
+        agent_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
         if group.listener_port == 0 || group.members.len() < 2 {
             anyhow::bail!("TCP port group needs an external port and at least two traps");
         }
@@ -233,18 +356,30 @@ impl ComposeProjectStore {
                 .root
                 .join(member.trap_id.to_string())
                 .join("manifest.json");
-            let deployment: KozyavkaDeployment = serde_json::from_slice(
-                &fs::read(&manifest)
-                    .with_context(|| format!("missing deployed trap {}", member.trap_id))?,
-            )?;
+            let manifest = fs::read(&manifest)
+                .with_context(|| format!("missing deployed trap {}", member.trap_id))?;
+            let deployment = match member.trap_kind {
+                SharedTcpTrapKind::Kozyavka => {
+                    SharedTcpDeployment::Kozyavka(serde_json::from_slice(&manifest)?)
+                }
+                SharedTcpTrapKind::Pritvoryashka => {
+                    SharedTcpDeployment::Pritvoryashka(serde_json::from_slice(&manifest)?)
+                }
+            };
+            if deployment.trap_id() != member.trap_id {
+                anyhow::bail!("dispatcher member does not match its deployed trap manifest");
+            }
             originals.push(deployment);
         }
         let result = (|| -> anyhow::Result<()> {
             for (member, deployment) in group.members.iter().zip(&originals) {
-                let mut internal = deployment.clone();
-                internal.host_port = member.backend_port;
-                internal.publish_address = "127.0.0.1".into();
-                self.deploy_kozyavka(internal, image)?;
+                self.deploy_shared_backend(
+                    deployment.clone(),
+                    member.backend_port,
+                    kozyavka_image,
+                    pritvoryashka_image,
+                    agent_id,
+                )?;
             }
             let targets: Vec<_> = group
                 .members
@@ -269,13 +404,57 @@ impl ComposeProjectStore {
         if let Err(error) = result {
             tracing::error!(%error, port = group.listener_port, "dispatcher transition failed; restoring prior trap publications");
             for deployment in originals {
-                if let Err(rollback) = self.deploy_kozyavka(deployment, image) {
+                if let Err(rollback) = self.deploy_shared_original(
+                    deployment,
+                    kozyavka_image,
+                    pritvoryashka_image,
+                    agent_id,
+                ) {
                     tracing::error!(%rollback, "dispatcher rollback failed");
                 }
             }
             return Err(error);
         }
         Ok(())
+    }
+
+    fn deploy_shared_backend(
+        &self,
+        deployment: SharedTcpDeployment,
+        backend_port: u16,
+        kozyavka_image: &str,
+        pritvoryashka_image: &str,
+        agent_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        match deployment {
+            SharedTcpDeployment::Kozyavka(mut deployment) => {
+                deployment.host_port = backend_port;
+                deployment.publish_address = "127.0.0.1".into();
+                self.deploy_kozyavka(deployment, kozyavka_image)
+            }
+            SharedTcpDeployment::Pritvoryashka(mut deployment) => {
+                deployment.host_port = backend_port;
+                deployment.publish_address = "127.0.0.1".into();
+                self.deploy_pritvoryashka(deployment, pritvoryashka_image, agent_id)
+            }
+        }
+    }
+
+    fn deploy_shared_original(
+        &self,
+        deployment: SharedTcpDeployment,
+        kozyavka_image: &str,
+        pritvoryashka_image: &str,
+        agent_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        match deployment {
+            SharedTcpDeployment::Kozyavka(deployment) => {
+                self.deploy_kozyavka(deployment, kozyavka_image)
+            }
+            SharedTcpDeployment::Pritvoryashka(deployment) => {
+                self.deploy_pritvoryashka(deployment, pritvoryashka_image, agent_id)
+            }
+        }
     }
 
     fn compose_down(&self, trap_id: uuid::Uuid, remove_directory: bool) -> anyhow::Result<()> {
@@ -372,17 +551,26 @@ async fn main() -> anyhow::Result<()> {
             let identity = AgentIdentity {
                 agent_id: agent.agent_id,
                 transport_credential: agent.transport_credential,
+                hysteria: agent.hysteria,
             };
             atomic_write(&identity_path, &serde_json::to_vec(&identity)?)?;
             identity
         }
     };
     tracing::info!(agent_id = %identity.agent_id, "agent is registered and running");
+    if let Some(connection) = &identity.hysteria {
+        ensure_hysteria_client(connection, &identity.transport_credential)?;
+    }
     let compose_projects = ComposeProjectStore::new(&args.state_dir);
     fs::create_dir_all(&compose_projects.root)?;
     if let Some(command_file) = args.command_file {
         let command: AgentCommand = serde_json::from_slice(&fs::read(command_file)?)?;
-        let result = compose_projects.apply(command, &args.kozyavka_image)?;
+        let result = compose_projects.apply(
+            command,
+            &args.kozyavka_image,
+            &args.pritvoryashka_image,
+            identity.agent_id,
+        )?;
         println!("{}", serde_json::to_string(&result)?);
         if !result.success {
             anyhow::bail!("command application failed: {}", result.detail);
@@ -391,14 +579,263 @@ async fn main() -> anyhow::Result<()> {
     if args.once {
         return Ok(());
     }
-    // Temporary local bridge for the first agent↔trap deployment test. The HFSP receiver will
-    // feed the same `apply` method and then this inbox can be removed without changing Docker.
+    // Initial SSH bootstrap may seed one root-owned command here. Later commands arrive through
+    // Kazik and use the same idempotent `apply` implementation.
     let inbox = args.state_dir.join("inbox");
     fs::create_dir_all(&inbox)?;
+    let configured_transport = match (args.kazik_hysteria_socks, args.kazik_center_udp) {
+        (Some(socks), Some(center_udp)) => Some((socks, center_udp)),
+        (None, None) if identity.hysteria.is_some() => {
+            Some(("127.0.0.1:1080".parse()?, "127.0.0.1:44000".parse()?))
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("HF_KAZIK_HYSTERIA_SOCKS and HF_KAZIK_CENTER_UDP must be set together"),
+    };
+    if let Some((socks, center_udp)) = configured_transport {
+        return run_kazik_hysteria_loop(
+            &args.state_dir,
+            &inbox,
+            &compose_projects,
+            &args.kozyavka_image,
+            &args.pritvoryashka_image,
+            identity,
+            socks,
+            center_udp,
+        )
+        .await;
+    }
     loop {
-        process_inbox(&inbox, &compose_projects, &args.kozyavka_image);
+        process_inbox(
+            &inbox,
+            &compose_projects,
+            &args.kozyavka_image,
+            &args.pritvoryashka_image,
+            identity.agent_id,
+        );
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+async fn run_kazik_hysteria_loop(
+    state_dir: &Path,
+    inbox: &Path,
+    projects: &ComposeProjectStore,
+    kozyavka_image: &str,
+    pritvoryashka_image: &str,
+    identity: AgentIdentity,
+    socks: SocketAddr,
+    center_udp: SocketAddr,
+) -> anyhow::Result<()> {
+    let transport = Arc::new(HysteriaSocks5UdpTransport::connect(socks, center_udp).await?);
+    let sender = FailoverSender::new(vec![transport.clone()])
+        .map_err(|error| anyhow::anyhow!("Kazik transport setup failed: {error}"))?;
+    let mut outbox = SqliteKazikOutbox::open(state_dir.join("kazik-outbox.sqlite"))?;
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<CommandJob>(32);
+    let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<CommandExecution>(32);
+    let worker_projects = projects.clone();
+    let worker_kozyavka_image = kozyavka_image.to_owned();
+    let worker_pritvoryashka_image = pritvoryashka_image.to_owned();
+    let worker_agent_id = identity.agent_id;
+    tokio::spawn(async move {
+        while let Some(job) = command_rx.recv().await {
+            let projects = worker_projects.clone();
+            let kozyavka_image = worker_kozyavka_image.clone();
+            let pritvoryashka_image = worker_pritvoryashka_image.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                projects.apply(
+                    job.command,
+                    &kozyavka_image,
+                    &pritvoryashka_image,
+                    worker_agent_id,
+                )
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("command worker panicked: {error}"))
+            .and_then(|result| result);
+            if result_tx
+                .send(CommandExecution {
+                    message_id: job.message_id,
+                    result,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    tracing::info!(agent_id = %identity.agent_id, transport = transport.name(), "Kazik Hysteria loop started");
+    loop {
+        process_inbox(
+            inbox,
+            projects,
+            kozyavka_image,
+            pritvoryashka_image,
+            identity.agent_id,
+        );
+        tokio::select! {
+            Some(execution) = result_rx.recv() => {
+                let (disposition, detail) = match execution.result {
+                    Ok(result) if result.success => (AckDisposition::Applied, None),
+                    Ok(result) => (AckDisposition::Rejected, Some(result.detail)),
+                    Err(error) => (AckDisposition::Rejected, Some(error.to_string())),
+                };
+                enqueue_ack(&mut outbox, &identity, execution.message_id, disposition, detail)?;
+                if let Err(error) = send_pending_once(&mut outbox, &sender, 64).await {
+                    tracing::warn!(%error, "command result ACK remains in SQLite outbox");
+                }
+            }
+            _ = heartbeat.tick() => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as i64)
+                    .unwrap_or_default();
+                let active_trap_count = fs::read_dir(state_dir.join("traps"))
+                    .map(|entries| entries.flatten().count() as u32)
+                    .unwrap_or_default();
+                outbox.enqueue(KazikEnvelope::new(
+                    identity.agent_id,
+                    identity.transport_credential.clone(),
+                    now,
+                    KazikBody::Heartbeat { status: AgentStatus {
+                        hostname: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
+                        active_trap_count,
+                    }},
+                ))?;
+                if let Err(error) = send_pending_once(&mut outbox, &sender, 64).await {
+                    tracing::warn!(%error, "Kazik pending packets remain in SQLite outbox");
+                }
+            }
+            received = transport.receive() => match received {
+                Ok(packet) => match KazikEnvelope::decode_hfsp(&packet) {
+                    Ok((envelope, _, _)) if envelope.agent_id == identity.agent_id
+                        && envelope.transport_credential == identity.transport_credential => {
+                        match envelope.body {
+                            KazikBody::Ack(ack)
+                                if matches!(ack.disposition, AckDisposition::Accepted | AckDisposition::Applied | AckDisposition::Duplicate) => {
+                                    outbox.acknowledge(ack.acknowledged_message_id)?;
+                                }
+                            KazikBody::Command { command } => {
+                                if command_tx.try_send(CommandJob { message_id: envelope.message_id, command }).is_err() {
+                                    enqueue_ack(
+                                        &mut outbox,
+                                        &identity,
+                                        envelope.message_id,
+                                        AckDisposition::Rejected,
+                                        Some("agent command queue is full or unavailable".into()),
+                                    )?;
+                                }
+                            }
+                            KazikBody::Ack(_) => {}
+                            _ => {
+                                enqueue_ack(
+                                    &mut outbox,
+                                    &identity,
+                                    envelope.message_id,
+                                    AckDisposition::Rejected,
+                                    Some("message body is not valid from center to agent".into()),
+                                )?;
+                            }
+                        }
+                    }
+                    Ok(_) => tracing::warn!("discarded Kazik packet with mismatched agent credential"),
+                    Err(error) => tracing::warn!(%error, "discarded malformed Kazik packet"),
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "Kazik transport receive failed; retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+}
+
+struct CommandJob {
+    message_id: uuid::Uuid,
+    command: AgentCommand,
+}
+
+struct CommandExecution {
+    message_id: uuid::Uuid,
+    result: anyhow::Result<CommandResult>,
+}
+
+fn enqueue_ack(
+    outbox: &mut SqliteKazikOutbox,
+    identity: &AgentIdentity,
+    acknowledged_message_id: uuid::Uuid,
+    disposition: AckDisposition,
+    detail: Option<String>,
+) -> anyhow::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
+    outbox.enqueue(KazikEnvelope::new(
+        identity.agent_id,
+        identity.transport_credential.clone(),
+        now,
+        KazikBody::Ack(Acknowledgement {
+            acknowledged_message_id,
+            disposition,
+            detail,
+        }),
+    ))?;
+    Ok(())
+}
+
+/// Materialize the per-agent Hysteria client only after the center has consumed the one-time
+/// enrollment token. The transport credential is root-readable only and TLS verification stays
+/// enabled by deliberately omitting Hysteria's `insecure` option.
+fn ensure_hysteria_client(connection: &HysteriaConnection, credential: &str) -> anyhow::Result<()> {
+    validate_hysteria_config_value("server", &connection.server)?;
+    validate_hysteria_config_value("sni", &connection.sni)?;
+    validate_hysteria_config_value("credential", credential)?;
+    if !Path::new("/usr/local/bin/hysteria").is_file() {
+        anyhow::bail!(
+            "Hysteria endpoint was issued but /usr/local/bin/hysteria is absent; bootstrap with HF_HYSTERIA_BINARY"
+        );
+    }
+    if !Command::new("systemctl")
+        .arg("--version")
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        anyhow::bail!("Hysteria client service currently requires systemd");
+    }
+    fs::create_dir_all("/etc/honeyforge")?;
+    let client_config = format!(
+        "server: \"{}\"\nauth: \"{}\"\ntls:\n  sni: \"{}\"\nsocks5:\n  listen: 127.0.0.1:1080\n  disableUDP: false\n",
+        connection.server, credential, connection.sni
+    );
+    atomic_write(
+        Path::new("/etc/honeyforge/hysteria-client.yaml"),
+        client_config.as_bytes(),
+    )?;
+    atomic_write(
+        Path::new("/etc/systemd/system/hf-hysteria-client.service"),
+        b"[Unit]\nDescription=HoneyForge Hysteria client\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nExecStart=/usr/local/bin/hysteria client -c /etc/honeyforge/hysteria-client.yaml\nRestart=always\nRestartSec=3\nNoNewPrivileges=true\n[Install]\nWantedBy=multi-user.target\n",
+    )?;
+    run_program("systemctl", &["daemon-reload"])?;
+    run_program(
+        "systemctl",
+        &["enable", "--now", "hf-hysteria-client.service"],
+    )?;
+    tracing::info!(server = %connection.server, sni = %connection.sni, "Hysteria client service is enabled");
+    Ok(())
+}
+
+fn validate_hysteria_config_value(name: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value.len() > 253
+        || value
+            .chars()
+            .any(|c| c.is_control() || c == '"' || c == '\\')
+    {
+        anyhow::bail!("unsafe Hysteria {name} value");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -591,6 +1028,17 @@ fn docker_compose_available() -> bool {
         .is_ok_and(|status| status.success())
 }
 
+fn validate_container_image(image: &str, trap_name: &str) -> anyhow::Result<()> {
+    if image.is_empty()
+        || image
+            .chars()
+            .any(|character| !(character.is_ascii_alphanumeric() || "._/-:@".contains(character)))
+    {
+        anyhow::bail!("unsafe {trap_name} image reference");
+    }
+    Ok(())
+}
+
 fn run_program(program: &str, args: &[&str]) -> anyhow::Result<()> {
     let status = Command::new(program).args(args).status()?;
     if !status.success() {
@@ -599,7 +1047,13 @@ fn run_program(program: &str, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn process_inbox(inbox: &Path, projects: &ComposeProjectStore, image: &str) {
+fn process_inbox(
+    inbox: &Path,
+    projects: &ComposeProjectStore,
+    kozyavka_image: &str,
+    pritvoryashka_image: &str,
+    agent_id: uuid::Uuid,
+) {
     let entries = match fs::read_dir(inbox) {
         Ok(entries) => entries,
         Err(error) => {
@@ -615,7 +1069,9 @@ fn process_inbox(inbox: &Path, projects: &ComposeProjectStore, image: &str) {
         let result = fs::read(&path)
             .map_err(anyhow::Error::from)
             .and_then(|bytes| Ok(serde_json::from_slice::<AgentCommand>(&bytes)?))
-            .and_then(|command| projects.apply(command, image));
+            .and_then(|command| {
+                projects.apply(command, kozyavka_image, pritvoryashka_image, agent_id)
+            });
         match result {
             Ok(result) if result.success => {
                 let processed = inbox.join("processed");
