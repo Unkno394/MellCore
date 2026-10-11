@@ -1,0 +1,25 @@
+#cloud-config
+package_update: true
+packages:
+  - openssh-server
+  - qemu-guest-agent
+users:
+  - name: analyst
+    groups: [adm, systemd-journal]
+    shell: /bin/bash
+    lock_passwd: false
+    plain_text_passwd: change-me-per-instance
+ssh_pwauth: true
+disable_root: false
+write_files:
+  - path: /etc/ssh/sshd_config.d/90-honeyforge.conf
+    permissions: '0644'
+    content: |
+      PasswordAuthentication yes
+      PermitRootLogin prohibit-password
+      X11Forwarding no
+runcmd:
+  - systemctl enable --now ssh
+  - systemctl enable --now qemu-guest-agent
+  - mkdir -p /srv/operations/backups
+  - sh -c 'echo quarterly-report-placeholder > /srv/operations/backups/q4.txt'

@@ -1,0 +1,11 @@
+# Development only: the certificate is generated locally by generate-cert.sh.
+listen: 127.0.0.1:8443
+tls:
+  cert: ./certs/localhost.crt
+  key: ./certs/localhost.key
+  sniGuard: strict
+auth:
+  type: password
+  password: honeyforge-local-dev-only
+disableUDP: false
+udpIdleTimeout: 60s

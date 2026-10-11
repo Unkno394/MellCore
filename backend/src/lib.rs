@@ -15,3 +15,4 @@ pub mod resources;
 pub mod email_verification;
 pub mod kozyavka;
 pub mod mail;
+pub mod dispatcher;

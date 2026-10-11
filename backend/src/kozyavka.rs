@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr};
 use utoipa::ToSchema;
 use uuid::Uuid;
+use hf_core::{AgentCommand, KozyavkaDeployment};
 
 pub const PROFILE_ID: Uuid = Uuid::from_u128(0x6b6f7a79_6176_4b61_8000_000000000001);
 
@@ -96,4 +97,19 @@ pub fn runtime_config(trap: &Trap) -> Result<RuntimeConfig, AppError> {
         banner: settings.banner,
         trap_id: trap.trap_id,
     })
+}
+
+/// The control-plane representation sent through HFSP to the agent. It contains only values
+/// already validated by the profile and port-reservation logic; never user-provided compose YAML.
+pub fn deployment_command(trap: &Trap) -> Result<AgentCommand, AppError> {
+    let runtime = runtime_config(trap)?;
+    let host_port = trap.ports.first().ok_or_else(AppError::internal)?.host_port;
+    Ok(AgentCommand::DeployKozyavka(KozyavkaDeployment {
+        command_id: Uuid::new_v4(),
+        trap_id: runtime.trap_id,
+        host_port,
+        container_port: runtime.port,
+        banner: runtime.banner,
+        publish_address: "0.0.0.0".into(),
+    }))
 }

@@ -25,3 +25,5 @@ __pycache__/
 *.tmp
 *.swp
 .DS_Store
+deploy/local-hysteria/certs/
+.tools/

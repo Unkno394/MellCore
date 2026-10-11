@@ -1,0 +1,10 @@
+# Development only. Production uses an individually issued credential and a real CA certificate.
+server: 127.0.0.1:8443
+auth: honeyforge-local-dev-only
+tls:
+  sni: localhost
+  insecure: false
+  ca: ./certs/localhost.crt
+socks5:
+  listen: 127.0.0.1:1080
+  disableUDP: false
