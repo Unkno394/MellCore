@@ -8,6 +8,7 @@ use std::{
 };
 
 mod sandbox;
+mod telemetry;
 
 use anyhow::Context;
 use clap::Parser;
@@ -239,6 +240,15 @@ impl ComposeProjectStore {
             &project_dir.join("config.json"),
             &serde_json::to_vec_pretty(&container_config)?,
         )?;
+        // This public banner configuration must be readable by the image's UID 65532.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                project_dir.join("config.json"),
+                fs::Permissions::from_mode(0o644),
+            )?;
+        }
         let compose = format!(
             "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    command: [\"--config\", \"/etc/honeyforge/config.json\"]\n    ports:\n      - \"{}:{}:{}/tcp\"\n    volumes:\n      - ./config.json:/etc/honeyforge/config.json:ro\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    init: true\n",
             deployment.trap_id.simple(),
@@ -280,6 +290,11 @@ impl ComposeProjectStore {
         validate_container_image(image, "pritvoryashka")?;
         let project_dir = self.root.join(deployment.trap_id.to_string());
         fs::create_dir_all(project_dir.join("runtime"))?;
+        let telemetry_endpoint = std::env::var("HF_TELEMETRY_PUBLIC_ENDPOINT").ok();
+        let telemetry_enabled = telemetry_endpoint.is_some();
+        if telemetry_enabled && std::env::var("HF_TELEMETRY_INGEST_TOKEN").is_err() {
+            anyhow::bail!("HF_TELEMETRY_INGEST_TOKEN is required with telemetry endpoint");
+        }
         atomic_write(
             &project_dir.join("manifest.json"),
             &serde_json::to_vec_pretty(&deployment)?,
@@ -294,13 +309,13 @@ impl ComposeProjectStore {
             "host_key": "/var/lib/pritvoryashka/host_ed25519",
             "auth": {"policy": "accept_all", "capture": "username", "max_attempts": 6},
             "telemetry": {
-                "endpoint": null,
-                "token_env": null,
+                "endpoint": telemetry_endpoint,
+                "token_env": if telemetry_enabled { Some("HF_TELEMETRY_INGEST_TOKEN") } else { None },
                 "jsonl_path": "/var/lib/pritvoryashka/events.jsonl",
                 "queue_capacity": 1024,
                 "batch_size": 50,
                 "flush_interval_ms": 500,
-                "max_event_bytes": 65536
+            "max_event_bytes": 49152
             },
             "max_connections": deployment.max_connections,
             "idle_timeout_seconds": 600,
@@ -310,13 +325,16 @@ impl ComposeProjectStore {
             &project_dir.join("pritvoryashka.json"),
             &serde_json::to_vec_pretty(&container_config)?,
         )?;
-        let compose = format!(
+        let mut compose = format!(
             "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    ports:\n      - \"{}:{}:2222/tcp\"\n    volumes:\n      - ./pritvoryashka.json:/etc/honeyforge/pritvoryashka.json:ro\n      - ./runtime:/var/lib/pritvoryashka\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    init: true\n",
             deployment.trap_id.simple(),
             image,
             deployment.publish_address,
             deployment.host_port,
         );
+        if telemetry_enabled {
+            compose.push_str("    environment:\n      HF_TELEMETRY_INGEST_TOKEN: ${HF_TELEMETRY_INGEST_TOKEN:?Telemetry token required}\n");
+        }
         atomic_write(&project_dir.join("compose.yaml"), compose.as_bytes())?;
         self.compose(
             &project_dir,
@@ -631,6 +649,7 @@ async fn run_kazik_hysteria_loop(
         .map_err(|error| anyhow::anyhow!("Kazik transport setup failed: {error}"))?;
     let mut outbox = SqliteKazikOutbox::open(state_dir.join("kazik-outbox.sqlite"))?;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+    let mut telemetry_poll = tokio::time::interval(Duration::from_secs(5));
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<CommandJob>(32);
     let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<CommandExecution>(32);
     let worker_projects = projects.clone();
@@ -684,6 +703,23 @@ async fn run_kazik_hysteria_loop(
                 enqueue_ack(&mut outbox, &identity, execution.message_id, disposition, detail)?;
                 if let Err(error) = send_pending_once(&mut outbox, &sender, 64).await {
                     tracing::warn!(%error, "command result ACK remains in SQLite outbox");
+                }
+            }
+            _ = telemetry_poll.tick() => {
+                match telemetry::collect_new_events(
+                    &projects.root,
+                    state_dir,
+                    &identity,
+                    &mut outbox,
+                ) {
+                    Ok(count) if count > 0 => {
+                        tracing::info!(events = count, "trap telemetry queued for Center");
+                        if let Err(error) = send_pending_once(&mut outbox, &sender, 64).await {
+                            tracing::warn!(%error, "trap telemetry remains in durable outbox");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "trap telemetry collection failed"),
                 }
             }
             _ = heartbeat.tick() => {

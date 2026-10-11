@@ -16,7 +16,6 @@ use axum::{
     response::Html,
     routing::{get, post},
 };
-use base64::Engine as _;
 use clap::Parser;
 use hf_core::{
     AgentCommand, AgentRegistration, BootstrapScript, CoreError, HighUbuntuDeployment,
@@ -24,15 +23,25 @@ use hf_core::{
 };
 use kazik_protocol::{AckDisposition, Acknowledgement, KazikBody, KazikEnvelope};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use ssh2::Session;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+mod credentials;
+mod telemetry_store;
+use credentials::CredentialStore;
+use telemetry_store::TelemetryStore;
+
 #[derive(Parser)]
 struct Args {
+    /// Root-owned credential store. Survives Center restarts and may contain a local agent.
+    #[arg(long, env = "HF_CENTER_CREDENTIALS_FILE")]
+    credentials_file: Option<PathBuf>,
+    /// Durable JSON Lines sink for events received through authenticated Kazik telemetry.
+    #[arg(long, env = "HF_CENTER_TELEMETRY_FILE", default_value = "/var/lib/honeyforge/telemetry/events.jsonl")]
+    telemetry_file: PathBuf,
     #[arg(long, env = "HF_CENTER_LISTEN", default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
     /// UDP receiver behind Hysteria. Keep it loopback-only; Hysteria terminates public QUIC/TLS.
@@ -74,13 +83,15 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     enrollment_tokens: Arc<Mutex<HashMap<String, Uuid>>>,
-    agent_credentials: Arc<Mutex<HashMap<Uuid, String>>>,
+    bootstrap_jobs: Arc<Mutex<HashMap<Uuid, BootstrapJob>>>,
+    agent_credentials: Arc<Mutex<CredentialStore>>,
     bootstrapper: Arc<dyn RemoteBootstrap>,
     public_center_url: Arc<str>,
     hysteria_connection: Option<HysteriaConnection>,
     control_token: Option<Arc<str>>,
     pending_commands: Arc<Mutex<HashMap<Uuid, VecDeque<KazikEnvelope>>>>,
     kazik_sequence: Arc<AtomicU64>,
+    telemetry_store: Arc<Mutex<TelemetryStore>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,8 +106,6 @@ struct BootstrapRequest {
     ssh_private_key: Option<String>,
     /// Optional passphrase for `ssh_private_key`.
     ssh_key_passphrase: Option<String>,
-    /// OpenSSH-style server host-key fingerprint: `SHA256:<base64-without-padding>`.
-    known_host_sha256: String,
     /// Optional first trap, deployed by the newly installed agent without a second SSH session.
     initial_high_ubuntu: Option<InitialHighUbuntuRequest>,
 }
@@ -112,10 +121,26 @@ struct InitialHighUbuntuRequest {
 
 #[derive(Debug, Serialize)]
 struct BootstrapResponse {
+    job_id: Uuid,
     agent_id: Uuid,
     enrollment_token: String,
     initial_trap_id: Option<Uuid>,
     status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BootstrapJobState {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BootstrapJob {
+    agent_id: Uuid,
+    status: BootstrapJobState,
+    message: Option<String>,
 }
 
 /// Request body Hysteria sends to `auth.type: http`. The remote address and rate are
@@ -223,7 +248,8 @@ async fn main() -> anyhow::Result<()> {
     let kazik_udp_listen = args.kazik_udp_listen;
     let state = AppState {
         enrollment_tokens: Arc::default(),
-        agent_credentials: Arc::default(),
+        bootstrap_jobs: Arc::default(),
+        agent_credentials: Arc::new(Mutex::new(CredentialStore::open(args.credentials_file)?)),
         bootstrapper: Arc::new(SshBootstrapper {
             agent_binary: args.agent_binary,
             kozyavka_image_archive: args.kozyavka_image_archive,
@@ -237,11 +263,13 @@ async fn main() -> anyhow::Result<()> {
         control_token,
         pending_commands: Arc::default(),
         kazik_sequence: Arc::new(AtomicU64::new(1)),
+        telemetry_store: Arc::new(Mutex::new(TelemetryStore::open(args.telemetry_file)?)),
     };
     tokio::spawn(kazik_udp_receiver(kazik_udp_listen, state.clone()));
     let app = Router::new()
         .route("/", get(dev_panel))
         .route("/v1/agents/bootstrap", post(bootstrap))
+        .route("/v1/agents/bootstrap/{job_id}", get(bootstrap_status))
         .route("/v1/agents/register", post(register))
         .route("/v1/hysteria/auth", post(hysteria_auth))
         .route("/v1/agents/{agent_id}/commands", post(queue_command))
@@ -316,23 +344,67 @@ async fn bootstrap(
         port: request.ssh_port,
         user: request.ssh_user,
         auth,
-        known_host_sha256: request.known_host_sha256,
     };
-    if let Err(error) = state.bootstrapper.install_agent(target, script).await {
-        warn!(%error, "bootstrap failed");
-        return Err(StatusCode::BAD_GATEWAY);
-    }
     state
         .enrollment_tokens
         .lock()
         .await
         .insert(token.clone(), agent_id);
+    let job_id = Uuid::new_v4();
+    state.bootstrap_jobs.lock().await.insert(
+        job_id,
+        BootstrapJob {
+            agent_id,
+            status: BootstrapJobState::Running,
+            message: None,
+        },
+    );
+    let bootstrapper = state.bootstrapper.clone();
+    let jobs = state.bootstrap_jobs.clone();
+    let enrollment_tokens = state.enrollment_tokens.clone();
+    let token_for_job = token.clone();
+    tokio::spawn(async move {
+        let result = bootstrapper.install_agent(target, script).await;
+        let (status, message) = match result {
+            Ok(()) => {
+                info!(%job_id, %agent_id, "agent bootstrap completed");
+                (BootstrapJobState::Succeeded, None)
+            }
+            Err(error) => {
+                warn!(%error, %job_id, "bootstrap failed");
+                enrollment_tokens.lock().await.remove(&token_for_job);
+                (
+                    BootstrapJobState::Failed,
+                    Some("Установка агента завершилась ошибкой. Проверьте лог на целевом сервере.".into()),
+                )
+            }
+        };
+        if let Some(job) = jobs.lock().await.get_mut(&job_id) {
+            job.status = status;
+            job.message = message;
+        }
+    });
     Ok(Json(BootstrapResponse {
+        job_id,
         agent_id,
         enrollment_token: token,
         initial_trap_id,
         status: "bootstrap_started",
     }))
+}
+
+async fn bootstrap_status(
+    State(state): State<AppState>,
+    RoutePath(job_id): RoutePath<Uuid>,
+) -> Result<Json<BootstrapJob>, StatusCode> {
+    state
+        .bootstrap_jobs
+        .lock()
+        .await
+        .get(&job_id)
+        .cloned()
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 fn validate_bootstrap_request(request: &BootstrapRequest) -> Result<(), StatusCode> {
@@ -345,17 +417,6 @@ fn validate_bootstrap_request(request: &BootstrapRequest) -> Result<(), StatusCo
             .chars()
             .any(|character| character.is_control() || character.is_whitespace());
     if host_is_invalid || request.ssh_port == 0 || request.ssh_user.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let Some(encoded_fingerprint) = request.known_host_sha256.strip_prefix("SHA256:") else {
-        return Err(StatusCode::BAD_REQUEST);
-    };
-    let fingerprint_is_valid = base64::engine::general_purpose::STANDARD_NO_PAD
-        .decode(encoded_fingerprint)
-        .map(|bytes| bytes.len() == 32)
-        .unwrap_or(false);
-    if !fingerprint_is_valid {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -408,11 +469,15 @@ async fn register(
     };
     // Provision an individual Hysteria/Kazik credential here; it is checked alongside agent_id.
     let transport_credential = format!("hf-dev-{}", Uuid::new_v4());
-    state
+    if let Err(error) = state
         .agent_credentials
         .lock()
         .await
-        .insert(agent_id, transport_credential.clone());
+        .insert(agent_id, transport_credential.clone())
+    {
+        tracing::error!(%error, "could not persist agent credential");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     Ok(Json(RegisteredAgent {
         agent_id,
         transport_credential,
@@ -425,9 +490,7 @@ async fn hysteria_auth(
     Json(request): Json<HysteriaAuthRequest>,
 ) -> Json<HysteriaAuthResponse> {
     let credentials = state.agent_credentials.lock().await;
-    let agent_id = credentials
-        .iter()
-        .find_map(|(agent_id, credential)| (credential == &request.auth).then_some(*agent_id));
+    let agent_id = credentials.authenticate(&request.auth);
     Json(HysteriaAuthResponse {
         ok: agent_id.is_some(),
         id: agent_id.map(|value| value.to_string()),
@@ -519,18 +582,28 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
                     commands.retain(|command| command.message_id != ack.acknowledged_message_id);
                 }
             }
+            // ACKs terminate a delivery exchange; ACKing an ACK would create an infinite loop.
             continue;
         }
         let disposition = match &envelope.body {
             KazikBody::Telemetry { events } => {
-                tracing::info!(agent_id = %envelope.agent_id, events = events.len(), "Kazik telemetry accepted");
+                let stored = match state.telemetry_store.lock().await.persist(envelope.agent_id, events) {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        tracing::error!(%error, agent_id = %envelope.agent_id, events = events.len(), "could not persist Kazik telemetry; leaving it unacknowledged");
+                        continue;
+                    }
+                };
+                tracing::info!(agent_id = %envelope.agent_id, received = events.len(), stored, "Kazik telemetry persisted");
                 AckDisposition::Accepted
             }
             KazikBody::Heartbeat { .. } => AckDisposition::Accepted,
             KazikBody::Register(_) | KazikBody::Command { .. } | KazikBody::Error { .. } => {
                 AckDisposition::Rejected
             }
-            KazikBody::Ack(_) => unreachable!(),
+            // ACK envelopes themselves live in the agent's durable outbox. Confirm receipt so
+            // completed command results do not accumulate there indefinitely.
+            KazikBody::Ack(_) => AckDisposition::Accepted,
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -588,7 +661,7 @@ async fn send_next_command(
 
 fn render_install_script(token: &str, center_url: &str) -> String {
     let mut script = format!(
-        "#!/bin/sh\nset -eu\nif [ \"$(id -u)\" -eq 0 ]; then SUDO=''; else SUDO='sudo -n'; fi\nensure_docker() {{\n  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then return; fi\n  [ -r /etc/os-release ] || {{ echo 'Cannot identify Linux distribution' >&2; exit 1; }}\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2\n      $SUDO systemctl enable --now docker\n      ;;\n    fedora)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    rhel|centos|rocky|almalinux)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    arch|manjaro)\n      $SUDO pacman -Sy --noconfirm docker docker-compose\n      $SUDO systemctl enable --now docker\n      ;;\n    alpine)\n      $SUDO apk add docker docker-cli-compose\n      $SUDO rc-update add docker default\n      $SUDO service docker start\n      ;;\n    *) echo \"Unsupported Linux distribution: $ID\" >&2; exit 1 ;;\n  esac\n  docker compose version >/dev/null\n}}\n$SUDO install -d -m 0700 /etc/honeyforge\n$SUDO install -m 0755 /tmp/hf-agent-bootstrap /usr/local/bin/hf-agent\nif [ -f /tmp/hf-kozyavka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-kozyavka-image.tar\n  rm -f /tmp/hf-kozyavka-image.tar\nfi\nprintf '%s' '{token}' | $SUDO tee /etc/honeyforge/enrollment-token >/dev/null\nif command -v systemctl >/dev/null 2>&1; then\n  $SUDO tee /etc/systemd/system/hf-agent.service >/dev/null <<'UNIT'\n[Unit]\nDescription=HoneyForge agent\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nEnvironment=HF_CENTER_URL={center_url}\nEnvironment=HF_KOZYAVKA_IMAGE=honeyforge-low:local\nExecStart=/usr/local/bin/hf-agent\nRestart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\nUNIT\n  $SUDO systemctl daemon-reload\n  $SUDO systemctl enable --now hf-agent.service\nelif command -v rc-update >/dev/null 2>&1; then\n  $SUDO tee /etc/init.d/hf-agent >/dev/null <<'OPENRC'\n#!/sbin/openrc-run\nname=\"HoneyForge agent\"\ncommand=\"/usr/local/bin/hf-agent\"\ncommand_background=\"yes\"\npidfile=\"/run/hf-agent.pid\"\nexport HF_CENTER_URL={center_url}\nexport HF_KOZYAVKA_IMAGE=honeyforge-low:local\nOPENRC\n  $SUDO chmod 0755 /etc/init.d/hf-agent\n  $SUDO rc-update add hf-agent default\n  $SUDO rc-service hf-agent start\nelse\n  echo 'Unsupported init system: systemd or OpenRC is required' >&2\n  exit 1\nfi\nrm -f /tmp/hf-agent-bootstrap\n"
+        "#!/bin/sh\nset -eu\nif [ \"$(id -u)\" -eq 0 ]; then SUDO=''; else SUDO='sudo -n'; fi\nensure_docker() {{\n  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then return; fi\n  [ -r /etc/os-release ] || {{ echo 'Cannot identify Linux distribution' >&2; exit 1; }}\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        echo 'Regional Ubuntu mirror configured; switching to archive.ubuntu.com before package update' >&2\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2\n      $SUDO systemctl enable --now docker\n      ;;\n    fedora)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    rhel|centos|rocky|almalinux)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    arch|manjaro)\n      $SUDO pacman -Sy --noconfirm docker docker-compose\n      $SUDO systemctl enable --now docker\n      ;;\n    alpine)\n      $SUDO apk add docker docker-cli-compose\n      $SUDO rc-update add docker default\n      $SUDO service docker start\n      ;;\n    *) echo \"Unsupported Linux distribution: $ID\" >&2; exit 1 ;;\n  esac\n  docker compose version >/dev/null\n}}\n$SUDO install -d -m 0700 /etc/honeyforge\n$SUDO install -m 0755 /tmp/hf-agent-bootstrap /usr/local/bin/hf-agent\nif [ -f /tmp/hf-kozyavka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-kozyavka-image.tar\n  rm -f /tmp/hf-kozyavka-image.tar\nfi\nprintf '%s' '{token}' | $SUDO tee /etc/honeyforge/enrollment-token >/dev/null\nif command -v systemctl >/dev/null 2>&1; then\n  $SUDO tee /etc/systemd/system/hf-agent.service >/dev/null <<'UNIT'\n[Unit]\nDescription=HoneyForge agent\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nEnvironment=HF_CENTER_URL={center_url}\nEnvironment=HF_KOZYAVKA_IMAGE=honeyforge-low:local\nExecStart=/usr/local/bin/hf-agent\nRestart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\nUNIT\n  $SUDO systemctl daemon-reload\n  $SUDO systemctl enable --now hf-agent.service\nelif command -v rc-update >/dev/null 2>&1; then\n  $SUDO tee /etc/init.d/hf-agent >/dev/null <<'OPENRC'\n#!/sbin/openrc-run\nname=\"HoneyForge agent\"\ncommand=\"/usr/local/bin/hf-agent\"\ncommand_background=\"yes\"\npidfile=\"/run/hf-agent.pid\"\nexport HF_CENTER_URL={center_url}\nexport HF_KOZYAVKA_IMAGE=honeyforge-low:local\nOPENRC\n  $SUDO chmod 0755 /etc/init.d/hf-agent\n  $SUDO rc-update add hf-agent default\n  $SUDO rc-service hf-agent start\nelse\n  echo 'Unsupported init system: systemd or OpenRC is required' >&2\n  exit 1\nfi\nrm -f /tmp/hf-agent-bootstrap\n"
     );
     script.push_str(
         "\nif [ -f /tmp/hf-high-ubuntu-ssh.tar.gz ]; then\n  $SUDO install -d -m 0755 /usr/local/lib/honeyforge\n  $SUDO tar -xzf /tmp/hf-high-ubuntu-ssh.tar.gz -C /usr/local/lib/honeyforge\n  $SUDO chmod -R a-w /usr/local/lib/honeyforge/high-ubuntu-ssh/cloud-init\n  $SUDO find /usr/local/lib/honeyforge/high-ubuntu-ssh/scripts -type f -exec chmod 0755 {} \\;\n  rm -f /tmp/hf-high-ubuntu-ssh.tar.gz\nfi\nif [ -f /tmp/hf-initial-command.json ]; then\n  $SUDO install -d -m 0700 /var/lib/honeyforge/inbox\n  $SUDO install -m 0600 /tmp/hf-initial-command.json /var/lib/honeyforge/inbox/initial-high.json\n  rm -f /tmp/hf-initial-command.json\nfi\n",
@@ -623,24 +696,7 @@ fn run_ssh_install(
     session
         .handshake()
         .map_err(|error| CoreError::Transport(format!("SSH handshake failed: {error}")))?;
-    debug!(host = %target.host, "SSH handshake completed; verifying host key");
-    let (host_key, _) = session
-        .host_key()
-        .ok_or_else(|| CoreError::Transport("server did not provide an SSH host key".into()))?;
-    let actual_fingerprint = format!(
-        "SHA256:{}",
-        base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD_NO_PAD,
-            Sha256::digest(host_key)
-        )
-    );
-    if actual_fingerprint != target.known_host_sha256 {
-        warn!(host = %target.host, actual_fingerprint = %actual_fingerprint, "SSH host-key fingerprint mismatch");
-        return Err(CoreError::Transport(
-            "SSH host-key fingerprint mismatch".into(),
-        ));
-    }
-    info!(host = %target.host, "SSH host-key verified");
+    debug!(host = %target.host, "SSH handshake completed; host-key verification is disabled");
     match &target.auth {
         hf_core::SshAuthentication::Password(password) => session
             .userauth_password(&target.user, password)
@@ -677,6 +733,9 @@ fn run_ssh_install(
     remote_binary
         .send_eof()
         .map_err(|error| CoreError::Transport(format!("cannot finish agent upload: {error}")))?;
+    remote_binary
+        .wait_eof()
+        .map_err(|error| CoreError::Transport(format!("agent upload did not reach EOF: {error}")))?;
     remote_binary
         .wait_close()
         .map_err(|error| CoreError::Transport(format!("agent upload failed: {error}")))?;
@@ -720,6 +779,9 @@ fn run_ssh_install(
                 "cannot finish initial trap command upload: {error}"
             ))
         })?;
+        remote.wait_eof().map_err(|error| {
+            CoreError::Transport(format!("initial trap command did not reach EOF: {error}"))
+        })?;
         remote.wait_close().map_err(|error| {
             CoreError::Transport(format!("initial trap command upload failed: {error}"))
         })?;
@@ -729,7 +791,7 @@ fn run_ssh_install(
         .channel_session()
         .map_err(|error| CoreError::Transport(format!("cannot open SSH channel: {error}")))?;
     channel
-        .exec("sh -s")
+        .exec("sh -s >/tmp/hf-agent-bootstrap.log 2>&1")
         .map_err(|error| CoreError::Transport(format!("cannot start remote installer: {error}")))?;
     channel
         .write_all(script.contents.as_bytes())
@@ -737,6 +799,9 @@ fn run_ssh_install(
     channel
         .send_eof()
         .map_err(|error| CoreError::Transport(format!("cannot finish installer input: {error}")))?;
+    channel
+        .wait_eof()
+        .map_err(|error| CoreError::Transport(format!("remote installer did not reach EOF: {error}")))?;
     channel
         .wait_close()
         .map_err(|error| CoreError::Transport(format!("remote installer failed: {error}")))?;
@@ -773,6 +838,9 @@ fn upload_file(
         .send_eof()
         .map_err(|error| CoreError::Transport(format!("cannot finish artifact upload: {error}")))?;
     remote
+        .wait_eof()
+        .map_err(|error| CoreError::Transport(format!("artifact upload did not reach EOF: {error}")))?;
+    remote
         .wait_close()
         .map_err(|error| CoreError::Transport(format!("artifact upload failed: {error}")))?;
     Ok(())
@@ -782,8 +850,6 @@ fn upload_file(
 mod tests {
     use super::*;
 
-    const FINGERPRINT: &str = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
     fn password_request(host: &str) -> BootstrapRequest {
         BootstrapRequest {
             host: host.into(),
@@ -792,7 +858,6 @@ mod tests {
             ssh_password: Some("secret".into()),
             ssh_private_key: None,
             ssh_key_passphrase: None,
-            known_host_sha256: FINGERPRINT.into(),
             initial_high_ubuntu: None,
         }
     }
@@ -824,8 +889,7 @@ mod tests {
             Some("-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----".into());
         assert!(validate_bootstrap_request(&request).is_err());
         request.ssh_private_key = None;
-        request.known_host_sha256 = "SHA256:not-a-host-key".into();
-        assert!(validate_bootstrap_request(&request).is_err());
+        assert!(validate_bootstrap_request(&request).is_ok());
     }
 
     #[test]

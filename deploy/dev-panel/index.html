@@ -26,7 +26,7 @@
 
   <section>
     <h2>1. Подключить VPS</h2>
-    <p class="hint">Нужен SHA256 fingerprint SSH host key. Пароль/ключ уходят только в запрос bootstrap и не сохраняются браузером.</p>
+    <p class="hint">Пароль/ключ используются только для SSH-подключения и не сохраняются браузером. Проверка host key SSH отключена.</p>
     <form id="bootstrap-form">
       <fieldset>
         <label>IP / hostname<input id="host" required placeholder="203.0.113.10 или 2001:db8::10"></label>
@@ -35,7 +35,6 @@
         <label>Способ входа<select id="auth-kind"><option value="password">Пароль</option><option value="key">Приватный ключ PEM</option></select></label>
         <label id="password-label" class="wide">SSH пароль<input id="ssh-password" type="password" autocomplete="new-password"></label>
         <label id="key-label" class="wide hidden">Приватный ключ PEM<textarea id="ssh-key" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></label>
-        <label class="wide">Fingerprint сервера<input id="fingerprint" required placeholder="SHA256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></label>
       </fieldset>
       <button>Установить агент</button>
     </form>
@@ -43,11 +42,10 @@
 
   <section>
     <h2>2. Поставить ловушку</h2>
-    <p class="hint">После bootstrap подожди пока агент зарегистрируется. Для dev control-plane введи <code>HF_CONTROL_TOKEN</code>; он не сохраняется.</p>
+    <p class="hint">После bootstrap подожди пока агент зарегистрируется, затем выбери уровень ловушки и порт.</p>
     <form id="trap-form">
       <fieldset>
         <label>Agent ID<input id="agent-id" required placeholder="Появится после bootstrap"></label>
-        <label>Control token<input id="control-token" type="password" required></label>
         <label>Уровень<select id="trap-kind"><option value="low">Low — баннер SSH</option><option value="middle">Middle — Pritvoryashka SSH</option></select></label>
         <label>Внешний TCP порт<input id="trap-port" type="number" min="1" max="65535" value="2222" required></label>
         <label id="banner-label" class="wide">SSH banner Low<input id="banner" value="SSH-2.0-OpenSSH_9.6" maxlength="253"></label>
@@ -87,12 +85,27 @@
       return body ? JSON.parse(body) : null;
     }
 
+    async function waitForBootstrap(jobId, agentId) {
+      const deadline = Date.now() + 20 * 60 * 1000;
+      while (Date.now() < deadline) {
+        const job = await request(`/v1/agents/bootstrap/${encodeURIComponent(jobId)}`);
+        if (job.status === 'succeeded') {
+          status(`Агент установлен. Agent ID: ${agentId}\nТеперь можно поставить ловушку.`);
+          return;
+        }
+        if (job.status === 'failed') throw new Error(job.message || 'Установка агента завершилась ошибкой.');
+        status(`Устанавливаю агента на сервере…\nAgent ID: ${agentId}\nМожно закрыть страницу — установка продолжится.`);
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+      throw new Error('Установка ещё выполняется. Обнови страницу и проверь статус позже.');
+    }
+
     $('bootstrap-form').onsubmit = async event => {
       event.preventDefault();
       const key = $('auth-kind').value === 'key';
       const body = {
         host: $('host').value.trim(), ssh_port: Number($('ssh-port').value),
-        ssh_user: $('ssh-user').value.trim(), known_host_sha256: $('fingerprint').value.trim(),
+        ssh_user: $('ssh-user').value.trim(),
         ssh_password: key ? null : $('ssh-password').value,
         ssh_private_key: key ? $('ssh-key').value : null,
         ssh_key_passphrase: null
@@ -103,7 +116,8 @@
         const result = await request('/v1/agents/bootstrap', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
         $('agent-id').value = result.agent_id;
         $('ssh-password').value = ''; $('ssh-key').value = '';
-        status(`Bootstrap запущен. Agent ID: ${result.agent_id}\nПодожди 10–20 секунд регистрации агента, затем поставь ловушку.`);
+        status(`Установка запущена. Agent ID: ${result.agent_id}`);
+        await waitForBootstrap(result.job_id, result.agent_id);
       } catch (error) { status(`Ошибка bootstrap: ${error.message}`); }
       finally { event.submitter.disabled = false; }
     };
@@ -123,7 +137,7 @@
       event.submitter.disabled = true; status('Ставлю команду в очередь агента…');
       try {
         const result = await request(`/v1/agents/${encodeURIComponent(agentId)}/commands`, {
-          method:'POST', headers:{'content-type':'application/json','x-honeyforge-control-token':$('control-token').value}, body:JSON.stringify(command)
+          method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(command)
         });
         status(`Команда ${result.status}: ${result.message_id}\nАгент заберёт её на ближайшем heartbeat (до 20 секунд).`);
       } catch (error) { status(`Ошибка постановки ловушки: ${error.message}`); }

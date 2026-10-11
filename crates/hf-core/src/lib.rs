@@ -62,7 +62,6 @@ pub struct SshBootstrapTarget {
     pub port: u16,
     pub user: String,
     pub auth: SshAuthentication,
-    pub known_host_sha256: String,
 }
 
 /// Ephemeral SSH authentication material. Never derive Debug/Serialize for this type.

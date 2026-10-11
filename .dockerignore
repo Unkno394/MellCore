@@ -6,3 +6,5 @@ backend/target
 *.tar.gz
 *.qcow2
 *.img
+**/__pycache__
+**/*.pyc
