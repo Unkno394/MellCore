@@ -1,4 +1,4 @@
-
+import type { Honeypot } from '../data/honeypots'
 import { useState } from 'react'
 
 type InteractionLevel = 'Low' | 'Medium' | 'High'
@@ -66,10 +66,20 @@ const levelStyles: Record<InteractionLevel, string> = {
   High: 'border-red-500/30 bg-red-500/10 text-red-300',
 }
 
-export default function Profiles() {
-  const [profiles, setProfiles] = useState<Profile[]>(initialProfiles)
-  const [selectedId, setSelectedId] = useState('PR-001')
-  const [saved, setSaved] = useState(false)
+
+type ProfilesProps = {
+    honeypots: Honeypot[]
+    onUpdateHoneypot: (honeypotId: string, profileName: string) => void
+  }
+  
+  
+export default function Profiles({
+    honeypots,
+    onUpdateHoneypot,
+  }: ProfilesProps) {
+    const [profiles, setProfiles] = useState<Profile[]>(initialProfiles)
+    const [selectedId, setSelectedId] = useState('PR-001')
+    const [saved, setSaved] = useState(false)
 
   const selectedProfile =
     profiles.find((profile) => profile.id === selectedId) ?? profiles[0]
@@ -114,7 +124,8 @@ export default function Profiles() {
     setSaved(false)
   }
 
-  function saveProfile() {
+  
+function saveProfile() {
     setProfiles((current) =>
       current.map((profile) =>
         profile.id === selectedId
@@ -122,8 +133,20 @@ export default function Profiles() {
           : profile,
       ),
     )
+  
+    if (selectedProfile.assignedHoneypot !== 'Unassigned') {
+      const assignedHoneypot = honeypots.find(
+        (honeypot) => honeypot.name === selectedProfile.assignedHoneypot,
+      )
+  
+      if (assignedHoneypot) {
+        onUpdateHoneypot(assignedHoneypot.id, selectedProfile.name)
+      }
+    }
+  
     setSaved(true)
   }
+  
 
   if (!selectedProfile) return null
 
@@ -398,11 +421,13 @@ export default function Profiles() {
                   onChange={(event) => updateSelected('assignedHoneypot', event.target.value)}
                   className="w-full rounded-lg border border-white/10 bg-[#100a09] px-3 py-3 text-sm text-white/80 outline-none focus:border-orange-400/50"
                 >
-                  <option>Unassigned</option>
-                  <option>SSH Honeypot 01</option>
-                  <option>Web Honeypot 02</option>
-                  <option>Network Sensor 03</option>
-                  <option>SSH Honeypot 04</option>
+                  <option value="Unassigned">Unassigned</option>
+
+{honeypots.map((honeypot) => (
+  <option key={honeypot.id} value={honeypot.name}>
+    {honeypot.name}
+  </option>
+))}
                 </select>
               </div>
             </div>

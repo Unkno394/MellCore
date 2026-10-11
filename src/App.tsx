@@ -1,4 +1,5 @@
-
+import { sessions } from './data/sessions'
+import { events } from './data/events'
 import { useState } from 'react'
 import { initialHoneypots, type Honeypot } from './data/honeypots'
 import ConnectServer from './pages/ConnectServer'
@@ -13,19 +14,63 @@ import CRTWarp from './components/CRTWarp'
 import Sidebar from './components/layout/Sidebar'
 import Topbar from './components/layout/Topbar'
 
-const stats = [
-  { label: 'Active Honeypots', value: '08', detail: 'Sensors deployed' },
-  { label: 'Active Sessions', value: '24', detail: '+6 in the last hour' },
-  { label: 'Events Today', value: '1,284', detail: 'Across all sensors' },
-  { label: 'Threat Alerts', value: '07', detail: 'Requires investigation' },
-]
-
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false)
+  const [isLightTheme, setIsLightTheme] = useState(false)
 
   const [honeypots, setHoneypots] = useState<Honeypot[]>(
     initialHoneypots
   )
+  const activeHoneypots = honeypots.filter(
+    (honeypot) => honeypot.status === 'Active'
+  ).length
+  
+  const totalHoneypots = honeypots.length
+  
+  
+const totalSessions = sessions.filter(
+  (session) => session.status === 'Active'
+).length
+
+  
+const activityByHour = Array.from({ length: 24 }, (_, hour) => ({
+  hour,
+  count: events.filter(
+    (event) => Number(event.time.split(':')[0]) === hour
+  ).length,
+}))
+
+const maxActivity = Math.max(
+  1,
+  ...activityByHour.map((item) => item.count)
+)
+
+  const threatAlerts = honeypots.filter(
+    (honeypot) => honeypot.status === 'Warning'
+  ).length
+  
+  const stats = [
+    {
+      label: 'Active Honeypots',
+      value: String(activeHoneypots).padStart(2, '0'),
+      detail: `${totalHoneypots} sensors configured`,
+    },
+    {
+      label: 'Active Sessions',
+      value: String(totalSessions),
+      detail: 'Across all honeypots',
+    },
+    {
+      label: 'Total Events',
+      value: String(events.length),
+      detail: 'Events recorded in demo sessions',
+    },
+    {
+      label: 'Threat Alerts',
+      value: String(threatAlerts).padStart(2, '0'),
+      detail: 'Honeypots in warning status',
+    },
+  ]
 
   const [currentPage, setCurrentPage] = useState<
     | 'Dashboard'
@@ -39,7 +84,11 @@ function App() {
   >('Dashboard')
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-[#100a09] text-[#e8dfda]">
+    <main
+  className={`app-root relative min-h-screen overflow-hidden ${
+    isLightTheme ? 'light-theme' : 'dark-theme'
+  } bg-[#100a09] text-[#e8dfda]`}
+>
       <div className="pointer-events-none fixed inset-0 z-0">
         <CRTWarp
           color="#d4810a"
@@ -130,20 +179,24 @@ function App() {
                       </span>
                     </div>
 
-                    <div className="mt-6 flex h-40 items-end gap-2">
-                      {[
-                        35, 52, 42, 68, 46, 80,
-                        58, 72, 48, 90, 64, 76,
-                        55, 85, 45, 68, 95, 61,
-                        78, 50, 70, 42, 63, 82,
-                      ].map((height, index) => (
-                        <div
-                          key={index}
-                          className="flex-1 rounded-t-sm bg-gradient-to-t from-red-950 to-orange-500/80 opacity-80 transition hover:opacity-100"
-                          style={{ height: `${height}%` }}
-                        />
-                      ))}
-                    </div>
+                    
+<div className="mt-6 flex h-40 items-end gap-1">
+  {activityByHour.map((item) => (
+    <div
+      key={item.hour}
+      className="group relative flex h-full flex-1 items-end"
+      title={`${String(item.hour).padStart(2, '0')}:00 — ${item.count} events`}
+    >
+      <div
+        className="w-full rounded-t-sm bg-gradient-to-t from-red-950 to-orange-500/80 opacity-80 transition hover:opacity-100"
+        style={{
+          height: `${item.count === 0 ? 2 : Math.max(8, (item.count / maxActivity) * 100)}%`,
+        }}
+      />
+    </div>
+  ))}
+</div>
+
 
                     <div className="mt-3 flex justify-between text-[10px] text-white/35">
                       <span>00:00</span>
@@ -164,61 +217,39 @@ function App() {
                     </p>
 
                     <div className="mt-5 space-y-4">
-                      {[
-                        {
-                          type: 'SSH login attempt',
-                          sensor: 'SSH Honeypot 01',
-                          time: '2m ago',
-                          level: 'High',
-                        },
-                        {
-                          type: 'Port scan detected',
-                          sensor: 'Network Sensor 03',
-                          time: '8m ago',
-                          level: 'Medium',
-                        },
-                        {
-                          type: 'New session opened',
-                          sensor: 'Web Honeypot 02',
-                          time: '14m ago',
-                          level: 'Low',
-                        },
-                        {
-                          type: 'Authentication failed',
-                          sensor: 'SSH Honeypot 01',
-                          time: '21m ago',
-                          level: 'High',
-                        },
-                      ].map((event) => (
-                        <div
-                          key={`${event.type}-${event.time}`}
-                          className="flex items-center gap-3"
-                        >
-                          <span
-                            className={`h-2 w-2 shrink-0 rounded-full ${
-                              event.level === 'High'
-                                ? 'bg-red-500'
-                                : event.level === 'Medium'
-                                  ? 'bg-orange-400'
-                                  : 'bg-emerald-400'
-                            }`}
-                          />
+                    {[...events]
+  .sort((a, b) => b.time.localeCompare(a.time))
+  .slice(0, 4)
+  .map((event) => (
+    <div
+      key={event.id}
+      className="flex items-center gap-3"
+    >
+      <span
+        className={`h-2 w-2 shrink-0 rounded-full ${
+          event.level === 'High'
+            ? 'bg-red-500'
+            : event.level === 'Medium'
+              ? 'bg-orange-400'
+              : 'bg-emerald-400'
+        }`}
+      />
 
-                          <div className="min-w-0 flex-1">
-                            <p className="truncate text-sm">
-                              {event.type}
-                            </p>
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm">
+          {event.type}
+        </p>
 
-                            <p className="mt-1 truncate text-xs text-white/40">
-                              {event.sensor}
-                            </p>
-                          </div>
+        <p className="mt-1 truncate text-xs text-white/40">
+          {event.honeypot}
+        </p>
+      </div>
 
-                          <span className="shrink-0 text-[10px] text-white/35">
-                            {event.time}
-                          </span>
-                        </div>
-                      ))}
+      <span className="shrink-0 text-[10px] text-white/35">
+        {event.time}
+      </span>
+    </div>
+  ))}
                     </div>
                   </section>
                 </div>
@@ -241,9 +272,25 @@ function App() {
 ) : currentPage === 'Sessions' ? (
   <Sessions />
 ) : currentPage === 'Settings' ? (
-  <Settings />
+  <Settings
+  isLightTheme={isLightTheme}
+  onThemeChange={setIsLightTheme}
+/>
 ) : (
-  <Profiles />
+  
+<Profiles
+  honeypots={honeypots}
+  onUpdateHoneypot={(honeypotId, profileName) => {
+    setHoneypots((current) =>
+      current.map((honeypot) =>
+        honeypot.id === honeypotId
+          ? { ...honeypot, profile: profileName }
+          : honeypot
+      )
+    )
+  }}
+/>
+
 )}
           </div>
         </div>

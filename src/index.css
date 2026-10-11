@@ -26,3 +26,46 @@ body,
 body {
   min-height: 100vh;
 }
+
+.app-root.light-theme {
+  background: #f4eee9;
+  color: #2a1b17;
+}
+
+.app-root.light-theme [class*="bg-[#100a09]"],
+.app-root.light-theme [class*="bg-[#160e0c]"] {
+  background-color: #fffaf6 !important;
+}
+
+.app-root.light-theme [class*="bg-white/"] {
+  background-color: #ffffff !important;
+}
+
+.app-root.light-theme [class*="text-white"] {
+  color: #66534b !important;
+}
+
+.app-root.light-theme h1,
+.app-root.light-theme h2,
+.app-root.light-theme h3,
+.app-root.light-theme h4 {
+  color: #2a1b17;
+}
+
+.app-root.light-theme [class*="border-white/"] {
+  border-color: #e4d5cb !important;
+}
+
+.app-root.light-theme input,
+.app-root.light-theme textarea,
+.app-root.light-theme select {
+  color: #2a1b17;
+  background-color: #fffaf6;
+  border-color: #d8c5b8;
+}
+
+.app-root,
+.app-root * {
+  transition-property: background-color, border-color, color;
+  transition-duration: 200ms;
+}

@@ -1,4 +1,7 @@
-
+type SettingsProps = {
+  isLightTheme: boolean
+  onThemeChange: (isLight: boolean) => void
+}
 import { useState } from 'react'
 
 type SettingsData = {
@@ -29,6 +32,7 @@ const defaultSettings: SettingsData = {
   refreshInterval: '5',
 }
 
+
 function loadSettings(): SettingsData {
   try {
     const saved = localStorage.getItem('mellcore-settings')
@@ -39,12 +43,13 @@ function loadSettings(): SettingsData {
         ...JSON.parse(saved),
       }
     }
-  } catch {
-    // Use default settings if stored data is invalid
+  } catch (error) {
+    console.error('Failed to load settings:', error)
   }
 
   return { ...defaultSettings }
 }
+
 
 type SelectFieldProps = {
   label: string
@@ -127,10 +132,14 @@ function ToggleField({
   )
 }
 
-export default function Settings() {
+export default function Settings({
+  isLightTheme,
+  onThemeChange,
+}: SettingsProps) {
   const [settings, setSettings] = useState<SettingsData>(
     loadSettings
   )
+  const themeName = isLightTheme ? 'Light' : 'Dark'
 
   const [saved, setSaved] = useState(false)
 
@@ -150,7 +159,7 @@ export default function Settings() {
     try {
       localStorage.setItem(
         'mellcore-settings',
-        JSON.stringify(settings)
+        JSON.stringify({ ...settings, theme: themeName })
       )
       setSaved(true)
     } catch {
@@ -161,6 +170,7 @@ export default function Settings() {
 
   function resetSettings() {
     setSettings({ ...defaultSettings })
+    onThemeChange(false)
     setSaved(false)
   }
 
@@ -192,13 +202,15 @@ export default function Settings() {
             </p>
           </div>
 
-          <SelectField
-            label="Theme"
-            description="Interface color scheme"
-            value={settings.theme}
-            options={['Dark']}
-            onChange={(value) => updateSetting('theme', value)}
-          />
+          <ToggleField
+  label="Light theme"
+  description="Switch between dark and light appearance"
+  checked={isLightTheme}
+  onChange={(value) => {
+    onThemeChange(value)
+    updateSetting('theme', value ? 'Light' : 'Dark')
+  }}
+/>
 
           <SelectField
             label="Language"

@@ -1,21 +1,14 @@
-
 import { useState } from 'react'
-
-// Демонстрационные события безопасности
-const events = [
-  { id: 1, time: '14:32:08', type: 'SSH login attempt', honeypot: 'SSH Honeypot 01', ip: '192.0.2.15', level: 'High' },
-  { id: 2, time: '14:28:41', type: 'Port scan detected', honeypot: 'Network Sensor 03', ip: '198.51.100.22', level: 'Medium' },
-  { id: 3, time: '14:24:15', type: 'New session opened', honeypot: 'Web Honeypot 02', ip: '203.0.113.10', level: 'Low' },
-  { id: 4, time: '14:19:32', type: 'Authentication failed', honeypot: 'SSH Honeypot 01', ip: '192.0.2.44', level: 'High' },
-  { id: 5, time: '14:15:06', type: 'HTTP request detected', honeypot: 'Web Honeypot 02', ip: '198.51.100.35', level: 'Low' },
-  { id: 6, time: '14:08:51', type: 'Suspicious command', honeypot: 'SSH Honeypot 01', ip: '203.0.113.81', level: 'High' },
-]
+import { events } from '../data/events'
 
 export default function LiveFeed() {
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState('All')
 
-  const filteredEvents = events.filter((event) => {
+  const sortedEvents = [...events].sort((a, b) =>
+    b.time.localeCompare(a.time)
+  )
+  const filteredEvents = sortedEvents.filter((event) => {
     const matchesSearch =
       `${event.type} ${event.honeypot} ${event.ip}`
         .toLowerCase()

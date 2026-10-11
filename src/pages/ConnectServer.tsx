@@ -1,4 +1,3 @@
-
 import { useState, type FormEvent } from 'react'
 
 type AuthMethod = 'password' | 'key'
