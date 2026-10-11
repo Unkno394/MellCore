@@ -5,8 +5,8 @@ import type { Honeypot } from '../data/honeypots'
 type Level = 'Low' | 'Medium' | 'High'
 
 type CreateHoneypotProps = {
-    onCreateHoneypot: (honeypot: Honeypot) => void
-  }
+  onCreateHoneypot: (honeypot: Honeypot, level: Level) => void
+}
   
   export default function CreateHoneypot({
     onCreateHoneypot,
@@ -40,7 +40,7 @@ type CreateHoneypotProps = {
       description: `${service} honeypot. Security level: ${level}. Port: ${port}.`,
     }
   
-    onCreateHoneypot(newHoneypot)
+    onCreateHoneypot(newHoneypot, level)
     setCreated(true)
   }
 

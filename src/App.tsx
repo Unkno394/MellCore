@@ -2,6 +2,10 @@ import { sessions } from './data/sessions'
 import { events } from './data/events'
 import { useState } from 'react'
 import { initialHoneypots, type Honeypot } from './data/honeypots'
+import ToastNotifications, {
+  type ToastItem,
+  type ThreatLevel,
+} from './components/ToastNotifications'
 import ConnectServer from './pages/ConnectServer'
 import CreateHoneypot from './pages/CreateHoneypot'
 import Auth from './pages/Auth'
@@ -15,6 +19,26 @@ import Sidebar from './components/layout/Sidebar'
 import Topbar from './components/layout/Topbar'
 
 function App() {
+  const [toasts, setToasts] = useState<ToastItem[]>([])
+
+const addToast = (
+  level: ThreatLevel,
+  title: string,
+  message: string,
+) => {
+  const id = Date.now() + Math.random()
+
+  setToasts((current) => [
+    ...current,
+    { id, level, title, message },
+  ])
+}
+
+const dismissToast = (id: number) => {
+  setToasts((current) =>
+    current.filter((toast) => toast.id !== id),
+  )
+}
   const [isAuthenticated, setIsAuthenticated] = useState(false)
   const [isLightTheme, setIsLightTheme] = useState(false)
 
@@ -113,6 +137,10 @@ const maxActivity = Math.max(
           paused={false}
         />
       </div>
+      <ToastNotifications
+  toasts={toasts}
+  onDismiss={dismissToast}
+/>
 
       {isAuthenticated ? (
         <div className="relative z-10 flex min-h-screen">
@@ -260,13 +288,39 @@ const maxActivity = Math.max(
               <ConnectServer />
             ) : currentPage === 'CreateHoneypot' ? (
               <CreateHoneypot
-                onCreateHoneypot={(newHoneypot) => {
-                  setHoneypots((current) => [
-                    newHoneypot,
-                    ...current,
-                  ])
-                }}
-              />
+  onCreateHoneypot={(newHoneypot, level) => {
+    setHoneypots((current) => [
+      newHoneypot,
+      ...current,
+    ])
+
+    const notificationStyles: Record<
+      ThreatLevel,
+      { title: string; message: string }
+    > = {
+      Low: {
+        title: 'Honeypot created',
+        message: `${newHoneypot.name} was created with Low security level.`,
+      },
+      Medium: {
+        title: 'Honeypot created',
+        message: `${newHoneypot.name} was created with Medium security level.`,
+      },
+      High: {
+        title: 'Honeypot created',
+        message: `${newHoneypot.name} was created with High security level.`,
+      },
+    }
+
+    const notification = notificationStyles[level]
+
+    addToast(
+      level,
+      notification.title,
+      notification.message,
+    )
+  }}
+/>
             ) : currentPage === 'LiveFeed' ? (
   <LiveFeed />
 ) : currentPage === 'Sessions' ? (
@@ -297,8 +351,16 @@ const maxActivity = Math.max(
       ) : (
         <div className="relative z-10">
           <Auth
-            onAuthenticated={() => setIsAuthenticated(true)}
-          />
+  onAuthenticated={() => {
+    setIsAuthenticated(true)
+
+    addToast(
+      'Low',
+      'System online',
+      'Welcome back, Operator. MellCore is ready.',
+    )
+  }}
+/>
         </div>
       )}
     </main>
