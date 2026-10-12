@@ -112,6 +112,10 @@ pub async fn register_trap(
     let profile_version: i64 = profile.get("version");
     let snapshot: serde_json::Value = profile.get("snapshot");
     let config: serde_json::Value = profile.get("config");
+    let resources = snapshot.get("resources").cloned().unwrap_or_else(|| match input.tier.as_str() {
+        "middle" => serde_json::json!({"cpu_cores":1.0,"memory_mb":512,"pids":256}),
+        _ => serde_json::json!({"cpu_cores":0.5,"memory_mb":128,"pids":64}),
+    });
     let existing_trap = sqlx::query("SELECT server_id,user_id,profile_id FROM traps WHERE trap_id=$1 FOR UPDATE")
         .bind(input.trap_id).fetch_optional(&mut *tx).await?;
     if let Some(trap) = existing_trap {
@@ -123,9 +127,9 @@ pub async fn register_trap(
             return Err(AppError::conflict("Trap ID is already registered for another target"));
         }
     } else {
-        sqlx::query("INSERT INTO traps(trap_id,server_id,user_id,name,profile_id,profile_version,profile_snapshot,config,effective_config,desired_state,actual_state) VALUES($1,$2,$3,$4,$5,$6,$7,'{}'::jsonb,$8,'running','installing')")
+        sqlx::query("INSERT INTO traps(trap_id,server_id,user_id,name,profile_id,profile_version,profile_snapshot,config,effective_config,resources,desired_state,actual_state) VALUES($1,$2,$3,$4,$5,$6,$7,'{}'::jsonb,$8,$9,'running','installing')")
             .bind(input.trap_id).bind(server_id).bind(owner).bind(format!("{} {}", kind, input.trap_id))
-            .bind(profile_id).bind(profile_version).bind(snapshot).bind(config)
+            .bind(profile_id).bind(profile_version).bind(snapshot).bind(config).bind(resources)
             .execute(&mut *tx).await?;
     }
     let previous_port: Option<i32> = sqlx::query_scalar("SELECT host_port FROM server_ports WHERE trap_id=$1")

@@ -58,6 +58,8 @@ pub struct Profile {
     pub honeypot_type: String,
     pub service_type: String,
     pub config: Value,
+    #[sqlx(json)]
+    pub resources: crate::resources::ContainerResourceLimits,
     pub version: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -73,6 +75,8 @@ pub struct ProfileInput {
     pub honeypot_type: String,
     pub service_type: String,
     pub config: Value,
+    #[serde(default)]
+    pub resources: Option<crate::resources::ContainerResourceLimits>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -102,6 +106,9 @@ impl ProfileInput {
             }
         }
         validate_config(&self.config)?;
+        if let Some(resources) = self.resources {
+            resources.validate_for_level(self.level)?;
+        }
         if self.honeypot_type == "kozyavka" {
             crate::kozyavka::validate_profile(self.level, &self.service_type, &self.config)?;
         }
@@ -109,6 +116,13 @@ impl ProfileInput {
             crate::pritvoryashka::validate_profile(self.level, &self.service_type, &self.config)?;
         }
         Ok(())
+    }
+
+    pub fn resolved_resources(&self) -> crate::resources::ContainerResourceLimits {
+        self.resources.unwrap_or_else(|| match self.level {
+            TrapLevel::Low => crate::resources::ContainerResourceLimits::low_default(),
+            TrapLevel::Medium => crate::resources::ContainerResourceLimits::middle_default(),
+        })
     }
 }
 

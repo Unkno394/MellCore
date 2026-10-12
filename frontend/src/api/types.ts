@@ -40,6 +40,13 @@ export type ProfileInput = {
   honeypot_type: string
   service_type: string
   config: Record<string, unknown>
+  resources: ContainerResourceLimits
+}
+
+export type ContainerResourceLimits = {
+  cpu_cores: number
+  memory_mb: number
+  pids: number
 }
 
 export type Profile = ProfileInput & {
@@ -109,6 +116,7 @@ export type TrapInput = {
   name: string
   profile_id: string
   config: Record<string, unknown>
+  resources?: ContainerResourceLimits
   desired_state: TrapDesiredState
   ports: PortBinding[]
 }
@@ -123,6 +131,7 @@ export type Trap = {
   profile_snapshot: Profile
   config: Record<string, unknown>
   effective_config: Record<string, unknown>
+  resources: ContainerResourceLimits
   desired_state: TrapDesiredState
   actual_state: ActualState
   version: number

@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useState } from 'react'
-import { statusLabel } from '../i18n/labels'
+import { dateTime, eventLabel, statusLabel } from '../i18n/labels'
 import { apiErrorMessage } from '../api/client'
 import type { MellCoreApi } from '../api/services'
-import type { Server, Trap, TrapAction } from '../api/types'
+import type { AttackEvent, Server, Trap, TrapAction } from '../api/types'
 
 type Props = {
   api: MellCoreApi
   traps: Trap[]
   servers: Server[]
+  events: AttackEvent[]
   readOnly: boolean
   onChanged: () => Promise<void>
   onShowAttacks: (trapId: string) => void
@@ -29,12 +30,7 @@ function serverTitle(server: Server | undefined) {
   return server ? `${server.name} · ${server.host}` : 'Сервер не найден'
 }
 
-function resourceLimits(trap: Trap) {
-  if (trap.profile_snapshot.level === 'low') return { cpu: '0,5 CPU', memory: '128 МБ RAM', pids: '64 процесса' }
-  return { cpu: '1 CPU', memory: '512 МБ RAM', pids: '256 процессов' }
-}
-
-export default function Honeypots({ api, traps, servers, readOnly, onChanged, onShowAttacks }: Props) {
+export default function Honeypots({ api, traps, servers, events, readOnly, onChanged, onShowAttacks }: Props) {
   const [search, setSearch] = useState('')
   const [typeFilter, setTypeFilter] = useState('all')
   const [serverFilter, setServerFilter] = useState('all')
@@ -55,6 +51,10 @@ export default function Honeypots({ api, traps, servers, readOnly, onChanged, on
       && (stateFilter === 'all' || trap.actual_state === stateFilter)
   }), [traps, search, typeFilter, serverFilter, stateFilter, serverNames])
   const selected = filtered.find((trap) => trap.trap_id === selectedId) ?? filtered[0] ?? null
+  const selectedEvents = useMemo(() => selected
+    ? events.filter((item) => item.event.trap_id === selected.trap_id)
+      .sort((a, b) => b.event.occurred_at.localeCompare(a.event.occurred_at)).slice(0, 12)
+    : [], [events, selected])
   const actionsDisabled = Boolean(busyAction) || readOnly || selected?.actual_state === 'installing'
 
   useEffect(() => {
@@ -134,7 +134,8 @@ export default function Honeypots({ api, traps, servers, readOnly, onChanged, on
           <div className="border-b border-white/5 p-5"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="text-[11px] uppercase tracking-[0.18em] text-orange-200/65">Выбранная ловушка</p><h3 className="mt-2 truncate text-xl font-semibold">{selected.name}</h3><p className="mt-1 truncate text-xs text-white/35">{serverTitle(serverNames.get(selected.server_id))}</p></div><span className={`shrink-0 rounded-full border px-2.5 py-1 text-[11px] ${stateTone[selected.actual_state]}`}>{statusLabel(selected.actual_state)}</span></div></div>
           <div className="space-y-5 p-5">
             <section><h4 className="text-xs font-semibold uppercase tracking-wider text-white/40">Конфигурация</h4><div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-3"><Info label="Тип" value={selected.profile_snapshot.honeypot_type}/><Info label="Служба" value={selected.profile_snapshot.service_type}/><Info label="Уровень" value={statusLabel(selected.profile_snapshot.level)}/><Info label="Версия профиля" value={String(selected.profile_version)}/><Info label="Внешние порты" value={selected.ports.map((port) => `${port.host_port}/${port.transport}`).join(', ') || 'Не заданы'}/><Info label="Создана" value={new Date(selected.created_at).toLocaleDateString('ru-RU')}/></div><p className="mt-3 text-xs leading-5 text-white/40">{selected.profile_snapshot.description || 'У профиля нет описания.'}</p></section>
-            <section className="border-t border-white/5 pt-4"><h4 className="text-xs font-semibold uppercase tracking-wider text-white/40">Лимиты контейнера</h4><div className="mt-3 grid grid-cols-3 gap-2">{Object.entries(resourceLimits(selected)).map(([key, value]) => <div key={key} className="rounded-lg border border-white/5 bg-black/10 p-2.5"><p className="text-[10px] text-white/35">{resourceLabels[key]}</p><p className="mt-1 text-xs font-medium text-white/75">{value}</p></div>)}</div><p className="mt-2 text-[10px] text-white/30">GPU не выделяется. Лимиты заданы профилем агента.</p></section>
+            <section className="border-t border-white/5 pt-4"><h4 className="text-xs font-semibold uppercase tracking-wider text-white/40">Лимиты контейнера · применённая конфигурация</h4><div className="mt-3 grid grid-cols-3 gap-2">{Object.entries({ cpu: `${selected.resources.cpu_cores} CPU`, memory: `${selected.resources.memory_mb} МБ RAM`, pids: `${selected.resources.pids} процессов` }).map(([key, value]) => <div key={key} className="rounded-lg border border-white/5 bg-black/10 p-2.5"><p className="text-[10px] text-white/35">{resourceLabels[key]}</p><p className="mt-1 text-xs font-medium text-white/75">{value}</p></div>)}</div><p className="mt-2 text-[10px] text-white/30">Это заданные Docker-лимиты, а не текущее потребление. GPU не настраивается.</p></section>
+            <section className="border-t border-white/5 pt-4"><div className="flex items-center justify-between gap-2"><div><h4 className="text-xs font-semibold uppercase tracking-wider text-white/40">Журнал ловушки</h4><p className="mt-1 text-[10px] text-white/30">События, полученные от агента</p></div><span className="text-[10px] text-white/30">{selectedEvents.length} последних</span></div>{selected.actual_state === 'failed' && <p className="mt-3 rounded-lg border border-red-400/20 bg-red-400/[0.06] px-3 py-2 text-xs text-red-300">Ловушка в состоянии ошибки. Подробный вывод Docker пока не предоставляется API.</p>}<div className="mt-3 max-h-64 space-y-2 overflow-auto">{selectedEvents.map((item) => <article key={`${item.event.event_id}`} className="rounded-lg border border-white/5 bg-black/10 px-3 py-2"><div className="flex items-start justify-between gap-3"><span className="text-xs text-white/75">{eventLabel(item.event.event_type)}</span><time className="shrink-0 text-[10px] text-white/30">{dateTime(item.event.occurred_at)}</time></div><p className="mt-1 text-[10px] text-white/35">{item.event.service_type}{item.event.source_ip ? ` · ${item.event.source_ip}` : ''}</p><EventPayload payload={item.event.payload}/></article>)}{selectedEvents.length === 0 && <p className="rounded-lg border border-white/5 bg-black/10 px-3 py-4 text-center text-xs text-white/35">Событий от агента пока нет.</p>}</div></section>
             <details className="border-t border-white/5 pt-4"><summary className="cursor-pointer text-xs font-semibold uppercase tracking-wider text-white/40 hover:text-white/65">Параметры конфигурации</summary><pre className="mt-3 max-h-48 overflow-auto rounded-lg border border-white/5 bg-black/20 p-3 text-[10px] leading-5 text-white/55">{JSON.stringify(selected.effective_config, null, 2)}</pre></details>
             <section className="border-t border-white/5 pt-4"><div className="flex items-center justify-between"><h4 className="text-xs font-semibold uppercase tracking-wider text-white/40">Управление</h4><button type="button" onClick={() => onShowAttacks(selected.trap_id)} className="text-xs text-orange-200/75 transition hover:text-orange-100">Атаки этой ловушки →</button></div><div className="mt-3 grid grid-cols-2 gap-2">{selected.actual_state !== 'running' && <ActionButton label="Запустить" disabled={actionsDisabled || selected.actual_state === 'removed'} onClick={() => void runAction('start')} tone="green"/>}{selected.actual_state === 'running' && <ActionButton label="Остановить" disabled={actionsDisabled} onClick={() => void runAction('stop')}/>}{selected.actual_state === 'running' && <ActionButton label="Перезапустить" disabled={actionsDisabled} onClick={() => void runAction('restart')}/>}<ActionButton label="Удалить" disabled={actionsDisabled} onClick={() => void runAction('remove')} tone="red"/></div>{busyAction && <p role="status" className="mt-3 text-xs text-orange-200/70">{pending ? `Ожидаю подтверждение: ${actionText[busyAction].toLowerCase()}…` : 'Отправляю команду агенту…'}</p>}{error && <p role="alert" className="mt-3 text-xs text-red-300">{error}</p>}{message && !error && <p role="status" className="mt-3 text-xs text-emerald-200/75">{message}</p>}{readOnly && <p className="mt-3 text-xs text-white/35">У вас доступ только для просмотра.</p>}</section>
           </div>
@@ -146,6 +147,16 @@ export default function Honeypots({ api, traps, servers, readOnly, onChanged, on
 
 function Info({ label, value }: { label: string; value: string }) {
   return <div className="min-w-0"><p className="text-[10px] uppercase tracking-wider text-white/30">{label}</p><p className="mt-1 truncate text-xs text-white/75" title={value}>{value}</p></div>
+}
+
+function EventPayload({ payload }: { payload: unknown }) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null
+  const summary = Object.entries(payload as Record<string, unknown>)
+    .filter(([, value]) => typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean')
+    .slice(0, 3)
+    .map(([key, value]) => `${key}: ${String(value)}`)
+    .join(' · ')
+  return summary ? <p className="mt-1 break-words font-mono text-[10px] text-orange-100/50">{summary}</p> : null
 }
 
 function ActionButton({ label, disabled, onClick, tone = 'neutral' }: { label: string; disabled: boolean; onClick: () => void; tone?: 'green' | 'red' | 'neutral' }) {

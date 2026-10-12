@@ -2,11 +2,15 @@ import { statusLabel } from '../i18n/labels'
 import { useState } from 'react'
 import { apiErrorMessage } from '../api/client'
 import type { MellCoreApi } from '../api/services'
-import type { Profile, ProfileInput } from '../api/types'
+import type { ContainerResourceLimits, Profile, ProfileInput } from '../api/types'
 
 type Props = { api: MellCoreApi; profiles: Profile[]; isAdmin: boolean; onChanged: () => Promise<void> }
 
-const emptyProfile: ProfileInput = { name: '', description: '', level: 'low', honeypot_type: 'kozyavka', service_type: 'ssh', config: {} }
+const defaultLimits: Record<ProfileInput['level'], ContainerResourceLimits> = {
+  low: { cpu_cores: 0.5, memory_mb: 128, pids: 64 },
+  medium: { cpu_cores: 1, memory_mb: 512, pids: 256 },
+}
+const emptyProfile: ProfileInput = { name: '', description: '', level: 'low', honeypot_type: 'kozyavka', service_type: 'ssh', config: {}, resources: defaultLimits.low }
 
 export default function Profiles({ api, profiles, isAdmin, onChanged }: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(profiles[0]?.id ?? null)
@@ -20,11 +24,12 @@ export default function Profiles({ api, profiles, isAdmin, onChanged }: Props) {
   function createNew() { setSelectedId(null); setForm(emptyProfile); setConfigText('{}'); setError(''); setMessage('') }
   function select(profile: Profile) {
     setSelectedId(profile.id)
-    setForm({ name: profile.name, description: profile.description, level: profile.level, honeypot_type: profile.honeypot_type, service_type: profile.service_type, config: profile.config })
+    setForm({ name: profile.name, description: profile.description, level: profile.level, honeypot_type: profile.honeypot_type, service_type: profile.service_type, config: profile.config, resources: profile.resources ?? defaultLimits[profile.level] })
     setConfigText(JSON.stringify(profile.config, null, 2))
     setError(''); setMessage('')
   }
   function update<K extends keyof ProfileInput>(key: K, value: ProfileInput[K]) { setForm((current) => ({ ...current, [key]: value })); setMessage('') }
+  function updateResource(key: keyof ContainerResourceLimits, value: number) { setForm((current) => ({ ...current, resources: { ...current.resources, [key]: value } })); setMessage('') }
 
   async function save() {
     setError(''); setMessage(''); setBusy(true)
@@ -56,11 +61,16 @@ export default function Profiles({ api, profiles, isAdmin, onChanged }: Props) {
       <section className="rounded-xl border border-white/10 bg-[#160e0c]/75 p-5 backdrop-blur-xl"><div className="border-b border-white/10 pb-5"><p className="text-[10px] uppercase tracking-[0.2em] text-orange-300/70">{selected ? `Редактирование версии ${selected.version}` : 'Новый профиль'}</p><h3 className="mt-2 text-lg font-semibold">{form.name || 'Профиль без названия'}</h3></div><div className="mt-5 space-y-5">
         <label className="block text-xs text-white/55">Название профиля<input disabled={!isAdmin} value={form.name} onChange={(e) => update('name', e.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-3 text-sm outline-none" /></label>
         <label className="block text-xs text-white/55">Описание<textarea disabled={!isAdmin} rows={3} value={form.description} onChange={(e) => update('description', e.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-3 text-sm outline-none" /></label>
-        <div className="grid gap-4 sm:grid-cols-3"><label className="text-xs text-white/55">Уровень взаимодействия<select disabled={!isAdmin} value={form.level} onChange={(e) => update('level', e.target.value as ProfileInput['level'])} className="mt-2 w-full rounded-lg border border-white/10 bg-[#100a09] px-3 py-3 text-sm"><option value="low">Низкий</option><option value="medium">Средний</option></select></label><label className="text-xs text-white/55">Тип ловушки<input disabled={!isAdmin} value={form.honeypot_type} onChange={(e) => update('honeypot_type', e.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-3 text-sm" /></label><label className="text-xs text-white/55">Тип службы<input disabled={!isAdmin} value={form.service_type} onChange={(e) => update('service_type', e.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-3 text-sm" /></label></div>
+        <div className="grid gap-4 sm:grid-cols-3"><label className="text-xs text-white/55">Уровень взаимодействия<select disabled={!isAdmin} value={form.level} onChange={(e) => { const level = e.target.value as ProfileInput['level']; setForm((current) => ({ ...current, level, resources: defaultLimits[level] })); setMessage('') }} className="mt-2 w-full rounded-lg border border-white/10 bg-[#100a09] px-3 py-3 text-sm"><option value="low">Низкий</option><option value="medium">Средний</option></select></label><label className="text-xs text-white/55">Тип ловушки<input disabled={!isAdmin} value={form.honeypot_type} onChange={(e) => update('honeypot_type', e.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-3 text-sm" /></label><label className="text-xs text-white/55">Тип службы<input disabled={!isAdmin} value={form.service_type} onChange={(e) => update('service_type', e.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-3 text-sm" /></label></div>
+        <section className="rounded-lg border border-white/10 bg-black/10 p-4"><h4 className="text-xs font-semibold uppercase tracking-wider text-white/45">Ресурсы по умолчанию</h4><p className="mt-1 text-[11px] text-white/35">Это исходный бюджет профиля. Для каждой ловушки его можно переопределить в допустимых пределах.</p><div className="mt-3 grid gap-3 sm:grid-cols-3"><ResourceInput label="CPU (ядра)" value={form.resources.cpu_cores} min={0.05} max={form.level === 'low' ? 0.5 : 1} step={0.05} disabled={!isAdmin} onChange={(value) => updateResource('cpu_cores', value)}/><ResourceInput label="RAM (МБ)" value={form.resources.memory_mb} min={32} max={form.level === 'low' ? 128 : 512} step={16} disabled={!isAdmin} onChange={(value) => updateResource('memory_mb', value)}/><ResourceInput label="Процессы" value={form.resources.pids} min={16} max={form.level === 'low' ? 64 : 256} step={1} disabled={!isAdmin} onChange={(value) => updateResource('pids', value)}/></div></section>
         <label className="block text-xs text-white/55">Конфигурация JSON<textarea disabled={!isAdmin} rows={8} value={configText} onChange={(e) => { setConfigText(e.target.value); setMessage('') }} className="mt-2 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-3 font-mono text-xs outline-none" /></label>
         {error && <p role="alert" className="text-sm text-red-400">{error}</p>}{message && <p role="status" className="text-sm text-emerald-300">{message}</p>}
         {isAdmin && <div className="flex gap-3"><button type="button" disabled={busy} onClick={save} className="rounded-lg bg-orange-500 px-5 py-3 text-sm font-semibold text-[#1a0d08] disabled:opacity-50">{selected ? 'Сохранить изменения' : 'Создать профиль'}</button>{selected && <button type="button" disabled={busy} onClick={remove} className="rounded-lg border border-red-500/30 px-5 py-3 text-sm text-red-300">Удалить</button>}</div>}
       </div></section>
     </div>
   </section>
+}
+
+function ResourceInput({ label, value, min, max, step, disabled, onChange }: { label: string; value: number; min: number; max: number; step: number; disabled: boolean; onChange: (value: number) => void }) {
+  return <label className="text-xs text-white/55">{label}<input type="number" min={min} max={max} step={step} required disabled={disabled} value={value} onChange={(event) => onChange(Number(event.target.value))} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-3 text-sm"/><span className="mt-1 block text-[10px] text-white/30">Максимум для {label.startsWith('CPU') ? 'уровня' : 'профиля'}: {max}</span></label>
 }

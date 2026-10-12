@@ -6,7 +6,7 @@ type Props = { currentPage: PageName; user: User; onLogout: () => void }
 
 const labels: Record<PageName, string> = {
   Dashboard: 'Обзор', Honeypots: 'Ловушки', Profiles: 'Профили',
-  ConnectServer: 'Добавить сервер', CreateHoneypot: 'Создать ловушку',
+  ConnectServer: 'Добавить сервер', CreateHoneypot: 'Добавить ловушку',
   LiveFeed: 'Атаки', Settings: 'Настройки',
 }
 

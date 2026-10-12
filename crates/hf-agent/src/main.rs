@@ -642,6 +642,7 @@ impl ComposeProjectStore {
                 .banner
                 .bytes()
                 .all(|byte| (32..=126).contains(&byte))
+            || !deployment.resources.within(0.5, 128, 64)
         {
             anyhow::bail!("invalid kozyavka deployment command");
         }
@@ -675,12 +676,15 @@ impl ComposeProjectStore {
             )?;
         }
         let compose = format!(
-            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    command: [\"--config\", \"/etc/honeyforge/config.json\"]\n    ports:\n      - \"{}:{}:{}/tcp\"\n    volumes:\n      - ./config.json:/etc/honeyforge/config.json:ro\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: 128m\n    cpus: 0.50\n    pids_limit: 64\n    ulimits:\n      nofile:\n        soft: 256\n        hard: 256\n    init: true\n",
+            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    command: [\"--config\", \"/etc/honeyforge/config.json\"]\n    ports:\n      - \"{}:{}:{}/tcp\"\n    volumes:\n      - ./config.json:/etc/honeyforge/config.json:ro\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: {}m\n    cpus: {:.3}\n    pids_limit: {}\n    ulimits:\n      nofile:\n        soft: 256\n        hard: 256\n    init: true\n",
             deployment.trap_id.simple(),
             image,
             deployment.publish_address,
             deployment.host_port,
             deployment.container_port,
+            deployment.resources.memory_mb,
+            deployment.resources.cpu_cores,
+            deployment.resources.pids,
         );
         atomic_write(&project_dir.join("compose.yaml"), compose.as_bytes())?;
         self.compose(
@@ -700,6 +704,7 @@ impl ComposeProjectStore {
             || deployment.server_id.is_nil()
             || deployment.host_port == 0
             || !(1..=128).contains(&deployment.max_connections)
+            || !deployment.resources.within(1.0, 512, 256)
             || deployment.hostname.is_empty()
             || deployment.hostname.len() > 64
             || !deployment
@@ -751,11 +756,14 @@ impl ComposeProjectStore {
             &serde_json::to_vec_pretty(&container_config)?,
         )?;
         let mut compose = format!(
-            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    ports:\n      - \"{}:{}:2222/tcp\"\n    volumes:\n      - ./pritvoryashka.json:/etc/honeyforge/pritvoryashka.json:ro\n      - ./runtime:/var/lib/pritvoryashka\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: 512m\n    cpus: 1.0\n    pids_limit: 256\n    ulimits:\n      nofile:\n        soft: 1024\n        hard: 1024\n    init: true\n",
+            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    ports:\n      - \"{}:{}:2222/tcp\"\n    volumes:\n      - ./pritvoryashka.json:/etc/honeyforge/pritvoryashka.json:ro\n      - ./runtime:/var/lib/pritvoryashka\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: {}m\n    cpus: {:.3}\n    pids_limit: {}\n    ulimits:\n      nofile:\n        soft: 1024\n        hard: 1024\n    init: true\n",
             deployment.trap_id.simple(),
             image,
             deployment.publish_address,
             deployment.host_port,
+            deployment.resources.memory_mb,
+            deployment.resources.cpu_cores,
+            deployment.resources.pids,
         );
         if telemetry_enabled {
             compose.push_str("    environment:\n      HF_TELEMETRY_INGEST_TOKEN: ${HF_TELEMETRY_INGEST_TOKEN:?Telemetry token required}\n");

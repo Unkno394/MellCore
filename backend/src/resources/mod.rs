@@ -8,6 +8,7 @@ use crate::{
     models::{ActualState, Role},
 };
 use chrono::{DateTime, Utc};
+use hf_core::ContainerResourceLimits as AgentContainerResourceLimits;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
@@ -51,6 +52,49 @@ pub enum PortPurpose {
     Ssh,
     Dispatcher,
     Trap,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ToSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerResourceLimits {
+    #[schema(minimum = 0.05, maximum = 1.0)]
+    pub cpu_cores: f64,
+    #[schema(minimum = 32, maximum = 512)]
+    pub memory_mb: u32,
+    #[schema(minimum = 16, maximum = 256)]
+    pub pids: u32,
+}
+
+impl ContainerResourceLimits {
+    pub fn low_default() -> Self {
+        Self { cpu_cores: 0.5, memory_mb: 128, pids: 64 }
+    }
+
+    pub fn middle_default() -> Self {
+        Self { cpu_cores: 1.0, memory_mb: 512, pids: 256 }
+    }
+
+    pub fn validate_for_level(&self, level: crate::models::TrapLevel) -> Result<(), AppError> {
+        let (cpu, memory, pids) = match level {
+            crate::models::TrapLevel::Low => (0.5, 128, 64),
+            crate::models::TrapLevel::Medium => (1.0, 512, 256),
+        };
+        if !self.cpu_cores.is_finite() || self.cpu_cores < 0.05 || self.cpu_cores > cpu
+            || !(32..=memory).contains(&self.memory_mb) || !(16..=pids).contains(&self.pids) {
+            return Err(AppError::invalid("Container resource limits are outside the selected trap tier policy"));
+        }
+        Ok(())
+    }
+}
+
+impl Default for ContainerResourceLimits {
+    fn default() -> Self { Self::low_default() }
+}
+
+impl From<ContainerResourceLimits> for AgentContainerResourceLimits {
+    fn from(value: ContainerResourceLimits) -> Self {
+        Self { cpu_cores: value.cpu_cores, memory_mb: value.memory_mb, pids: value.pids }
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize, ToSchema)]
@@ -138,6 +182,9 @@ pub struct TrapInput {
     pub profile_id: Uuid,
     /// Shallow top-level overrides over the selected profile config.
     pub config: Value,
+    /// Optional per-container budget; omitted values inherit profile defaults.
+    #[serde(default)]
+    pub resources: Option<ContainerResourceLimits>,
     pub desired_state: TrapDesiredState,
     #[schema(max_items = 32)]
     pub ports: Vec<PortBinding>,
@@ -167,6 +214,8 @@ pub struct Trap {
     pub profile_snapshot: Profile,
     pub config: Value,
     pub effective_config: Value,
+    #[sqlx(json)]
+    pub resources: ContainerResourceLimits,
     pub desired_state: TrapDesiredState,
     pub actual_state: ActualState,
     pub version: i64,

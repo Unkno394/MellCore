@@ -13,7 +13,7 @@ export type PageName =
 const navItems = [
   { page: 'Dashboard', label: 'Обзор', icon: '◫' },
   { page: 'ConnectServer', label: 'Добавить сервер', icon: '+' },
-  { page: 'CreateHoneypot', label: 'Создать ловушку', icon: '++' },
+  { page: 'CreateHoneypot', label: 'Добавить ловушку', icon: '++' },
   { page: 'Honeypots', label: 'Ловушки', icon: '⌘' },
   { page: 'Profiles', label: 'Профили', icon: '◎' },
   { page: 'LiveFeed', label: 'Атаки', icon: '⌁' },

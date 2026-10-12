@@ -111,6 +111,7 @@ pub fn deployment_command(trap: &Trap) -> Result<AgentCommand, AppError> {
         host_port,
         container_port: runtime.port,
         banner: runtime.banner,
+        resources: trap.resources.into(),
         publish_address: if binding.route_mode == crate::resources::RouteMode::Direct {
             "0.0.0.0"
         } else {

@@ -125,6 +125,8 @@ pub struct KozyavkaDeployment {
     pub host_port: u16,
     pub container_port: u16,
     pub banner: String,
+    #[serde(default)]
+    pub resources: ContainerResourceLimits,
     /// External direct listener is 0.0.0.0; Dispatcher members are loopback-only.
     pub publish_address: String,
 }
@@ -140,12 +142,42 @@ pub struct PritvoryashkaDeployment {
     /// External direct listener is 0.0.0.0; Dispatcher members are loopback-only.
     pub publish_address: String,
     pub hostname: String,
+    #[serde(default = "ContainerResourceLimits::middle_default")]
+    pub resources: ContainerResourceLimits,
     #[serde(default = "default_pritvoryashka_connections")]
     pub max_connections: u16,
 }
 
 fn default_pritvoryashka_connections() -> u16 {
     128
+}
+
+/// Bounded Docker resource budget passed as typed deployment data. The agent still enforces
+/// tier-specific ceilings and renders its own Compose file; callers never supply YAML.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerResourceLimits {
+    pub cpu_cores: f64,
+    pub memory_mb: u32,
+    pub pids: u32,
+}
+
+impl Default for ContainerResourceLimits {
+    fn default() -> Self {
+        Self { cpu_cores: 0.5, memory_mb: 128, pids: 64 }
+    }
+}
+
+impl ContainerResourceLimits {
+    pub fn middle_default() -> Self {
+        Self { cpu_cores: 1.0, memory_mb: 512, pids: 256 }
+    }
+
+    pub fn within(&self, max_cpu: f64, max_memory_mb: u32, max_pids: u32) -> bool {
+        self.cpu_cores.is_finite() && self.cpu_cores >= 0.05 && self.cpu_cores <= max_cpu
+            && (32..=max_memory_mb).contains(&self.memory_mb)
+            && (16..=max_pids).contains(&self.pids)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

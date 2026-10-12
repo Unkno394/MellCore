@@ -14,9 +14,10 @@ pub async fn create(
 ) -> Result<Profile, AppError> {
     principal.require_admin()?;
     input.validate()?;
+    let resources = input.resolved_resources();
     let mut tx = management::admin_tx(pool, principal.user.id).await?;
-    let profile = sqlx::query_as::<_, Profile>("INSERT INTO trap_profiles(id,name,description,level,honeypot_type,service_type,config) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *")
-        .bind(Uuid::new_v4()).bind(input.name.trim()).bind(input.description).bind(input.level).bind(input.honeypot_type).bind(input.service_type).bind(input.config).fetch_one(&mut *tx).await?;
+    let profile = sqlx::query_as::<_, Profile>("INSERT INTO trap_profiles(id,name,description,level,honeypot_type,service_type,config,resources) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *")
+        .bind(Uuid::new_v4()).bind(input.name.trim()).bind(input.description).bind(input.level).bind(input.honeypot_type).bind(input.service_type).bind(input.config).bind(sqlx::types::Json(resources)).fetch_one(&mut *tx).await?;
     management::audit(
         &mut tx,
         principal.user.id,
@@ -80,8 +81,9 @@ pub async fn update(
         return Err(AppError::conflict("Profile version has changed"));
     }
     let p = input.profile;
-    let profile = sqlx::query_as::<_, Profile>("UPDATE trap_profiles SET name=$2,description=$3,level=$4,honeypot_type=$5,service_type=$6,config=$7,version=version+1,updated_at=now() WHERE id=$1 RETURNING *")
-        .bind(target).bind(p.name.trim()).bind(p.description).bind(p.level).bind(p.honeypot_type).bind(p.service_type).bind(p.config).fetch_one(&mut *tx).await?;
+    let resources = p.resolved_resources();
+    let profile = sqlx::query_as::<_, Profile>("UPDATE trap_profiles SET name=$2,description=$3,level=$4,honeypot_type=$5,service_type=$6,config=$7,resources=$8,version=version+1,updated_at=now() WHERE id=$1 RETURNING *")
+        .bind(target).bind(p.name.trim()).bind(p.description).bind(p.level).bind(p.honeypot_type).bind(p.service_type).bind(p.config).bind(sqlx::types::Json(resources)).fetch_one(&mut *tx).await?;
     management::audit(
         &mut tx,
         principal.user.id,

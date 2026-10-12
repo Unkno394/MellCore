@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use hf_core::{AgentCommand, TcpPortGroup, TcpPortGroupMember};
+use hf_core::{AgentCommand, SharedTcpTrapKind, TcpPortGroup, TcpPortGroupMember};
 use uuid::Uuid;
 
 pub const INTERNAL_PORT_START: u16 = 31_000;
@@ -13,6 +13,7 @@ pub const INTERNAL_PORT_END: u16 = 32_000;
 pub struct GroupCandidate {
     pub trap_id: Uuid,
     pub weight: u8,
+    pub trap_kind: SharedTcpTrapKind,
 }
 
 /// Allocates loopback ports deterministically from the HoneyForge internal range and creates the
@@ -50,6 +51,7 @@ pub fn plan_tcp_port_group(
             trap_id: candidate.trap_id,
             backend_port: next,
             weight: candidate.weight,
+            trap_kind: candidate.trap_kind,
         });
         unavailable.insert(next);
         next += 1;
@@ -72,8 +74,8 @@ mod tests {
         let command = plan_tcp_port_group(
             1488,
             &[
-                GroupCandidate { trap_id: first, weight: 50 },
-                GroupCandidate { trap_id: second, weight: 50 },
+                GroupCandidate { trap_id: first, weight: 50, trap_kind: SharedTcpTrapKind::Kozyavka },
+                GroupCandidate { trap_id: second, weight: 50, trap_kind: SharedTcpTrapKind::Kozyavka },
             ],
             &HashSet::from([31_000]),
         )

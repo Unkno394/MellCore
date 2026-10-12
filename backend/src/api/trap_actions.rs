@@ -47,7 +47,7 @@ pub async fn start(
 ) -> Result<(StatusCode, Json<TrapActionProgress>), AppError> {
     resources::owned_tx(state.pool()?, &principal).await?.commit().await?;
     let trap = resources::traps::get(state.pool()?, &principal, trap_id).await?;
-    let agent_id: Uuid = sqlx::query_scalar("SELECT cat.agent_id FROM center_agent_traps cat JOIN traps t ON t.trap_id=cat.trap_id JOIN center_agent_servers cas ON cas.agent_id=cat.agent_id AND cas.server_id=t.server_id JOIN servers s ON s.server_id=t.server_id AND s.user_id=t.user_id WHERE cat.trap_id=$1 AND t.user_id=$2 AND cat.state<>'removed'")
+    let agent_id: Uuid = sqlx::query_scalar("SELECT cas.agent_id FROM traps t JOIN center_agent_servers cas ON cas.server_id=t.server_id JOIN servers s ON s.server_id=t.server_id AND s.user_id=t.user_id WHERE t.trap_id=$1 AND t.user_id=$2 AND s.status='online'")
         .bind(trap_id).bind(principal.user.id).fetch_optional(state.pool()?).await?.ok_or_else(AppError::not_found)?;
     let action_id = Uuid::new_v4();
     let commands = commands_for(input.action, &trap)?;
@@ -135,6 +135,7 @@ fn commands_for(action: TrapAction, trap: &Trap) -> Result<Vec<AgentCommand>, Ap
                     command_id: Uuid::new_v4(), trap_id: trap.trap_id, server_id: trap.server_id,
                     host_port, publish_address: if port.route_mode == crate::resources::RouteMode::Direct { "0.0.0.0" } else { "127.0.0.1" }.into(),
                     hostname: settings.hostname, max_connections,
+                    resources: trap.resources.into(),
                 }))
             }
             _ => Err(AppError::conflict("No deployment recipe is available for this trap")),
