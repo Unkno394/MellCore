@@ -70,7 +70,7 @@ telemetry. Несовместимый набор остановит устано
   only an independently confirmed host escape is marked confirmed. Owned results are available at
   `GET /api/v1/traps/{trap_id}/attack-matches`; administrators can inspect aggregated unknown
   action proposals at `GET /api/v1/knowledge/proposals` before manually curating the knowledge base.
-  Новые Low/Middle из dev-panel сначала проходят регистрацию в общих таблицах
+  Новые Low/Middle из веб-интерфейса сначала проходят регистрацию в общих таблицах
   `servers`/`traps` backend. Center сохраняет привязку agent/trap и отправляет
   неизвестные события в отдельный `events.rejected.jsonl`. Старые ловушки,
   поставленные до этой версии, требуют отдельной сверки перед обновлением Center.

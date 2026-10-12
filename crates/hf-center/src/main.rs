@@ -13,7 +13,6 @@ use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path as RoutePath, State},
     http::{HeaderMap, StatusCode},
-    response::Html,
     routing::{get, post},
 };
 use clap::Parser;
@@ -36,7 +35,6 @@ mod backend_registry;
 mod ingress_budget;
 mod telemetry_store;
 mod security_state;
-mod telemetry_store;
 use clickhouse::ClickHouseTelemetry;
 use postgres_graph_sink::PostgresGraphSink;
 use backend_registry::BackendRegistry;
@@ -443,7 +441,6 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(kazik_udp_receiver(kazik_udp_listen, state.clone()));
     tokio::spawn(retry_compromised_kicks(state.clone()));
     let app = Router::new()
-        .route("/", get(dev_panel))
         .route("/v1/agents/bootstrap", post(bootstrap))
         .route("/v1/agents/bootstrap/{job_id}", get(bootstrap_status))
         .route("/v1/agents/register", post(register))
@@ -462,10 +459,6 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-async fn dev_panel() -> Html<&'static str> {
-    Html(include_str!("../../../deploy/dev-panel/index.html"))
 }
 
 fn validate_hysteria_value(name: &str, value: &str) -> anyhow::Result<()> {
