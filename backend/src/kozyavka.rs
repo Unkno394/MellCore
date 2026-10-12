@@ -5,12 +5,12 @@ use crate::{
     models::TrapLevel,
     resources::{PortBinding, Transport, Trap},
 };
+use hf_core::{AgentCommand, KozyavkaDeployment};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr};
 use utoipa::ToSchema;
 use uuid::Uuid;
-use hf_core::{AgentCommand, KozyavkaDeployment};
 
 pub const PROFILE_ID: Uuid = Uuid::from_u128(0x6b6f7a79_6176_4b61_8000_000000000001);
 

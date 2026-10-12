@@ -172,6 +172,23 @@ mod tests {
     }
 
     #[test]
+    fn lost_batch_ack_replay_is_deduplicated_after_restart() {
+        let path = std::env::temp_dir().join(format!("hf-telemetry-batch-{}.jsonl", Uuid::new_v4()));
+        let agent_id = Uuid::new_v4();
+        let batch = vec![event(Uuid::new_v4()), event(Uuid::new_v4()), event(Uuid::new_v4())];
+        {
+            let mut store = TelemetryStore::open(&path).unwrap();
+            assert_eq!(store.persist(agent_id, &batch).unwrap(), batch.len());
+            // A lost ACK causes the complete immutable envelope to be sent again.
+            assert_eq!(store.persist(agent_id, &batch).unwrap(), 0);
+        }
+        let mut restarted = TelemetryStore::open(&path).unwrap();
+        assert_eq!(restarted.persist(agent_id, &batch).unwrap(), 0);
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), batch.len());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn quarantined_unknown_trap_is_durable_and_not_in_main_spool() {
         let path = std::env::temp_dir().join(format!("hf-rejected-{}.jsonl", Uuid::new_v4()));
         let agent = Uuid::new_v4();

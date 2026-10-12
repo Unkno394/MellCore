@@ -24,7 +24,7 @@ pub struct IngestResponse {
     pub duplicate_events: usize,
 }
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Clone, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CenterEventInput {
     pub agent_id: Uuid,
@@ -143,37 +143,55 @@ pub async fn list(
 
 #[utoipa::path(get,path="/api/v1/traps/{trap_id}/attack-matches",tag="telemetry",security(("bearer"=[])),params(("trap_id"=Uuid,Path)),responses((status=200,body=[AttackGraphMatch]),(status=401,body=crate::errors::ErrorResponse),(status=404,description="Trap missing or owned by another user",body=crate::errors::ErrorResponse),(status=503,body=crate::errors::ErrorResponse)))]
 pub async fn list_attack_matches(
-    State(state): State<AppState>, principal: Principal, Path(trap_id): Path<Uuid>,
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(trap_id): Path<Uuid>,
 ) -> Result<Json<Vec<AttackGraphMatch>>, AppError> {
     let pool = state.pool()?;
     crate::resources::traps::get(pool, &principal, trap_id).await?;
     let rows = sqlx::query("SELECT gp.session_key,split_part(gp.session_key,':',1) AS evidence_domain,t.technique_key,t.name,gp.status,gp.similarity,gp.evidence_event_ids,gp.updated_at FROM attack_graph_progress gp JOIN attack_techniques t USING(technique_id) WHERE gp.trap_id=$1 ORDER BY gp.updated_at DESC LIMIT 100")
         .bind(trap_id).fetch_all(pool).await?;
     use sqlx::Row;
-    let matches = rows.into_iter().map(|row| AttackGraphMatch {
-        session_key: row.get("session_key"), evidence_domain: row.get("evidence_domain"),
-        technique_key: row.get("technique_key"), technique_name: row.get("name"),
-        status: row.get("status"), similarity: row.get("similarity"),
-        evidence_event_ids: row.get("evidence_event_ids"), updated_at: row.get("updated_at"),
-    }).collect();
+    let matches = rows
+        .into_iter()
+        .map(|row| AttackGraphMatch {
+            session_key: row.get("session_key"),
+            evidence_domain: row.get("evidence_domain"),
+            technique_key: row.get("technique_key"),
+            technique_name: row.get("name"),
+            status: row.get("status"),
+            similarity: row.get("similarity"),
+            evidence_event_ids: row.get("evidence_event_ids"),
+            updated_at: row.get("updated_at"),
+        })
+        .collect();
     Ok(Json(matches))
 }
 
 #[utoipa::path(get,path="/api/v1/knowledge/proposals",tag="telemetry",security(("bearer"=[])),responses((status=200,body=[AttackGraphProposal]),(status=401,body=crate::errors::ErrorResponse),(status=403,body=crate::errors::ErrorResponse),(status=503,body=crate::errors::ErrorResponse)))]
 pub async fn list_graph_proposals(
-    State(state): State<AppState>, principal: Principal,
+    State(state): State<AppState>,
+    principal: Principal,
 ) -> Result<Json<Vec<AttackGraphProposal>>, AppError> {
     principal.require_admin()?;
     let rows = sqlx::query("SELECT proposal_id,action_kind,process_class,resource_class,outcome,sample_event_id,evidence_count,suggested_technique,first_seen,last_seen FROM attack_graph_proposals WHERE status='pending' ORDER BY evidence_count DESC,last_seen DESC LIMIT 100")
         .fetch_all(state.pool()?).await?;
     use sqlx::Row;
-    let proposals = rows.into_iter().map(|row| AttackGraphProposal {
-        proposal_id: row.get("proposal_id"), action_kind: row.get("action_kind"),
-        process_class: row.get("process_class"), resource_class: row.get("resource_class"),
-        outcome: row.get("outcome"), sample_event_id: row.get("sample_event_id"),
-        evidence_count: row.get("evidence_count"), suggested_technique: row.get("suggested_technique"),
-        first_seen: row.get("first_seen"), last_seen: row.get("last_seen"),
-    }).collect();
+    let proposals = rows
+        .into_iter()
+        .map(|row| AttackGraphProposal {
+            proposal_id: row.get("proposal_id"),
+            action_kind: row.get("action_kind"),
+            process_class: row.get("process_class"),
+            resource_class: row.get("resource_class"),
+            outcome: row.get("outcome"),
+            sample_event_id: row.get("sample_event_id"),
+            evidence_count: row.get("evidence_count"),
+            suggested_technique: row.get("suggested_technique"),
+            first_seen: row.get("first_seen"),
+            last_seen: row.get("last_seen"),
+        })
+        .collect();
     Ok(Json(proposals))
 }
 
@@ -182,32 +200,48 @@ pub async fn list_graph_proposals(
 /// to declare a host escape without independent validated observer evidence.
 #[utoipa::path(post,path="/api/v1/knowledge/proposals/{proposal_id}/review",tag="telemetry",security(("bearer"=[])),params(("proposal_id"=Uuid,Path)),request_body=ReviewGraphProposal,responses((status=200,body=ReviewGraphResult),(status=403,body=crate::errors::ErrorResponse),(status=409,body=crate::errors::ErrorResponse)))]
 pub async fn review_graph_proposal(
-    State(state): State<AppState>, principal: Principal,
-    Path(proposal_id): Path<Uuid>, Json(input): Json<ReviewGraphProposal>,
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(proposal_id): Path<Uuid>,
+    Json(input): Json<ReviewGraphProposal>,
 ) -> Result<Json<ReviewGraphResult>, AppError> {
     principal.require_admin()?;
     if !matches!(input.decision.as_str(), "accept" | "reject") {
         return Err(AppError::invalid("Decision must be accept or reject"));
     }
-    if input.decision == "reject" && (input.technique_id.is_some() || input.predecessor_node_id.is_some()) {
-        return Err(AppError::invalid("Rejected proposals cannot create graph nodes"));
+    if input.decision == "reject"
+        && (input.technique_id.is_some() || input.predecessor_node_id.is_some())
+    {
+        return Err(AppError::invalid(
+            "Rejected proposals cannot create graph nodes",
+        ));
     }
     let mut tx = state.pool()?.begin().await?;
     use sqlx::Row;
     let row = sqlx::query("SELECT status,action_kind,process_class,resource_class,outcome,suggested_technique FROM attack_graph_proposals WHERE proposal_id=$1 FOR UPDATE")
         .bind(proposal_id).fetch_optional(&mut *tx).await?.ok_or_else(AppError::not_found)?;
-    if row.get::<String, _>("status") != "pending" { return Err(AppError::conflict("Proposal was already reviewed")); }
+    if row.get::<String, _>("status") != "pending" {
+        return Err(AppError::conflict("Proposal was already reviewed"));
+    }
     let mut node_id = None;
     let status = if input.decision == "accept" {
-        let technique = input.technique_id.or(row.get("suggested_technique"))
+        let technique = input
+            .technique_id
+            .or(row.get("suggested_technique"))
             .ok_or_else(|| AppError::invalid("Choose an existing technique"))?;
         let known: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM attack_techniques WHERE technique_id=$1 AND status='known')")
             .bind(technique).fetch_one(&mut *tx).await?;
-        if !known { return Err(AppError::invalid("Technique is unknown or pending review")); }
+        if !known {
+            return Err(AppError::invalid("Technique is unknown or pending review"));
+        }
         if let Some(predecessor) = input.predecessor_node_id {
             let belongs: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM attack_graph_nodes WHERE node_id=$1 AND technique_id=$2)")
                 .bind(predecessor).bind(technique).fetch_one(&mut *tx).await?;
-            if !belongs { return Err(AppError::invalid("Predecessor does not belong to technique")); }
+            if !belongs {
+                return Err(AppError::invalid(
+                    "Predecessor does not belong to technique",
+                ));
+            }
         }
         let id = Uuid::new_v4();
         let node_key = format!("variant.{}", id.simple());
@@ -219,17 +253,29 @@ pub async fn review_graph_proposal(
             .bind(row.get::<String, _>("outcome"))
             .execute(&mut *tx).await?;
         if let Some(predecessor) = input.predecessor_node_id {
-            sqlx::query("INSERT INTO attack_graph_edges(technique_id,from_node,to_node) VALUES($1,$2,$3)")
-                .bind(technique).bind(predecessor).bind(id).execute(&mut *tx).await?;
+            sqlx::query(
+                "INSERT INTO attack_graph_edges(technique_id,from_node,to_node) VALUES($1,$2,$3)",
+            )
+            .bind(technique)
+            .bind(predecessor)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         }
         node_id = Some(id);
         "accepted"
-    } else { "rejected" };
+    } else {
+        "rejected"
+    };
     sqlx::query("UPDATE attack_graph_proposals SET status=$2,reviewed_by=$3,reviewed_at=now(),accepted_node_id=$4 WHERE proposal_id=$1")
         .bind(proposal_id).bind(status).bind(principal.user.id).bind(node_id)
         .execute(&mut *tx).await?;
     tx.commit().await?;
-    Ok(Json(ReviewGraphResult { proposal_id, status: status.to_owned(), node_id }))
+    Ok(Json(ReviewGraphResult {
+        proposal_id,
+        status: status.to_owned(),
+        node_id,
+    }))
 }
 
 impl TryFrom<StoredAttackEvent> for AttackEvent {
@@ -288,9 +334,11 @@ pub async fn ingest(
     persist_batch(state, batch, false).await
 }
 
-async fn persist_batch(state: AppState, mut batch: TelemetryBatch, trusted_center: bool)
-    -> Result<(StatusCode, Json<IngestResponse>), AppError>
-{
+async fn persist_batch(
+    state: AppState,
+    mut batch: TelemetryBatch,
+    trusted_center: bool,
+) -> Result<(StatusCode, Json<IngestResponse>), AppError> {
     batch
         .validate(&state.config.telemetry, Utc::now())
         .map_err(validation_error)?;
@@ -300,8 +348,9 @@ async fn persist_batch(state: AppState, mut batch: TelemetryBatch, trusted_cente
     let mut tx = pool.begin().await?;
     // A per-agent transaction lock serializes progress, including its first INSERT.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
-        .bind(batch.agent_id.to_string()).execute(&mut *tx).await?;
-
+        .bind(batch.agent_id.to_string())
+        .execute(&mut *tx)
+        .await?;
 
     if let Some(existing) = sqlx::query_scalar::<_, Vec<u8>>(
         "SELECT batch_hash FROM telemetry_batches WHERE batch_id=$1 FOR SHARE",
@@ -354,7 +403,9 @@ async fn persist_batch(state: AppState, mut batch: TelemetryBatch, trusted_cente
         .execute(&mut *tx)
         .await?;
 
-    batch.events.sort_by_key(|event| (event.occurred_at, event.sequence_no));
+    batch
+        .events
+        .sort_by_key(|event| (event.occurred_at, event.sequence_no));
     let mut accepted_events = 0_usize;
     let mut duplicate_events = 0_usize;
     let received_at = Utc::now();
@@ -380,13 +431,21 @@ async fn persist_batch(state: AppState, mut batch: TelemetryBatch, trusted_cente
             // Middle may send the same event directly before Center mirrors it.
             // The trusted, agent-bound Center delivery must still index the graph.
             if trusted_center {
-                crate::attack_graph::observe(&mut tx, batch.agent_id, batch.server_id, event, true).await?;
+                crate::attack_graph::observe(&mut tx, batch.agent_id, batch.server_id, event, true)
+                    .await?;
             }
             duplicate_events += 1;
             continue;
         }
         insert_event(&mut tx, &batch, event, &hash, received_at, expires_at).await?;
-        crate::attack_graph::observe(&mut tx, batch.agent_id, batch.server_id, event, trusted_center).await?;
+        crate::attack_graph::observe(
+            &mut tx,
+            batch.agent_id,
+            batch.server_id,
+            event,
+            trusted_center,
+        )
+        .await?;
         accepted_events += 1;
     }
     tx.commit().await?;
@@ -404,7 +463,9 @@ async fn persist_batch(state: AppState, mut batch: TelemetryBatch, trusted_cente
 /// event; the backend resolves server ownership from the registered trap.
 #[utoipa::path(post,path="/internal/v1/center/events",tag="telemetry",security(("telemetry_bearer"=[])),request_body=CenterEventInput,responses((status=202,body=IngestResponse),(status=401,body=crate::errors::ErrorResponse),(status=404,body=crate::errors::ErrorResponse),(status=422,body=crate::errors::ErrorResponse)))]
 pub async fn ingest_from_center(
-    State(state): State<AppState>, headers: HeaderMap, Json(input): Json<CenterEventInput>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CenterEventInput>,
 ) -> Result<(StatusCode, Json<IngestResponse>), AppError> {
     authorize_center(&state, &headers)?;
     let pool = state.pool()?;
@@ -479,8 +540,15 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
 }
 
 pub(crate) fn authorize_center(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
-    let expected = state.config.center_ingest_token.as_ref().ok_or_else(AppError::unauthorized)?;
-    if !constant_time_eq(expected.expose().as_bytes(), telemetry_bearer(headers).unwrap_or_default()) {
+    let expected = state
+        .config
+        .center_ingest_token
+        .as_ref()
+        .ok_or_else(AppError::unauthorized)?;
+    if !constant_time_eq(
+        expected.expose().as_bytes(),
+        telemetry_bearer(headers).unwrap_or_default(),
+    ) {
         return Err(AppError::unauthorized());
     }
     Ok(())

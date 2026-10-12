@@ -532,7 +532,7 @@ impl HighTelemetryStore {
             let mut statement = transaction.prepare(
                 "SELECT event_id, event_json FROM high_telemetry_events
                  WHERE event_id NOT IN (SELECT event_id FROM high_telemetry_batch_events)
-                 ORDER BY received_at_unix_ms, event_id LIMIT ?1",
+                 ORDER BY received_at_unix_ms, rowid LIMIT ?1",
             )?;
             statement
                 .query_map([i64::try_from(maximum_events).unwrap_or(i64::MAX)], |row| {
@@ -585,8 +585,8 @@ impl HighTelemetryStore {
         }))
     }
 
-    /// Deletes mapped events only after a future center contract confirms durable persistence.
-    /// The current center's `Accepted` response is explicitly insufficient for this call.
+    /// Deletes mapped events only after Center's semantic ACK confirms durable persistence.
+    /// Transport delivery alone is never sufficient for this call.
     pub fn acknowledge_durable_kazik_batch(
         &mut self,
         message_id: Uuid,

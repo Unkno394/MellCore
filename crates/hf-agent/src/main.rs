@@ -25,10 +25,12 @@ use hf_core::{
 };
 use hf_services::{
     FailoverSender, HysteriaSocks5UdpTransport,
+    high_telemetry::HighTelemetryStore,
     kazik_outbox::{SqliteKazikOutbox, send_pending_once},
 };
 use kazik_protocol::{
     AckDisposition, Acknowledgement, AgentStatus, DurableOutbox, KazikBody, KazikEnvelope,
+    MAX_TELEMETRY_BATCH_EVENTS,
 };
 use sandbox::{HighDomainState, LibvirtSandboxManager, UbuntuSshVm, default_recipe_dir};
 use serde::{Deserialize, Serialize};
@@ -1236,6 +1238,10 @@ async fn main() -> anyhow::Result<()> {
         args.high_telemetry_max_pending,
         Duration::from_secs(args.high_operational_interval_seconds),
     )?;
+    let high_kazik_store = HighTelemetryStore::open(
+        args.state_dir.join("high-telemetry.sqlite"),
+        args.high_telemetry_max_pending,
+    )?;
     // Initial SSH bootstrap may seed one root-owned command here. Later commands arrive through
     // Kazik and use the same idempotent `apply` implementation.
     let inbox = args.state_dir.join("inbox");
@@ -1258,6 +1264,7 @@ async fn main() -> anyhow::Result<()> {
             identity,
             socks,
             center_udp,
+            high_kazik_store,
         )
         .await;
     }
@@ -1284,6 +1291,7 @@ async fn run_kazik_hysteria_loop(
     identity: AgentIdentity,
     socks: SocketAddr,
     center_udp: SocketAddr,
+    mut high_telemetry_store: HighTelemetryStore,
 ) -> anyhow::Result<()> {
     let mut transport: Option<Arc<HysteriaSocks5UdpTransport>> = None;
     let mut sender: Option<FailoverSender> = None;
@@ -1291,7 +1299,7 @@ async fn run_kazik_hysteria_loop(
     let mut outbox_retry = tokio::time::interval(Duration::from_secs(5));
     let mut outbox = SqliteKazikOutbox::open(state_dir.join("kazik-outbox.sqlite"))?;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
-    let mut telemetry_poll = tokio::time::interval(Duration::from_secs(5));
+    let mut telemetry_poll = tokio::time::interval(telemetry::batch_wait());
     let mut emergency_tick = tokio::time::interval(Duration::from_secs(1));
     let existing_incident = emergency::pending(state_dir)?;
     let mut incident_message_id = existing_incident.as_ref().map(|incident| incident.message_id);
@@ -1312,6 +1320,7 @@ async fn run_kazik_hysteria_loop(
                 KazikBody::Telemetry { events: vec![event] },
             );
             envelope.message_id = incident.message_id;
+            telemetry::ensure_packet_size(&envelope)?;
             missing_alert = Some(envelope);
         }
     }
@@ -1333,9 +1342,7 @@ async fn run_kazik_hysteria_loop(
     let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<CommandExecution>(32);
     match projects.recover_quarantines() {
         Ok(events) => for event in events {
-            outbox.enqueue(KazikEnvelope::new(identity.agent_id,
-                identity.transport_credential.clone(), event.occurred_at_unix_ms,
-                KazikBody::Telemetry { events: vec![event] }))?;
+            telemetry::enqueue_immediate_event(&identity, &mut outbox, event)?;
         },
         Err(error) => tracing::error!(%error, "could not scan persisted trap quarantines"),
     }
@@ -1480,15 +1487,7 @@ async fn run_kazik_hysteria_loop(
                         }
                     }
                 }
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_millis() as i64;
-                outbox.enqueue(KazikEnvelope::new(
-                    identity.agent_id,
-                    identity.transport_credential.clone(),
-                    now,
-                    KazikBody::Telemetry { events: vec![observation.event] },
-                ))?;
+                telemetry::enqueue_immediate_event(&identity, &mut outbox, observation.event)?;
                 if let Some(sender) = sender.as_ref() {
                     if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
                         tracing::warn!(%error, "security event remains in SQLite outbox");
@@ -1496,11 +1495,7 @@ async fn run_kazik_hysteria_loop(
                 }
             }
             Some(event) = quarantine_rx.recv() => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
-                outbox.enqueue(KazikEnvelope::new(identity.agent_id,
-                    identity.transport_credential.clone(), now,
-                    KazikBody::Telemetry { events: vec![event] }))?;
+                telemetry::enqueue_immediate_event(&identity, &mut outbox, event)?;
                 if let Some(sender) = sender.as_ref() {
                     if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
                         tracing::warn!(%error, "quarantine result remains in SQLite outbox");
@@ -1518,6 +1513,7 @@ async fn run_kazik_hysteria_loop(
                         now,
                         KazikBody::Telemetry { events: vec![event.clone()] },
                     );
+                    telemetry::ensure_packet_size(&envelope)?;
                     let message_id = envelope.message_id;
                     let response_armed = emergency::armed();
                     emergency::record(state_dir, &event, message_id)?;
@@ -1590,6 +1586,7 @@ async fn run_kazik_hysteria_loop(
                 }
             }
             _ = telemetry_poll.tick() => {
+                let mut queued = false;
                 match telemetry::collect_new_events(
                     &projects.root,
                     state_dir,
@@ -1597,15 +1594,42 @@ async fn run_kazik_hysteria_loop(
                     &mut outbox,
                 ) {
                     Ok(count) if count > 0 => {
+                        queued = true;
                         tracing::info!(events = count, "trap telemetry queued for Center");
-                        if let Some(sender) = sender.as_ref() {
-                            if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
-                                tracing::warn!(%error, "trap telemetry remains in durable outbox");
-                            }
-                        }
                     }
                     Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "trap telemetry collection failed"),
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_millis() as i64;
+                let json_budget = telemetry::event_json_budget(&identity, now)?;
+                match high_telemetry_store.prepare_kazik_batch(
+                    MAX_TELEMETRY_BATCH_EVENTS,
+                    json_budget,
+                    now,
+                ) {
+                    Ok(Some(batch)) => {
+                        let envelope = batch.kazik_envelope(
+                            identity.agent_id,
+                            identity.transport_credential.clone(),
+                        );
+                        match telemetry::ensure_packet_size(&envelope)
+                            .and_then(|_| outbox.enqueue(envelope).map_err(Into::into))
+                        {
+                            Ok(()) => queued = true,
+                            Err(error) => tracing::warn!(%error, "High telemetry remains in its durable SQLite queue"),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(%error, "High telemetry batching failed"),
+                }
+                if queued {
+                    if let Some(sender) = sender.as_ref() {
+                        if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
+                            tracing::warn!(%error, "trap telemetry remains in durable outbox");
+                        }
+                    }
                 }
             }
             _ = heartbeat.tick() => {
@@ -1645,6 +1669,11 @@ async fn run_kazik_hysteria_loop(
                                         emergency::record_alert_ack(state_dir, ack.acknowledged_message_id)?;
                                         missing_alert = None;
                                     }
+                                    // Clear the High source batch first. If the process stops
+                                    // before the common outbox row is removed, the harmless
+                                    // replay is still deduplicated by Center event_id.
+                                    high_telemetry_store
+                                        .acknowledge_durable_kazik_batch(ack.acknowledged_message_id)?;
                                     outbox.acknowledge(ack.acknowledged_message_id)?;
                                     if pending_emergency.as_ref().is_some_and(|pending| pending.message_id == ack.acknowledged_message_id) {
                                         match emergency::start(state_dir) {
@@ -2139,13 +2168,14 @@ fn atomic_write(path: &Path, content: &[u8]) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatcherConfig, DispatcherListener, DispatcherTarget, Platform, QuarantineMarker, quarantine_result, parse_platform};
+    use super::{
+        ComposeProjectStore, DispatcherConfig, DispatcherListener, DispatcherTarget,
+        HighDesiredState, HighRuntimeManifest, Platform, QuarantineMarker, compose_remove_id,
+        parse_platform, quarantine_result,
+    };
+    use hf_core::{AgentCommand, HighUbuntuDeployment};
+    use std::fs;
 
-    fn detach_dispatcher_target(
-        &self,
-        trap_id: uuid::Uuid,
-        shared_backend: bool,
-    ) -> anyhow::Result<Option<Vec<u8>>> {
     use uuid::Uuid;
 
     #[test]

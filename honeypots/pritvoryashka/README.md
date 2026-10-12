@@ -9,7 +9,8 @@ Pritvoryashka — самостоятельная Middle Interaction SSH-лову
 
 - `ssh/` — `russh` server, парольная авторизация, PTY, shell/exec channels,
   terminal input, таймаут и лимит параллельных клиентов.
-- `shell/` — безопасный tokenizer и детерминированные реализации команд.
+- `shell/` — безопасный tokenizer, детерминированные реализации команд и
+  единая виртуальная модель процессов, сервисов, контейнеров и данных.
 - `filesystem/` — нормализованные виртуальные пути, файлы, каталоги, metadata,
   права и лимиты числа/размера объектов. Доступа к host FS нет.
 - `deception/` — локальный конечный автомат сценария и метрика Deception Depth.
@@ -17,8 +18,9 @@ Pritvoryashka — самостоятельная Middle Interaction SSH-лову
   bounded queue, batching, retry, JSONL fallback и HTTP transport.
 - `integration/` — `/health/live` и `/health/ready`.
 
-Состояние `Shell`, VFS, история и deception engine принадлежат одному SSH
-handler. После отключения handler и вся сессионная VFS освобождаются.
+Состояние `Shell`, VFS, история, виртуальный сервер и deception engine
+принадлежат одному SSH handler. После отключения handler и всё состояние
+сессии освобождается. Между SSH-сессиями изменения не передаются.
 
 ## Локальный запуск
 
@@ -74,14 +76,47 @@ HF_PRITVORYASHKA_IMAGE_ARCHIVE=pritvoryashka-image.tar hf-center ...
 
 ## Команды
 
-Поддержаны `pwd`, `ls`, `cd`, `cat`, `echo`, `whoami`, `id`, `uname`,
-`hostname`, `date`, `uptime`, `ps`, `top`, `history`, `mkdir`, `touch`, `rm`,
-`cp`, `mv`, `head`, `tail`, `grep`, `find`, `clear`, `exit`.
+Поддержаны базовые `pwd`, `ls`, `cd`, `cat`, `echo`, `whoami`, `id`, `uname`,
+`hostname`, `date`, `uptime`, `history`, `mkdir`, `touch`, `rm`, `cp`, `mv`,
+`head`, `tail`, `grep`, `find`, `clear`, `exit`, а также команды приманок:
+`ps`, `top`, `kill`, `ip`, `ss`, `netstat`, `crontab`, `systemctl`,
+`authorized_keys`, `docker`, `docker-compose`, `git`, `psql`, `tar`, `unzip`,
+`zipinfo`, `companyctl`.
 
 Есть одинарные/двойные кавычки, пробелы в аргументах, backspace, Ctrl+C,
 Ctrl+D, PTY и изменение размера терминала. Конвейеры, перенаправления,
 подстановки, `&&`, `;` и job control намеренно отклоняются как unsupported
 syntax. Неизвестная команда возвращает правдоподобный `command not found`.
+
+## Интерактивные приманки
+
+Все приманки описывают один сервер приложений `billing-api` и используют одну
+сессионную модель:
+
+1. `ps`, `top`, `kill` и виртуальный `/proc` показывают процессы с PID и
+   изменяемыми состояниями. `STOP`, `CONT`, `TERM` и `KILL` остаются внутри модели.
+2. В VFS находятся фиктивные `.env`, deploy SSH key, AWS credentials и
+   конфигурации. Они правдоподобны, но намеренно невалидны.
+3. `ip`, `ss` и `netstat` показывают интерфейсы и виртуальные PostgreSQL,
+   Redis, SSH и HTTP listeners.
+4. `crontab`, `systemctl` и `authorized_keys` позволяют менять виртуальное
+   закрепление. Доступны `crontab add` и `authorized_keys add`.
+5. `docker`/`docker compose` поддерживают `ps`, `inspect`, `logs`, `exec`,
+   start/stop/restart, Compose, volumes и networks.
+6. `/srv/billing-api` содержит фиктивный Rust-проект с `git log`, `status`,
+   `show`, `branch` и `remote -v`.
+7. `psql -c <query>` имитирует схему, таблицы и ограниченные SELECT/INSERT/
+   UPDATE/DELETE без настоящей СУБД.
+8. `/var/backups` содержит виртуальные TAR/ZIP/SQL backup; их можно просмотреть
+   и распаковать в VFS через `tar`, `unzip` и `zipinfo`.
+9. `history` и `.bash_history` содержат подсказки к остальным приманкам и
+   обновляются выполненными командами.
+10. `companyctl` объединяет services, config и backups и меняет ту же модель.
+
+Например, `docker stop billing-api` завершает PID 1134, удаляет его каталог из
+`/proc`, обновляет `/proc/net/tcp`, убирает порт 8080 из `ss`/`netstat` и
+отражается в `companyctl services list`. `docker start` восстанавливает процесс
+и listener. Docker daemon, PostgreSQL, Git и процессы хоста не вызываются.
 
 ## Adaptive Deception
 
@@ -104,7 +139,9 @@ syntax. Неизвестная команда возвращает правдо�
 - `session.started`, `session.ended`;
 - `command.executed`;
 - `filesystem.accessed`, `filesystem.modified`;
-- `deception.triggered`, `deception.stage_changed`.
+- `deception.triggered`, `deception.stage_changed`;
+- `deception.interaction` с полями `bait`, `action`, `target`, `success` для
+  успешных и неуспешных взаимодействий с приманками.
 
 Компонент отправляет `TelemetryBatch` schema version 1 в
 `POST /internal/v1/telemetry/batches`. Очередь ограничена, при переполнении
@@ -145,6 +182,10 @@ cargo test -p pritvoryashka --test ssh -- --ignored
 - SFTP/SCP, X11, agent forwarding, local/remote/Unix forwarding.
 - Настоящие процессы, shell grammar, pipes/redirections и host filesystem.
 - Сохранение изменений VFS между сессиями.
+- Полный интерактивный TTY вложенных `psql`, `docker exec sh` и редактора
+  `crontab -e`: вместо них поддерживаются ограниченные одношаговые команды.
+- Произвольный SQL, Git plumbing и создание настоящих форматов архивов: это
+  детерминированные симуляции с подготовленным набором данных.
 - Автоматическое развёртывание контейнера/процесса на зарегистрированном server:
   существующий HoneyForge infrastructure executor пока не реализован.
 - ClickHouse и UI-specific аналитические endpoints; события пока сохраняются
