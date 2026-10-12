@@ -26,7 +26,8 @@ heartbeat and retries it until `Applied` or `Duplicate ACK`; the agent executes 
 Tokio worker queue and returns its result through the durable packet outbox. This endpoint returns
 404 when no control token is configured; it is not a replacement for panel user/session auth.
 
-This is the current boundary: credentials and queued Center commands are held in memory. Persisting
-them, explicit revocation, and force-closing an already authenticated Hysteria session still need a
-durable control-plane store and Hysteria session-control integration. Do not represent this template
-as revocation-complete production deployment yet.
+Set `HF_CENTER_CREDENTIALS_FILE` to a root-owned JSON file to retain agent credentials across
+Center restarts. Without that setting credentials remain in memory. Enrollment tokens and queued
+commands still remain in memory; explicit revocation and force-closing authenticated Hysteria
+sessions still need control-plane/session-control integration. The single-host deployment and
+its verification script are documented in [deploy/vps](../vps/README.md).

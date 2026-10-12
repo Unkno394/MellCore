@@ -24,6 +24,13 @@ pub struct IngestResponse {
     pub duplicate_events: usize,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CenterEventInput {
+    pub agent_id: Uuid,
+    pub event: IncomingEvent,
+}
+
 #[derive(Default, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
@@ -36,6 +43,30 @@ pub struct EventQuery {
 pub struct AttackEventPage {
     pub items: Vec<AttackEvent>,
     pub next_cursor: Option<Uuid>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct AttackGraphMatch {
+    pub technique_key: String,
+    pub technique_name: String,
+    pub status: String,
+    pub similarity: f32,
+    pub evidence_event_ids: Vec<Uuid>,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct AttackGraphProposal {
+    pub proposal_id: Uuid,
+    pub action_kind: String,
+    pub process_class: String,
+    pub resource_class: String,
+    pub outcome: String,
+    pub sample_event_id: Uuid,
+    pub evidence_count: i64,
+    pub suggested_technique: Option<Uuid>,
+    pub first_seen: chrono::DateTime<Utc>,
+    pub last_seen: chrono::DateTime<Utc>,
 }
 
 #[derive(FromRow)]
@@ -91,6 +122,41 @@ pub async fn list(
         None
     };
     Ok(Json(AttackEventPage { items, next_cursor }))
+}
+
+#[utoipa::path(get,path="/api/v1/traps/{trap_id}/attack-matches",tag="telemetry",security(("bearer"=[])),params(("trap_id"=Uuid,Path)),responses((status=200,body=[AttackGraphMatch]),(status=401,body=crate::errors::ErrorResponse),(status=404,description="Trap missing or owned by another user",body=crate::errors::ErrorResponse),(status=503,body=crate::errors::ErrorResponse)))]
+pub async fn list_attack_matches(
+    State(state): State<AppState>, principal: Principal, Path(trap_id): Path<Uuid>,
+) -> Result<Json<Vec<AttackGraphMatch>>, AppError> {
+    let pool = state.pool()?;
+    crate::resources::traps::get(pool, &principal, trap_id).await?;
+    let rows = sqlx::query("SELECT t.technique_key,t.name,gp.status,gp.similarity,gp.evidence_event_ids,gp.updated_at FROM attack_graph_progress gp JOIN attack_techniques t USING(technique_id) WHERE gp.trap_id=$1 ORDER BY gp.updated_at DESC LIMIT 100")
+        .bind(trap_id).fetch_all(pool).await?;
+    use sqlx::Row;
+    let matches = rows.into_iter().map(|row| AttackGraphMatch {
+        technique_key: row.get("technique_key"), technique_name: row.get("name"),
+        status: row.get("status"), similarity: row.get("similarity"),
+        evidence_event_ids: row.get("evidence_event_ids"), updated_at: row.get("updated_at"),
+    }).collect();
+    Ok(Json(matches))
+}
+
+#[utoipa::path(get,path="/api/v1/knowledge/proposals",tag="telemetry",security(("bearer"=[])),responses((status=200,body=[AttackGraphProposal]),(status=401,body=crate::errors::ErrorResponse),(status=403,body=crate::errors::ErrorResponse),(status=503,body=crate::errors::ErrorResponse)))]
+pub async fn list_graph_proposals(
+    State(state): State<AppState>, principal: Principal,
+) -> Result<Json<Vec<AttackGraphProposal>>, AppError> {
+    principal.require_admin()?;
+    let rows = sqlx::query("SELECT proposal_id,action_kind,process_class,resource_class,outcome,sample_event_id,evidence_count,suggested_technique,first_seen,last_seen FROM attack_graph_proposals WHERE status='pending' ORDER BY evidence_count DESC,last_seen DESC LIMIT 100")
+        .fetch_all(state.pool()?).await?;
+    use sqlx::Row;
+    let proposals = rows.into_iter().map(|row| AttackGraphProposal {
+        proposal_id: row.get("proposal_id"), action_kind: row.get("action_kind"),
+        process_class: row.get("process_class"), resource_class: row.get("resource_class"),
+        outcome: row.get("outcome"), sample_event_id: row.get("sample_event_id"),
+        evidence_count: row.get("evidence_count"), suggested_technique: row.get("suggested_technique"),
+        first_seen: row.get("first_seen"), last_seen: row.get("last_seen"),
+    }).collect();
+    Ok(Json(proposals))
 }
 
 impl TryFrom<StoredAttackEvent> for AttackEvent {
@@ -231,6 +297,7 @@ pub async fn ingest(
             continue;
         }
         insert_event(&mut tx, &batch, event, &hash, received_at, expires_at).await?;
+        crate::attack_graph::observe(&mut tx, batch.agent_id, batch.server_id, event).await?;
         accepted_events += 1;
     }
     tx.commit().await?;
@@ -242,6 +309,27 @@ pub async fn ingest(
             duplicate_events,
         }),
     ))
+}
+
+/// Center-to-PostgreSQL mirror. The trusted center supplies agent identity and
+/// event; the backend resolves server ownership from the registered trap.
+#[utoipa::path(post,path="/internal/v1/center/events",tag="telemetry",security(("telemetry_bearer"=[])),request_body=CenterEventInput,responses((status=202,body=IngestResponse),(status=401,body=crate::errors::ErrorResponse),(status=404,body=crate::errors::ErrorResponse),(status=422,body=crate::errors::ErrorResponse)))]
+pub async fn ingest_from_center(
+    State(state): State<AppState>, headers: HeaderMap, Json(input): Json<CenterEventInput>,
+) -> Result<(StatusCode, Json<IngestResponse>), AppError> {
+    authorize(&state, &headers)?;
+    let pool = state.pool()?;
+    let server_id: Uuid = sqlx::query_scalar("SELECT server_id FROM traps WHERE trap_id=$1")
+        .bind(input.event.trap_id).fetch_optional(pool).await?.ok_or_else(AppError::not_found)?;
+    let batch = TelemetryBatch {
+        schema_version: SCHEMA_VERSION,
+        // Stable across retries, so the existing idempotent batch path applies.
+        batch_id: input.event.event_id,
+        agent_id: input.agent_id,
+        server_id,
+        events: vec![input.event],
+    };
+    ingest(State(state), headers, Json(batch)).await
 }
 
 async fn insert_event(

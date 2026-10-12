@@ -150,8 +150,16 @@ cargo test -p pritvoryashka --test ssh -- --ignored
 - ClickHouse и UI-specific аналитические endpoints; события пока сохраняются
   только в PostgreSQL.
 
-Ограничения памяти внутри процесса обеспечиваются лимитами клиентов, input,
-history, event queue, event size, VFS nodes и VFS bytes. Для production также
-нужно запускать процесс непривилегированным пользователем в container/systemd
-с cgroup memory/CPU limits и разрешать исходящий трафик только к HoneyForge.
+Команды Middle — только виртуальные команды из `shell/commands.rs`; они не
+создают процессы ОС. Доступ к файлам идёт через виртуальную FS, ограниченную
+4096 объектами, 1 MiB на файл и 4 MiB суммарно. Shell отклоняет пайпы,
+перенаправления, командные разделители и command substitution. SSH-сервер
+ограничивает подключения, длину команды и время бездействия; агент при создании
+контейнера задаёт cgroup-лимиты памяти/CPU/PID и `nofile`, read-only rootfs,
+убирает capabilities и включает `no-new-privileges`. Для постоянного host key
+разрешён единственный writable volume.
+
+Контейнеры пока используют обычную Docker bridge-сеть. Вход опубликован только
+на настроенном SSH-порту, но исходящий трафик из контейнера не ограничен
+allowlist-ом HoneyForge; это остаётся отдельной задачей hardening.
 

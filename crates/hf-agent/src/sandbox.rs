@@ -124,7 +124,10 @@ impl LibvirtSandboxManager {
     }
 
     pub fn remove(&self, instance_id: Uuid) -> anyhow::Result<()> {
-        self.reset(instance_id)
+        // reset.sh is the idempotent teardown primitive. Removal invokes it directly so the
+        // caller cannot accidentally acquire ResetHighUbuntu's subsequent redeploy semantics.
+        let instance_id = instance_id.to_string();
+        self.run("reset.sh", &[&instance_id])
     }
 
     pub fn stop(&self, instance_id: Uuid) -> anyhow::Result<()> {
