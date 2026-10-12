@@ -252,7 +252,7 @@ export default function Settings({
 
           <SelectField
             label="Default threat level"
-            description="Preferred severity filter"
+            description="UI-only preference; backend telemetry has no severity field"
             value={settings.defaultThreatLevel}
             options={['All', 'High', 'Medium', 'Low']}
             onChange={(value) =>
@@ -350,7 +350,7 @@ export default function Settings({
 
             <p className="mt-1 text-xs text-white/40">
               Preferences are stored locally in this browser.
-              Server integration is not connected.
+              MellCore does not expose a settings API.
             </p>
 
             {saved && (
@@ -381,7 +381,7 @@ export default function Settings({
       </div>
 
       <div className="text-xs text-white/35">
-        MellCore · Demo configuration panel
+        MellCore · Local interface preferences
       </div>
     </section>
   )

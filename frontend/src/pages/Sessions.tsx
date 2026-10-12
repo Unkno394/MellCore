@@ -1,281 +1,34 @@
-import { useState } from 'react'
-import { sessions, type Session } from '../data/sessions'
+import { useMemo, useState } from 'react'
+import type { AttackEvent, Trap } from '../api/types'
 
-export default function Sessions() {
+type Props = { events: AttackEvent[]; traps: Trap[]; loading: boolean; error: string }
+type DerivedSession = { id: string; events: AttackEvent[]; first: string; last: string; trapId: string; sourceIp: string | null }
+
+export default function Sessions({ events, traps, loading, error }: Props) {
   const [search, setSearch] = useState('')
-  const [filter, setFilter] = useState('All')
-  const [selectedSession, setSelectedSession] =
-    useState<Session | null>(null)
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const trapNames = useMemo(() => new Map(traps.map((trap) => [trap.trap_id, trap.name])), [traps])
+  const sessions = useMemo(() => {
+    const grouped = new Map<string, AttackEvent[]>()
+    for (const item of events) {
+      const id = item.event.session_id
+      if (id) grouped.set(id, [...(grouped.get(id) ?? []), item])
+    }
+    return [...grouped.entries()].map(([id, items]): DerivedSession => {
+      const sorted = [...items].sort((a, b) => a.event.occurred_at.localeCompare(b.event.occurred_at))
+      return { id, events: sorted, first: sorted[0].event.occurred_at, last: sorted.at(-1)!.event.occurred_at, trapId: sorted[0].event.trap_id, sourceIp: sorted.find((item) => item.event.source_ip)?.event.source_ip ?? null }
+    }).sort((a, b) => b.last.localeCompare(a.last))
+  }, [events])
+  const filtered = sessions.filter((session) => `${session.id} ${session.sourceIp ?? ''} ${trapNames.get(session.trapId) ?? ''}`.toLowerCase().includes(search.toLowerCase()))
+  const selected = sessions.find((session) => session.id === selectedId) ?? null
 
-  const filteredSessions = sessions.filter((session) => {
-    const matchesSearch =
-      `${session.id} ${session.honeypot} ${session.ip}`
-        .toLowerCase()
-        .includes(search.toLowerCase())
-
-    const matchesFilter =
-      filter === 'All' || session.status === filter
-
-    return matchesSearch && matchesFilter
-  })
-
-  return (
-    <section className="space-y-6 p-6">
-      <div>
-        <p className="text-sm text-white/45">
-          SECURITY / SESSIONS
-        </p>
-
-        <h2 className="mt-1 text-2xl font-semibold">
-          Sessions
-        </h2>
-
-        <p className="mt-2 text-sm text-white/45">
-          Investigate attacker interactions and session activity.
-        </p>
-      </div>
-
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        {[
-          {
-            label: 'Total Sessions',
-            value: sessions.length,
-          },
-          {
-            label: 'Active Sessions',
-            value: sessions.filter(
-              (session) => session.status === 'Active'
-            ).length,
-          },
-          {
-            label: 'Completed Sessions',
-            value: sessions.filter(
-              (session) => session.status === 'Completed'
-            ).length,
-          },
-        ].map((stat) => (
-          <div
-            key={stat.label}
-            className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5 backdrop-blur-xl"
-          >
-            <p className="text-sm text-white/50">
-              {stat.label}
-            </p>
-
-            <p className="mt-4 text-3xl font-semibold">
-              {stat.value}
-            </p>
-          </div>
-        ))}
-      </div>
-
-      <div className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5 backdrop-blur-xl">
-        <div className="flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <h3 className="font-semibold">
-              Session history
-            </h3>
-
-            <p className="mt-1 text-xs text-white/40">
-              Recorded attacker interactions
-            </p>
-          </div>
-
-          <div className="flex flex-wrap gap-3">
-            <input
-              type="text"
-              placeholder="Search sessions..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="rounded-lg border border-white/10 bg-black/30 px-4 py-2 text-sm text-white outline-none focus:border-orange-500/50"
-            />
-
-            <select
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              className="rounded-lg border border-white/10 bg-[#160e0c] px-4 py-2 text-sm text-white outline-none"
-            >
-              <option value="All">All sessions</option>
-              <option value="Active">Active</option>
-              <option value="Completed">Completed</option>
-            </select>
-          </div>
-        </div>
-
-        <div className="mt-6 overflow-x-auto">
-          <table className="w-full text-left text-sm">
-            <thead className="border-b border-white/10 text-xs text-white/40">
-              <tr>
-                <th className="px-4 py-3">Session ID</th>
-                <th className="px-4 py-3">Honeypot</th>
-                <th className="px-4 py-3">Source IP</th>
-                <th className="px-4 py-3">Started</th>
-                <th className="px-4 py-3">Duration</th>
-                <th className="px-4 py-3">Status</th>
-                <th className="px-4 py-3">Action</th>
-              </tr>
-            </thead>
-
-            <tbody>
-              {filteredSessions.map((session) => (
-                <tr
-                  key={session.id}
-                  className="border-b border-white/5 transition hover:bg-white/5"
-                >
-                  <td className="px-4 py-4 font-mono text-orange-300">
-                    {session.id}
-                  </td>
-
-                  <td className="px-4 py-4">
-                    {session.honeypot}
-                  </td>
-
-                  <td className="px-4 py-4 font-mono text-white/50">
-                    {session.ip}
-                  </td>
-
-                  <td className="px-4 py-4 text-white/50">
-                    {session.started}
-                  </td>
-
-                  <td className="px-4 py-4 text-white/60">
-                    {session.duration}
-                  </td>
-
-                  <td className="px-4 py-4">
-                    <span
-                      className={`rounded-md px-3 py-1 text-xs ${
-                        session.status === 'Active'
-                          ? 'bg-emerald-500/15 text-emerald-400'
-                          : 'bg-white/10 text-white/50'
-                      }`}
-                    >
-                      {session.status}
-                    </span>
-                  </td>
-
-                  <td className="px-4 py-4">
-                    <button
-                      type="button"
-                      onClick={() => setSelectedSession(session)}
-                      className="rounded-lg border border-orange-500/30 px-3 py-2 text-xs text-orange-300 transition hover:bg-orange-500/10"
-                    >
-                      View details
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-
-          {filteredSessions.length === 0 && (
-            <p className="py-8 text-center text-sm text-white/40">
-              No sessions found
-            </p>
-          )}
-        </div>
-
-        <div className="mt-4 text-xs text-white/40">
-          Showing {filteredSessions.length} of {sessions.length} sessions
-          <span className="ml-3 text-orange-400/70">
-            Demo data
-          </span>
-        </div>
-      </div>
-
-      {selectedSession && (
-        <div className="rounded-xl border border-orange-500/20 bg-[#160e0c]/90 p-6 backdrop-blur-xl">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="text-xs text-orange-400">
-                SESSION DETAILS
-              </p>
-
-              <h3 className="mt-2 text-xl font-semibold">
-                {selectedSession.id}
-              </h3>
-            </div>
-
-            <button
-              type="button"
-              onClick={() => setSelectedSession(null)}
-              className="rounded-lg border border-white/10 px-4 py-2 text-sm text-white/60 hover:bg-white/5"
-            >
-              Close
-            </button>
-          </div>
-
-          <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
-            <div>
-              <p className="text-xs text-white/40">
-                Honeypot
-              </p>
-              <p className="mt-2 text-sm">
-                {selectedSession.honeypot}
-              </p>
-            </div>
-
-            <div>
-              <p className="text-xs text-white/40">
-                Source IP
-              </p>
-              <p className="mt-2 font-mono text-sm">
-                {selectedSession.ip}
-              </p>
-            </div>
-
-            <div>
-              <p className="text-xs text-white/40">
-                Duration
-              </p>
-              <p className="mt-2 text-sm">
-                {selectedSession.duration}
-              </p>
-            </div>
-          </div>
-
-          <div className="mt-8">
-            <h4 className="font-semibold">
-              Event timeline
-            </h4>
-
-            <p className="mt-1 text-xs text-white/40">
-              Chronological sequence of recorded activity
-            </p>
-
-            <div className="mt-6 space-y-0">
-              {selectedSession.events.map((event, index) => (
-                <div
-                  key={`${event.time}-${index}`}
-                  className="flex gap-4"
-                >
-                  <div className="flex flex-col items-center">
-                    <span className="h-3 w-3 shrink-0 rounded-full border-2 border-orange-400 bg-[#160e0c]" />
-
-                    {index < selectedSession.events.length - 1 && (
-                      <div className="min-h-14 w-px flex-1 bg-orange-500/20" />
-                    )}
-                  </div>
-
-                  <div className="pb-6">
-                    <p className="font-mono text-xs text-orange-300">
-                      {event.time}
-                    </p>
-
-                    <p className="mt-2 text-sm font-medium">
-                      {event.action}
-                    </p>
-
-                    <p className="mt-1 text-xs text-white/45">
-                      {event.detail}
-                    </p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      )}
-    </section>
-  )
+  return <section className="space-y-6 p-6"><div><p className="text-sm text-white/45">SECURITY / DERIVED SESSIONS</p><h2 className="mt-1 text-2xl font-semibold">Sessions</h2><p className="mt-2 text-sm text-white/45">Event groups derived only when telemetry includes a session_id.</p></div>
+    <div className="rounded-lg border border-orange-500/20 bg-orange-500/5 p-4 text-sm text-orange-100">The backend has no Sessions resource or active/completed status API. These rows are derived from the current event snapshot; duration and liveness cannot be determined reliably.</div>
+    {error && <p role="alert" className="text-sm text-red-400">{error}</p>}
+    <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">{[['Derived sessions', sessions.length], ['Events with session ID', events.filter((item) => item.event.session_id).length], ['Events without session ID', events.filter((item) => !item.event.session_id).length]].map(([label, value]) => <div key={String(label)} className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5"><p className="text-sm text-white/50">{label}</p><p className="mt-4 text-3xl font-semibold">{value}</p></div>)}</div>
+    <div className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5"><div className="flex flex-wrap items-center justify-between gap-4"><div><h3 className="font-semibold">Derived session history</h3><p className="mt-1 text-xs text-white/40">Based on the currently loaded telemetry snapshot</p></div><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search sessions..." className="rounded-lg border border-white/10 bg-black/30 px-4 py-2 text-sm outline-none focus:border-orange-500/50"/></div>
+      <div className="mt-6 overflow-x-auto"><table className="w-full min-w-[760px] text-left text-sm"><thead className="border-b border-white/10 text-xs text-white/40"><tr><th className="px-4 py-3">Session ID</th><th className="px-4 py-3">Honeypot</th><th className="px-4 py-3">Source IP</th><th className="px-4 py-3">First event</th><th className="px-4 py-3">Last event</th><th className="px-4 py-3">Events</th><th className="px-4 py-3">Action</th></tr></thead><tbody>{filtered.map((session) => <tr key={session.id} className="border-b border-white/5 hover:bg-white/5"><td className="max-w-52 truncate px-4 py-4 font-mono text-orange-300">{session.id}</td><td className="px-4 py-4">{trapNames.get(session.trapId) ?? session.trapId}</td><td className="px-4 py-4 font-mono text-white/50">{session.sourceIp ?? '—'}</td><td className="px-4 py-4 text-white/50">{new Date(session.first).toLocaleString()}</td><td className="px-4 py-4 text-white/50">{new Date(session.last).toLocaleString()}</td><td className="px-4 py-4">{session.events.length}</td><td className="px-4 py-4"><button type="button" onClick={() => setSelectedId(session.id)} className="rounded-lg border border-orange-500/30 px-3 py-2 text-xs text-orange-300">View events</button></td></tr>)}</tbody></table>{!loading && filtered.length === 0 && <p className="py-8 text-center text-sm text-white/40">No session identifiers were returned in this snapshot.</p>}</div>
+    </div>
+    {selected && <div className="rounded-xl border border-orange-500/20 bg-[#160e0c]/90 p-6"><div className="flex justify-between gap-4"><div><p className="text-xs text-orange-400">DERIVED EVENT GROUP</p><h3 className="mt-2 break-all font-mono text-lg">{selected.id}</h3></div><button type="button" onClick={() => setSelectedId(null)} className="rounded-lg border border-white/10 px-4 py-2 text-sm text-white/60">Close</button></div><div className="mt-6 space-y-4">{selected.events.map(({ event }) => <div key={event.event_id} className="border-l border-orange-500/30 pl-4"><p className="text-sm">{event.event_type}</p><p className="mt-1 text-xs text-white/40">{new Date(event.occurred_at).toLocaleString()} · {event.protocol}/{event.service_type}</p></div>)}</div></div>}
+  </section>
 }

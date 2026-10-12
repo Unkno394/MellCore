@@ -1,7 +1,7 @@
 
 import FuzzyText from '../FuzzyText'
 
-type PageName =
+export type PageName =
   | 'Dashboard'
   | 'Honeypots'
   | 'Profiles'
@@ -136,11 +136,11 @@ export default function Sidebar({
         </div>
 
         <div className="text-sm font-medium text-white">
-          Monitoring active
+          Management API
         </div>
 
         <div className="mt-1 text-xs text-white/40">
-          Demo interface
+          Authenticated session
         </div>
       </div>
     </aside>

@@ -1,318 +1,51 @@
-import type { Honeypot, Status } from '../data/honeypots'
 import { useMemo, useState } from 'react'
+import { apiErrorMessage } from '../api/client'
+import type { MellCoreApi } from '../api/services'
+import type { Trap, TrapDesiredState } from '../api/types'
 
-type HoneypotsProps = {
-  honeypots: Honeypot[]
+type Props = { api: MellCoreApi; traps: Trap[]; readOnly: boolean; onChanged: () => Promise<void> }
+
+const statusStyles: Record<Trap['actual_state'], string> = {
+  running: 'border-emerald-500/25 bg-emerald-500/10 text-emerald-400',
+  installing: 'border-orange-500/25 bg-orange-500/10 text-orange-300',
+  failed: 'border-red-500/25 bg-red-500/10 text-red-300',
+  unknown: 'border-white/10 bg-white/5 text-white/45', stopped: 'border-white/10 bg-white/5 text-white/45', removed: 'border-white/10 bg-white/5 text-white/45',
 }
 
-const statusStyles: Record<Status, string> = {
-  Active: 'border-emerald-500/25 bg-emerald-500/10 text-emerald-400',
-  Inactive: 'border-white/10 bg-white/5 text-white/45',
-  Warning: 'border-orange-500/25 bg-orange-500/10 text-orange-300',
-}
-
-function Honeypots({ honeypots }: HoneypotsProps) {
+export default function Honeypots({ api, traps, readOnly, onChanged }: Props) {
   const [search, setSearch] = useState('')
-  const [statusFilter, setStatusFilter] = useState('All statuses')
-  const [typeFilter, setTypeFilter] = useState('All types')
-  const [selectedId, setSelectedId] = useState('HP-001')
+  const [selectedId, setSelectedId] = useState<string | null>(traps[0]?.trap_id ?? null)
+  const [desired, setDesired] = useState<TrapDesiredState>('stopped')
+  const [error, setError] = useState('')
+  const [message, setMessage] = useState('')
+  const filtered = useMemo(() => traps.filter((trap) => `${trap.name} ${trap.trap_id} ${trap.profile_snapshot.honeypot_type}`.toLowerCase().includes(search.toLowerCase())), [traps, search])
+  const selected = filtered.find((trap) => trap.trap_id === selectedId) ?? filtered[0] ?? null
 
-  const filteredHoneypots = useMemo(() => {
-    return honeypots.filter((honeypot) => {
-      const query = search.toLowerCase()
+  function select(trap: Trap) { setSelectedId(trap.trap_id); setDesired(trap.desired_state); setError(''); setMessage('') }
 
-      const matchesSearch =
-        honeypot.name.toLowerCase().includes(query) ||
-        honeypot.ip.includes(query) ||
-        honeypot.id.toLowerCase().includes(query)
+  async function saveDesired() {
+    if (!selected) return
+    setError(''); setMessage('')
+    try {
+      await api.traps.update(selected, { name: selected.name, profile_id: selected.profile_id, config: selected.config, desired_state: desired, ports: selected.ports })
+      setMessage(`Desired state saved as “${desired}”. This API did not execute a deployment command.`)
+      await onChanged()
+    } catch (requestError) { setError(apiErrorMessage(requestError)) }
+  }
 
-      const matchesStatus =
-        statusFilter === 'All statuses' ||
-        honeypot.status === statusFilter
+  async function remove() {
+    if (!selected || !window.confirm(`Delete registration for ${selected.name}?`)) return
+    setError('')
+    try { await api.traps.delete(selected.trap_id); setSelectedId(null); await onChanged() }
+    catch (requestError) { setError(apiErrorMessage(requestError)) }
+  }
 
-      const matchesType =
-        typeFilter === 'All types' || honeypot.type === typeFilter
-
-      return matchesSearch && matchesStatus && matchesType
-    })
-  }, [search, statusFilter, typeFilter, honeypots])
-
-  const selectedHoneypot =
-    filteredHoneypots.find((item) => item.id === selectedId) ??
-    filteredHoneypots[0]
-
-  const activeCount = honeypots.filter(
-    (item) => item.status === 'Active',
-  ).length
-
-  const warningCount = honeypots.filter(
-    (item) => item.status === 'Warning',
-  ).length
-
-  return (
-    <section className="space-y-6 p-4 sm:p-6">
-      <div>
-        <p className="text-sm text-white/40">
-          Workspace / Honeypots
-        </p>
-        <div className="mt-2 flex flex-wrap items-end justify-between gap-3">
-          <div>
-            <h2 className="text-2xl font-semibold tracking-tight">
-              Honeypots
-            </h2>
-            <p className="mt-2 text-sm text-white/45">
-              Manage your traps, monitor their status and inspect details.
-            </p>
-          </div>
-
-          <span className="rounded-lg border border-orange-500/20 bg-orange-500/10 px-3 py-2 text-xs text-orange-300">
-            DEMO DATA
-          </span>
-        </div>
-      </div>
-
-      {/* Summary cards */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <article className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5 backdrop-blur-xl">
-          <p className="text-sm text-white/45">Total honeypots</p>
-          <p className="mt-3 text-3xl font-semibold">{honeypots.length.toString().padStart(2, '0')}</p>
-          <p className="mt-2 text-xs text-white/35">Registered traps</p>
-        </article>
-
-        <article className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5 backdrop-blur-xl">
-          <p className="text-sm text-white/45">Active</p>
-          <p className="mt-3 text-3xl font-semibold text-emerald-400">
-            {activeCount.toString().padStart(2, '0')}
-          </p>
-          <p className="mt-2 text-xs text-white/35">Currently enabled in demo</p>
-        </article>
-
-        <article className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5 backdrop-blur-xl">
-          <p className="text-sm text-white/45">Needs attention</p>
-          <p className="mt-3 text-3xl font-semibold text-orange-300">
-            {warningCount.toString().padStart(2, '0')}
-          </p>
-          <p className="mt-2 text-xs text-white/35">Demo warning status</p>
-        </article>
-      </div>
-
-      {/* Search and filters */}
-      <div className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-4 backdrop-blur-xl">
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_180px_180px]">
-          <label className="relative block">
-            <span className="sr-only">Search honeypots</span>
-            <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-white/35">
-              ⌕
-            </span>
-            <input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search by name, ID or IP..."
-              className="w-full rounded-lg border border-white/10 bg-black/20 py-3 pl-9 pr-3 text-sm text-white outline-none transition placeholder:text-white/30 focus:border-orange-500/50"
-            />
-          </label>
-
-          <select
-            value={statusFilter}
-            onChange={(event) => setStatusFilter(event.target.value)}
-            aria-label="Filter by status"
-            className="rounded-lg border border-white/10 bg-[#160e0c] px-3 py-3 text-sm text-white/70 outline-none focus:border-orange-500/50"
-          >
-            <option>All statuses</option>
-            <option>Active</option>
-            <option>Inactive</option>
-            <option>Warning</option>
-          </select>
-
-          <select
-            value={typeFilter}
-            onChange={(event) => setTypeFilter(event.target.value)}
-            aria-label="Filter by type"
-            className="rounded-lg border border-white/10 bg-[#160e0c] px-3 py-3 text-sm text-white/70 outline-none focus:border-orange-500/50"
-          >
-            <option>All types</option>
-            <option>SSH</option>
-            <option>Web</option>
-            <option>Network</option>
-            <option>Database</option>
-          </select>
-        </div>
-
-        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-white/35">
-          <span>{filteredHoneypots.length} honeypots found</span>
-          <button
-            type="button"
-            onClick={() => {
-              setSearch('')
-              setStatusFilter('All statuses')
-              setTypeFilter('All types')
-            }}
-            className="transition hover:text-orange-300"
-          >
-            Clear filters
-          </button>
-        </div>
-      </div>
-
-      {/* Honeypot list and selected details */}
-      <div className="grid grid-cols-1 items-start gap-4 2xl:grid-cols-[minmax(0,1.6fr)_minmax(280px,0.8fr)]">
-        <section className="min-w-0 overflow-hidden rounded-xl border border-white/10 bg-[#160e0c]/80 backdrop-blur-xl">
-          <div className="border-b border-white/10 p-5">
-            <h3 className="font-semibold">Honeypot inventory</h3>
-            <p className="mt-1 text-xs text-white/40">
-              Select a trap to view its details
-            </p>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[680px] text-left text-sm">
-              <thead className="border-b border-white/10 bg-black/10 text-[11px] uppercase tracking-wider text-white/35">
-                <tr>
-                  <th className="px-5 py-4 font-medium">Honeypot</th>
-                  <th className="px-4 py-4 font-medium">Type</th>
-                  <th className="px-4 py-4 font-medium">Status</th>
-                  <th className="px-4 py-4 font-medium">Last activity</th>
-                </tr>
-              </thead>
-
-              <tbody className="divide-y divide-white/5">
-                {filteredHoneypots.map((honeypot) => {
-                  const isSelected = selectedHoneypot?.id === honeypot.id
-
-                  return (
-                    <tr
-                      key={honeypot.id}
-                      onClick={() => setSelectedId(honeypot.id)}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter' || event.key === ' ') {
-                          event.preventDefault()
-                          setSelectedId(honeypot.id)
-                        }
-                      }}
-                      tabIndex={0}
-                      aria-selected={isSelected}
-                      className={`cursor-pointer outline-none transition hover:bg-white/[0.04] focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-orange-400 ${
-                        isSelected ? 'bg-orange-500/[0.07]' : ''
-                      }`}
-                    >
-                      <td className="px-5 py-4">
-                        <div className="flex items-center gap-3">
-                          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-orange-500/20 bg-orange-500/[0.08] text-orange-300">
-                            ⌘
-                          </span>
-                          <div>
-                            <p className="whitespace-nowrap font-medium text-white/90">
-                              {honeypot.name}
-                            </p>
-                            <p className="mt-1 text-xs text-white/35">
-                              {honeypot.ip}
-                            </p>
-                          </div>
-                        </div>
-                      </td>
-
-                      <td className="px-4 py-4 text-white/60">
-                        {honeypot.type}
-                      </td>
-
-                      <td className="px-4 py-4">
-                        <span className={`inline-flex items-center gap-2 whitespace-nowrap rounded-full border px-2.5 py-1 text-[11px] ${statusStyles[honeypot.status]}`}>
-                          <span className="h-1.5 w-1.5 rounded-full bg-current" />
-                          {honeypot.status}
-                        </span>
-                      </td>
-
-                      <td className="whitespace-nowrap px-4 py-4 text-xs text-white/40">
-                        {honeypot.lastActivity}
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-
-          {filteredHoneypots.length === 0 && (
-            <div className="p-10 text-center">
-              <p className="text-sm text-white/70">No honeypots found</p>
-              <p className="mt-2 text-xs text-white/35">
-                Try changing your search or filters.
-              </p>
-            </div>
-          )}
-        </section>
-
-        {/* Selected honeypot details */}
-        <aside className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5 backdrop-blur-xl">
-          {selectedHoneypot ? (
-            <>
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <p className="text-xs uppercase tracking-widest text-orange-300/70">
-                    Selected honeypot
-                  </p>
-                  <h3 className="mt-2 text-lg font-semibold">
-                    {selectedHoneypot.name}
-                  </h3>
-                  <p className="mt-1 text-xs text-white/35">
-                    {selectedHoneypot.id}
-                  </p>
-                </div>
-                <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-orange-500/20 bg-orange-500/10 text-xl text-orange-300">
-                  ⌘
-                </span>
-              </div>
-
-              <div className="mt-5">
-                <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs ${statusStyles[selectedHoneypot.status]}`}>
-                  <span className="h-1.5 w-1.5 rounded-full bg-current" />
-                  {selectedHoneypot.status}
-                </span>
-              </div>
-
-              <p className="mt-5 text-sm leading-6 text-white/55">
-                {selectedHoneypot.description}
-              </p>
-
-              <div className="my-5 border-t border-white/10" />
-
-              <div className="space-y-4">
-                {[
-                  ['IP address', selectedHoneypot.ip],
-                  ['Type', selectedHoneypot.type],
-                  ['Assigned profile', selectedHoneypot.profile],
-                  ['Location', selectedHoneypot.location],
-                  ['Last activity', selectedHoneypot.lastActivity],
-                  ['Sessions', String(selectedHoneypot.sessions)],
-                ].map(([label, value]) => (
-                  <div key={label} className="flex items-start justify-between gap-4">
-                    <span className="text-xs text-white/40">{label}</span>
-                    <span className="text-right text-xs font-medium text-white/80">
-                      {value}
-                    </span>
-                  </div>
-                ))}
-              </div>
-
-              <div className="mt-6 rounded-lg border border-white/10 bg-black/20 p-3">
-                <p className="text-xs text-white/55">Data source</p>
-                <p className="mt-1 text-xs text-orange-300/80">
-                  Local demo data · Backend not connected
-                </p>
-              </div>
-            </>
-          ) : (
-            <div className="py-8 text-center">
-              <p className="text-sm text-white/65">No honeypot selected</p>
-              <p className="mt-2 text-xs text-white/35">
-                Change the filters to see available traps.
-              </p>
-            </div>
-          )}
-        </aside>
-      </div>
-    </section>
-  )
+  const running = traps.filter((trap) => trap.actual_state === 'running').length
+  const attention = traps.filter((trap) => trap.actual_state === 'failed').length
+  return <section className="space-y-6 p-4 sm:p-6"><div><p className="text-sm text-white/40">Workspace / Honeypots</p><div className="mt-2 flex items-end justify-between"><div><h2 className="text-2xl font-semibold">Honeypots</h2><p className="mt-2 text-sm text-white/45">Backend trap registrations and reported actual state.</p></div><span className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">MANAGEMENT API</span></div></div>
+    <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">{[['Total honeypots', traps.length, 'Registered configurations'], ['Actually running', running, 'Backend actual_state'], ['Failed', attention, 'Reported failures']].map(([label, value, detail]) => <article key={String(label)} className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5"><p className="text-sm text-white/45">{label}</p><p className="mt-3 text-3xl font-semibold">{String(value).padStart(2, '0')}</p><p className="mt-2 text-xs text-white/35">{detail}</p></article>)}</div>
+    <div className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-4"><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search by name, ID or type..." className="w-full rounded-lg border border-white/10 bg-black/20 px-4 py-3 text-sm outline-none focus:border-orange-500/50" /></div>
+    <div className="grid grid-cols-1 items-start gap-4 2xl:grid-cols-[1.6fr_0.8fr]"><section className="overflow-hidden rounded-xl border border-white/10 bg-[#160e0c]/80"><table className="w-full min-w-[680px] text-left text-sm"><thead className="border-b border-white/10 text-xs text-white/40"><tr><th className="px-5 py-4">Honeypot</th><th className="px-4 py-4">Profile</th><th className="px-4 py-4">Desired</th><th className="px-4 py-4">Actual</th></tr></thead><tbody>{filtered.map((trap) => <tr key={trap.trap_id} onClick={() => select(trap)} className="cursor-pointer border-b border-white/5 hover:bg-white/[0.04]"><td className="px-5 py-4"><p className="font-medium">{trap.name}</p><p className="mt-1 font-mono text-xs text-white/35">{trap.trap_id}</p></td><td className="px-4 py-4"><p>{trap.profile_snapshot.name}</p><p className="text-xs text-white/40">{trap.profile_snapshot.level}</p></td><td className="px-4 py-4 capitalize text-white/60">{trap.desired_state}</td><td className="px-4 py-4"><span className={`rounded-full border px-3 py-1 text-xs capitalize ${statusStyles[trap.actual_state]}`}>{trap.actual_state}</span></td></tr>)}</tbody></table>{filtered.length === 0 && <p className="p-10 text-center text-sm text-white/40">No honeypots found.</p>}</section>
+      <aside className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5">{selected ? <><p className="text-xs uppercase tracking-widest text-orange-300/70">Selected honeypot</p><h3 className="mt-2 text-lg font-semibold">{selected.name}</h3><p className="mt-4 text-sm text-white/55">{selected.profile_snapshot.description || 'No profile description.'}</p><div className="my-5 border-t border-white/10" /><div className="space-y-3 text-xs">{[['Type', selected.profile_snapshot.honeypot_type], ['Service', selected.profile_snapshot.service_type], ['Level', selected.profile_snapshot.level], ['Actual state', selected.actual_state], ['Version', String(selected.version)]].map(([label, value]) => <div key={label} className="flex justify-between gap-3"><span className="text-white/40">{label}</span><span className="text-right capitalize">{value}</span></div>)}</div><div className="mt-6 rounded-lg border border-orange-500/15 bg-orange-500/5 p-3 text-xs text-orange-100">Desired state is configuration only until backend-to-agent orchestration is implemented.</div>{!readOnly && <div className="mt-5 space-y-3"><select value={desired} onChange={(e) => setDesired(e.target.value as TrapDesiredState)} className="w-full rounded-lg border border-white/10 bg-[#100a09] px-3 py-3 text-sm"><option value="stopped">Stopped</option><option value="running">Running (desired only)</option></select><div className="flex gap-2"><button type="button" onClick={saveDesired} className="flex-1 rounded-lg bg-orange-600 px-3 py-2 text-sm">Save desired state</button><button type="button" onClick={remove} className="rounded-lg border border-red-500/30 px-3 py-2 text-sm text-red-300">Delete</button></div></div>}{error && <p className="mt-4 text-xs text-red-400">{error}</p>}{message && <p className="mt-4 text-xs text-emerald-300">{message}</p>}</> : <p className="text-sm text-white/40">No honeypot selected.</p>}</aside>
+    </div></section>
 }
-
-export default Honeypots

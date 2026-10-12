@@ -1,257 +1,45 @@
+import { useMemo, useState, type FormEvent } from 'react'
 import FuzzyText from '../components/FuzzyText'
-import { useState } from 'react'
-import type { Honeypot } from '../data/honeypots'
+import { apiErrorMessage } from '../api/client'
+import type { MellCoreApi } from '../api/services'
+import type { Profile, Server, TrapDesiredState } from '../api/types'
 
-type Level = 'Low' | 'Medium' | 'High'
+type Props = { api: MellCoreApi; profiles: Profile[]; servers: Server[]; readOnly: boolean; onCreated: () => Promise<void> }
 
-type CreateHoneypotProps = {
-  onCreateHoneypot: (honeypot: Honeypot, level: Level) => void
-}
-  
-  export default function CreateHoneypot({
-    onCreateHoneypot,
-  }: CreateHoneypotProps) {
-  const [level, setLevel] = useState<Level>('Low')
+export default function CreateHoneypot({ api, profiles, servers, readOnly, onCreated }: Props) {
+  const supported = useMemo(() => profiles.filter((profile) => profile.level === 'low' || profile.level === 'medium'), [profiles])
   const [name, setName] = useState('')
-  const [service, setService] = useState('SSH')
-  const [port, setPort] = useState('22')
-  const [profile, setProfile] = useState('Linux server')
-  const [operatingSystem, setOperatingSystem] = useState('Ubuntu 22.04')
-  const [created, setCreated] = useState(false)
+  const [serverId, setServerId] = useState('')
+  const [profileId, setProfileId] = useState('')
+  const [hostPort, setHostPort] = useState('2222')
+  const [targetPort, setTargetPort] = useState('2222')
+  const [desiredState, setDesiredState] = useState<TrapDesiredState>('stopped')
+  const [error, setError] = useState('')
+  const [message, setMessage] = useState('')
+  const [busy, setBusy] = useState(false)
+  const profile = supported.find((item) => item.id === profileId)
 
-  function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-  
-    const newHoneypot: Honeypot = {
-      id: `HP-${Date.now()}`,
-      name,
-      ip: 'Not assigned',
-      type: service,
-      profile:
-        level === 'Low'
-          ? 'Basic'
-          : level === 'Medium'
-            ? profile
-            : operatingSystem,
-      status: 'Inactive',
-      lastActivity: 'Never',
-      sessions: 0,
-      location: 'Not assigned',
-      description: `${service} honeypot. Security level: ${level}. Port: ${port}.`,
-    }
-  
-    onCreateHoneypot(newHoneypot, level)
-    setCreated(true)
+  async function submit(event: FormEvent) {
+    event.preventDefault(); setError(''); setMessage('')
+    if (!serverId || !profile) return setError('Select a registered server and a supported profile.')
+    setBusy(true)
+    try {
+      await api.traps.create(serverId, { name, profile_id: profile.id, config: {}, desired_state: desiredState, ports: [{ transport: 'tcp', host_port: Number(hostPort), target_port: Number(targetPort), route_mode: 'direct' }] })
+      setMessage(`Trap configuration saved with desired state “${desiredState}”. No deployment command was executed.`)
+      setName('')
+      await onCreated()
+    } catch (requestError) { setError(apiErrorMessage(requestError)) }
+    finally { setBusy(false) }
   }
 
-  const levels: { value: Level; title: string; description: string }[] = [
-    {
-      value: 'Low',
-      title: 'Low',
-      description: 'Basic port and service simulation.',
-    },
-    {
-      value: 'Medium',
-      title: 'Medium',
-      description: 'Simulated service with a behavior profile.',
-    },
-    {
-      value: 'High',
-      title: 'High',
-      description: 'Advanced isolated environment simulation.',
-    },
-  ]
-
-  
-  return (
-    <section className="space-y-6 p-6">
-      <div className="mx-auto max-w-4xl">
-        <div className="mb-6 text-center">
-          <p className="text-sm text-white/45">Configuration</p>
-
-          <div className="mt-3 flex justify-center">
-            <FuzzyText
-              fontSize={28}
-              fontWeight={600}
-              color="#f1a36b"
-              baseIntensity={0.2}
-              hoverIntensity={0.5}
-              fuzzRange={8}
-              fps={30}
-              enableHover
-              className="block"
-            >
-              Create Honeypot
-            </FuzzyText>
-          </div>
-
-          <p className="mt-3 text-sm text-white/45">
-            Configure a new honeypot for your monitoring environment.
-          </p>
-        </div>
-
-        
-        <form
-          onSubmit={handleSubmit}
-          className="w-full space-y-6 rounded-xl border border-white/10 bg-[#160e0c]/80 p-6 backdrop-blur-xl"
-        >
-        <div>
-          <label className="mb-2 block text-sm text-white/70">
-            Honeypot name
-          </label>
-          <input
-            required
-            value={name}
-            onChange={(event) => {
-              setName(event.target.value)
-              setCreated(false)
-            }}
-            placeholder="e.g. SSH Honeypot 01"
-            className="w-full rounded-lg border border-white/10 bg-black/20 px-4 py-3 text-sm outline-none transition focus:border-orange-500/50"
-          />
-        </div>
-
-        <div>
-          <h3 className="mb-3 text-sm font-medium">Security level</h3>
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-            {levels.map((item) => (
-              <button
-                key={item.value}
-                type="button"
-                onClick={() => {
-                  setLevel(item.value)
-                  setCreated(false)
-                }}
-                className={`rounded-xl border p-4 text-left transition ${
-                  level === item.value
-                    ? 'border-orange-500/50 bg-orange-500/10'
-                    : 'border-white/10 bg-black/10 hover:border-white/20'
-                }`}
-              >
-                <div className="font-semibold text-[#f1a36b]">
-                  {item.title}
-                </div>
-                <p className="mt-2 text-xs leading-5 text-white/45">
-                  {item.description}
-                </p>
-                {level === item.value && (
-                  <p className="mt-3 text-xs text-orange-300">Selected</p>
-                )}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <div>
-            <label className="mb-2 block text-sm text-white/70">
-              Service type
-            </label>
-            <select
-              value={service}
-              onChange={(event) => {
-                setService(event.target.value)
-                setPort(
-                  event.target.value === 'SSH'
-                    ? '22'
-                    : event.target.value === 'HTTP'
-                      ? '80'
-                      : '21',
-                )
-                setCreated(false)
-              }}
-              className="w-full rounded-lg border border-white/10 bg-[#100a09] px-4 py-3 text-sm outline-none focus:border-orange-500/50"
-            >
-              <option value="SSH">SSH</option>
-              <option value="HTTP">HTTP</option>
-              <option value="FTP">FTP</option>
-            </select>
-          </div>
-
-          <div>
-            <label className="mb-2 block text-sm text-white/70">
-              Port
-            </label>
-            <input
-              required
-              type="number"
-              min="1"
-              max="65535"
-              value={port}
-              onChange={(event) => {
-                setPort(event.target.value)
-                setCreated(false)
-              }}
-              className="w-full rounded-lg border border-white/10 bg-black/20 px-4 py-3 text-sm outline-none focus:border-orange-500/50"
-            />
-          </div>
-
-          {level === 'Medium' && (
-            <div>
-              <label className="mb-2 block text-sm text-white/70">
-                Behavior profile
-              </label>
-              <select
-                value={profile}
-                onChange={(event) => {
-                  setProfile(event.target.value)
-                  setCreated(false)
-                }}
-                className="w-full rounded-lg border border-white/10 bg-[#100a09] px-4 py-3 text-sm outline-none focus:border-orange-500/50"
-              >
-                <option>Linux server</option>
-                <option>Web server</option>
-                <option>Database server</option>
-              </select>
-            </div>
-          )}
-
-          {level === 'High' && (
-            <div>
-              <label className="mb-2 block text-sm text-white/70">
-                Operating system
-              </label>
-              <select
-                value={operatingSystem}
-                onChange={(event) => {
-                  setOperatingSystem(event.target.value)
-                  setCreated(false)
-                }}
-                className="w-full rounded-lg border border-white/10 bg-[#100a09] px-4 py-3 text-sm outline-none focus:border-orange-500/50"
-              >
-                <option>Ubuntu 22.04</option>
-                <option>Debian 12</option>
-                <option>Windows</option>
-              </select>
-            </div>
-          )}
-        </div>
-
-        <div className="rounded-lg border border-orange-500/15 bg-orange-500/5 p-4">
-          <p className="text-sm font-medium text-[#f1a36b]">
-            Configuration summary
-          </p>
-          <p className="mt-2 text-xs leading-5 text-white/50">
-            Level: {level} · Service: {service} · Port: {port}
-            {level === 'Medium' && ` · Profile: ${profile}`}
-            {level === 'High' && ` · OS: ${operatingSystem}`}
-          </p>
-        </div>
-
-        <button
-          type="submit"
-          className="rounded-lg border border-orange-500/30 bg-orange-500/10 px-5 py-3 text-sm font-medium text-[#f1a36b] transition hover:bg-orange-500/20"
-        >
-          Create Honeypot
-        </button>
-
-        {created && (
-          <p className="text-sm text-emerald-300">
-            Demo configuration created. No server was deployed.
-          </p>
-        )}
-        </form>
-      </div>
-    </section>
-  )
+  return <section className="space-y-6 p-6"><div className="mx-auto max-w-4xl"><div className="mb-6 text-center"><p className="text-sm text-white/45">Configuration</p><div className="mt-3 flex justify-center"><FuzzyText fontSize={28} fontWeight={600} color="#f1a36b" baseIntensity={0.2} hoverIntensity={0.5} fuzzRange={8} fps={30} enableHover className="block">Create Honeypot</FuzzyText></div><p className="mt-3 text-sm text-white/45">Save a Low or Medium trap configuration in MellCore.</p></div>
+    <form onSubmit={submit} className="w-full space-y-6 rounded-xl border border-white/10 bg-[#160e0c]/80 p-6 backdrop-blur-xl">
+      <div className="rounded-lg border border-orange-500/20 bg-orange-500/5 p-4 text-sm text-orange-100">High is intentionally unavailable: the management API currently supports only Low and Medium. Saving <code>desired_state</code> does not deploy the trap.</div>
+      <label className="block text-sm text-white/70">Honeypot name<input required disabled={readOnly} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. SSH Honeypot 01" className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-4 py-3 outline-none focus:border-orange-500/50" /></label>
+      <div className="grid gap-4 sm:grid-cols-2"><label className="text-sm text-white/70">Server<select required disabled={readOnly} value={serverId} onChange={(e) => setServerId(e.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-[#100a09] px-4 py-3"><option value="">Select server</option>{servers.map((server) => <option key={server.server_id} value={server.server_id}>{server.name} — {server.host}</option>)}</select></label><label className="text-sm text-white/70">Profile<select required disabled={readOnly} value={profileId} onChange={(e) => { setProfileId(e.target.value); const selected = supported.find((item) => item.id === e.target.value); if (selected?.service_type === 'ssh') setTargetPort('2222') }} className="mt-2 w-full rounded-lg border border-white/10 bg-[#100a09] px-4 py-3"><option value="">Select Low/Medium profile</option>{supported.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.level})</option>)}</select></label></div>
+      {profile && <div className="grid grid-cols-3 gap-3">{[['Level', profile.level], ['Type', profile.honeypot_type], ['Service', profile.service_type]].map(([label, value]) => <div key={label} className="rounded-lg border border-white/10 bg-black/20 p-3"><p className="text-[10px] uppercase text-white/35">{label}</p><p className="mt-1 text-sm capitalize">{value}</p></div>)}</div>}
+      <div className="grid gap-4 sm:grid-cols-3"><label className="text-sm text-white/70">Host port<input required disabled={readOnly} type="number" min="1" max="65535" value={hostPort} onChange={(e) => setHostPort(e.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-4 py-3" /></label><label className="text-sm text-white/70">Target port<input required disabled={readOnly} type="number" min="1" max="65535" value={targetPort} onChange={(e) => setTargetPort(e.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-4 py-3" /></label><label className="text-sm text-white/70">Desired state<select disabled={readOnly} value={desiredState} onChange={(e) => setDesiredState(e.target.value as TrapDesiredState)} className="mt-2 w-full rounded-lg border border-white/10 bg-[#100a09] px-4 py-3"><option value="stopped">Stopped</option><option value="running">Running (desired only)</option></select></label></div>
+      {error && <p role="alert" className="text-sm text-red-400">{error}</p>}{message && <p role="status" className="text-sm text-emerald-300">{message}</p>}
+      {!readOnly && <button disabled={busy || !servers.length || !supported.length} className="rounded-lg border border-orange-500/30 bg-orange-500/10 px-5 py-3 text-sm font-medium text-[#f1a36b] disabled:opacity-40">{busy ? 'Saving…' : 'Save trap configuration'}</button>}
+    </form></div></section>
 }

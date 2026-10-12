@@ -1,75 +1,19 @@
-# React + TypeScript + Vite
+# MellCore Dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The React/Vite dashboard talks only to the MellCore management API. It never connects to `hf-center`, and no control token or SSH credential is exposed to browser code.
 
-Currently, two official plugins are available:
+## Development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Copy `.env.example` to `.env.local` if the backend is not listening on `http://127.0.0.1:8080`, then run `npm run dev`. Vite proxies `/api` and `/health` to `MELLCORE_API_PROXY_TARGET`, keeping browser requests same-origin during development.
 
-## React Compiler
+Only non-secret browser configuration belongs in variables prefixed with `VITE_`; Vite embeds those values into the client bundle. `MELLCORE_API_PROXY_TARGET` is consumed only by `vite.config.ts`.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Production
 
-## Expanding the ESLint configuration
+Run `npm run build` and serve `dist/` as static files. The production reverse proxy should:
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+- fall back to `index.html` for client routes such as `/reset-password` and `/verify-email`;
+- proxy `/api/*` and `/health/*` to the Rust backend;
+- terminate TLS and keep the frontend and management API on the same public origin.
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-
-```
-
-You can also install [eslint-plugin-react-x](https://npmx.dev/package/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://npmx.dev/package/eslint-plugin-react-dom) for React-specific lint rules:
-
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-
-```
+The Vite development proxy is not part of the production server.
