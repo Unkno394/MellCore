@@ -8,19 +8,17 @@ export type PageName =
   | 'ConnectServer'
   | 'CreateHoneypot'
   | 'LiveFeed'
-  | 'Sessions'
   | 'Settings'
 
 const navItems = [
-  { label: 'Dashboard', icon: '◫' },
-  { label: 'Connect Server', icon: '⌘' },
-  { label: 'Create Honeypot', icon: '+' },
-  { label: 'Honeypots', icon: '⌘' },
-  { label: 'Profiles', icon: '◎' },
-  { label: 'Live Feed', icon: '⌁' },
-  { label: 'Sessions', icon: '▤' },
-  { label: 'Settings', icon: '⚙' },
-]
+  { page: 'Dashboard', label: 'Обзор', icon: '◫' },
+  { page: 'ConnectServer', label: 'Добавить сервер', icon: '+' },
+  { page: 'CreateHoneypot', label: 'Создать ловушку', icon: '++' },
+  { page: 'Honeypots', label: 'Ловушки', icon: '⌘' },
+  { page: 'Profiles', label: 'Профили', icon: '◎' },
+  { page: 'LiveFeed', label: 'Атаки', icon: '⌁' },
+  { page: 'Settings', label: 'Настройки', icon: '⚙' },
+] as const satisfies ReadonlyArray<{ page: PageName; label: string; icon: string }>
 
 type SidebarProps = {
   activePage: PageName
@@ -44,57 +42,28 @@ export default function Sidebar({
           </div>
 
           <div className="mt-1 text-[10px] uppercase tracking-widest text-white/40">
-            Threat monitoring
+            Мониторинг угроз
           </div>
         </div>
       </div>
 
       <div className="mb-3 px-3 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/35">
-        Workspace
+        РАБОЧАЯ ОБЛАСТЬ
       </div>
 
       <nav className="flex flex-col gap-1">
         {navItems.map((item) => {
-          const isActive =
-            item.label === 'Connect Server'
-              ? activePage === 'ConnectServer'
-              : item.label === 'Create Honeypot'
-                ? activePage === 'CreateHoneypot'
-                : item.label === 'Live Feed'
-                  ? activePage === 'LiveFeed'
-                  : item.label === activePage
-
-          const isAvailable =
-            item.label === 'Dashboard' ||
-            item.label === 'Create Honeypot' ||
-            item.label === 'Honeypots' ||
-            item.label === 'Profiles' ||
-            item.label === 'Connect Server' ||
-            item.label === 'Live Feed' ||
-            item.label === 'Sessions'  ||
-            item.label === 'Settings'
+          const isActive = item.page === activePage
 
           return (
             <button
               key={item.label}
               type="button"
-              disabled={!isAvailable}
-              onClick={() => {
-                if (item.label === 'Dashboard') onNavigate('Dashboard')
-                if (item.label === 'Honeypots') onNavigate('Honeypots')
-                if (item.label === 'Create Honeypot') onNavigate('CreateHoneypot')
-                if (item.label === 'Profiles') onNavigate('Profiles')
-                if (item.label === 'Connect Server') onNavigate('ConnectServer')
-                if (item.label === 'Live Feed') onNavigate('LiveFeed')
-                if (item.label === 'Sessions') onNavigate('Sessions')
-                  if (item.label === 'Settings') onNavigate('Settings')
-              }}
+              onClick={() => onNavigate(item.page)}
               className={`flex items-center gap-3 rounded-lg px-3 py-3 text-left text-sm transition ${
                 isActive
                   ? 'border border-orange-500/20 bg-orange-500/10 text-[#f1a36b]'
-                  : isAvailable
-                    ? 'text-[#e8dfda]/65 hover:bg-white/5 hover:text-white'
-                    : 'cursor-not-allowed text-[#e8dfda]/25'
+                  : 'text-[#e8dfda]/65 hover:bg-white/5 hover:text-white'
               }`}
             >
               <span className="w-5 text-center text-base">
@@ -119,11 +88,6 @@ export default function Sidebar({
                 <span>{item.label}</span>
               )}
 
-              {!isAvailable && (
-                <span className="ml-auto text-[9px] uppercase tracking-wider text-white/20">
-                  Soon
-                </span>
-              )}
             </button>
           )
         })}
@@ -132,15 +96,15 @@ export default function Sidebar({
       <div className="mt-auto rounded-xl border border-white/10 bg-black/20 p-4">
         <div className="mb-2 flex items-center gap-2 text-xs text-white/60">
           <span className="h-2 w-2 rounded-full bg-emerald-400" />
-          System status
+          Состояние системы
         </div>
 
         <div className="text-sm font-medium text-white">
-          Management API
+          API управления
         </div>
 
         <div className="mt-1 text-xs text-white/40">
-          Authenticated session
+          Сеанс авторизован
         </div>
       </div>
     </aside>

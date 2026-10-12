@@ -12,9 +12,9 @@ export default function ResetPassword({ api }: { api: MellCoreApi }) {
   async function submit(event: FormEvent) {
     event.preventDefault()
     setError('')
-    if (!token) return setError('The reset link does not contain a token.')
-    if (password.length < 12) return setError('Password must contain at least 12 characters.')
-    if (password !== confirm) return setError('Passwords do not match.')
+    if (!token) return setError('В ссылке нет токена восстановления.')
+    if (password.length < 12) return setError('Пароль должен содержать не менее 12 символов.')
+    if (password !== confirm) return setError('Пароли не совпадают.')
     try {
       await api.auth.resetPassword(token, password)
       window.history.replaceState(null, '', '/reset-password')
@@ -25,8 +25,8 @@ export default function ResetPassword({ api }: { api: MellCoreApi }) {
   }
 
   return (
-    <AuthShell title="Reset password">
-      {complete ? <p className="text-sm text-emerald-300">Password changed. All previous sessions were revoked.</p> : <form onSubmit={submit} className="space-y-4"><PasswordInput label="New password" value={password} onChange={setPassword} /><PasswordInput label="Confirm password" value={confirm} onChange={setConfirm} />{error && <p role="alert" className="text-sm text-red-400">{error}</p>}<button className="w-full rounded-lg bg-orange-600 px-4 py-3 text-sm font-semibold">Change password →</button></form>}
+    <AuthShell title="Восстановление пароля">
+      {complete ? <p className="text-sm text-emerald-300">Пароль изменён. Все предыдущие сеансы отозваны.</p> : <form onSubmit={submit} className="space-y-4"><PasswordInput label="Новый пароль" value={password} onChange={setPassword} /><PasswordInput label="Подтверждение пароля" value={confirm} onChange={setConfirm} />{error && <p role="alert" className="text-sm text-red-400">{error}</p>}<button className="w-full rounded-lg bg-orange-600 px-4 py-3 text-sm font-semibold">Изменить пароль →</button></form>}
       <HomeLink />
     </AuthShell>
   )
@@ -41,5 +41,5 @@ export function AuthShell({ title, children }: { title: string; children: ReactN
 }
 
 function HomeLink() {
-  return <button type="button" onClick={() => { window.history.replaceState(null, '', '/'); window.location.reload() }} className="mt-6 w-full text-center text-sm text-orange-300 hover:text-orange-200">Return to sign in</button>
+  return <button type="button" onClick={() => { window.history.replaceState(null, '', '/'); window.location.reload() }} className="mt-6 w-full text-center text-sm text-orange-300 hover:text-orange-200">Вернуться ко входу</button>
 }

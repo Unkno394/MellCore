@@ -17,14 +17,15 @@
   Viewer и User читают общий каталог профилей.
 - Пагинация, защита последнего Admin, проверка версии профиля, OpenAPI/Swagger.
 - CRUD собственных серверов и ловушек, снимки профилей, статусы и резервирование
-  портов SSH/ловушек/будущего dispatcher. SSH credentials только по ссылке.
+  портов SSH/ловушек/будущего dispatcher. Установка агента запускается через
+  Center; SSH-пароль и ключ не сохраняются.
 - Профиль kozyavka для существующей отдельной Low-ловушки и экспорт её конфигурации.
 - Pritvoryashka: отдельная Rust Middle Interaction SSH-ловушка с виртуальным
   shell/VFS, adaptive deception и совместимой телеметрией.
 - Приём телеметрии v1 в PostgreSQL с проверкой trap/server и дедупликацией.
 
-**Ещё не реализованы:** ClickHouse, WebSocket,
-SSH-развёртывание, HFSP, Hysteria 2, TCP Dispatcher и инфраструктурные исполнители.
+**В этом пакете отдельно не реализованы:** WebSocket и универсальный
+инфраструктурный исполнитель. SSH bootstrap агента выполняет hf-center.
 INTEGRATION_MODE=mock выбирает будущий режим; MockExecutor ещё не подключён.
 Режим real завершает запуск с integration_not_configured.
 
@@ -126,6 +127,7 @@ SESSION_TTL_SECONDS больше не используются.
 | GET /health/ready | Management PostgreSQL доступен: 200, иначе 503 |
 | POST /api/v1/auth/register | {name,email,password} → 201 User |
 | POST /api/v1/auth/login | {email,password} → access_token, token_type, expires_in, user |
+| POST /api/v1/auth/refresh | HttpOnly cookie → новый access_token |
 | GET /api/v1/auth/me | {user} текущего JWT |
 | POST /api/v1/auth/logout | Немедленный отзыв текущего JWT, 204 |
 | POST /api/v1/auth/resend-verification | {email} → 202; без SMTP — 503 |
@@ -142,12 +144,16 @@ SESSION_TTL_SECONDS больше не используются.
 | POST /internal/v1/telemetry/batches | Приём TelemetryBatch v1 по отдельному bearer token |
 | /docs/, /openapi.json | DOCS_ENABLED=true, только loopback bind |
 
-Авторизация: `Authorization: Bearer <access_token>`. Cookie и токены в URL не
-принимаются; Origin/CSRF для Bearer-запросов не требуются. HS256, проверка срока,
+Авторизация API-ресурсов: `Authorization: Bearer <access_token>`. Cookie
+принимается только `/auth/refresh` и `/auth/logout` с проверкой Origin; токены
+в URL не принимаются. HS256, проверка срока,
 issuer/audience и текущих прав в PostgreSQL. JWT sub — UUID пользователя,
 jti — UUID отзываемого токена. Срок по умолчанию 15 минут, JWT_TTL_SECONDS от
-60 до 3600 секунд. Максимум 10 токенов на аккаунт. Refresh-токенов пока нет:
-после истечения нужен повторный вход. Изменение аккаунта отзывает все его JWT,
+60 до 3600 секунд. Токен доступа автоматически продлевается через отдельную
+серверную сессию в HttpOnly/Secure/SameSite=Strict cookie, срок которой скользит
+на 30 дней при использовании. Refresh-токен хранится в PostgreSQL только как
+SHA-256; выход и изменение аккаунта отзывают сессию и все её JWT. Не более 10
+таких сессий на аккаунт. Изменение аккаунта также отзывает
 ссылки сброса/подтверждения и старые cookie-сессии. Viewer/User не читают реестр
 пользователей. Admin не обходит принадлежность серверов/ловушек; Viewer их только читает.
 
@@ -265,3 +271,15 @@ Low находится в [honeypots/kozyavka](../honeypots/kozyavka/README.md) 
 отдельной программой; её исходники не включены в пакет backend. Backend хранит профиль
 kozyavka и выдаёт совместимый JSON для будущего развёртывания через инфраструктурный
 адаптер. Dockerfile backend добавится на этапе контейнерного запуска.
+
+## Установка агента через панель
+
+В production установке backend получает `CENTER_CONTROL_TOKEN` из
+`/etc/honeyforge/backend.env`. Аутентифицированный
+`POST /api/v1/servers/bootstrap` принимает данные SSH только на время запроса,
+сохраняет название сервера в PostgreSQL и запускает существующий SSH bootstrap
+Center на `127.0.0.1:18081`. Пароль и приватный ключ в базу не записываются.
+`GET /api/v1/servers/{server_id}/bootstrap` возвращает статус установки.
+Перед размещением ловушки дождитесь `succeeded` и `registered: true`.
+Публичный Nginx-маршрут `/v1/agents/bootstrap*` должен быть закрыт; браузер
+работает только через `/api/v1/`.

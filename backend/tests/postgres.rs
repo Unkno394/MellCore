@@ -73,7 +73,7 @@ async fn login(app: &Router, name: &str, password: &str) -> Session {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["user"].get("password_hash").is_none());
-    assert!(cookie.is_none());
+    assert!(cookie.as_deref().is_some_and(|value| value.starts_with("__Host-mellcore-refresh=") && value.contains("HttpOnly") && value.contains("SameSite=Strict")));
     assert_eq!(body["token_type"], "Bearer");
     Session {
         token: body["access_token"].as_str().unwrap().into(),
@@ -257,6 +257,29 @@ async fn postgres_management_and_security_end_to_end() {
     let admin = login(&app, "ADMIN", PASSWORD).await;
     let me = request(&app, "GET", "/api/v1/auth/me", Some(&admin), Value::Null).await;
     assert_eq!(me.1["user"]["id"], admin_id.to_string());
+    let (_, _, cookie) = request(&app, "POST", "/api/v1/auth/login", None,
+        json!({"email":"admin@example.test","password":PASSWORD})).await;
+    let cookie = cookie.unwrap().split(';').next().unwrap().to_owned();
+    let cross_site = app.clone().oneshot(Request::builder().method("POST")
+        .uri("/api/v1/auth/refresh").header("origin", "https://other.example.test")
+        .header("cookie", cookie.as_str()).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(cross_site.status(), 403);
+    let refresh = app.clone().oneshot(Request::builder().method("POST")
+        .uri("/api/v1/auth/refresh").header("origin", ORIGIN)
+        .header("cookie", cookie.as_str()).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(refresh.status(), 200);
+    let renewed: Value = serde_json::from_slice(&to_bytes(refresh.into_body(), 1_048_576).await.unwrap()).unwrap();
+    let renewed_session = Session { token: renewed["access_token"].as_str().unwrap().into() };
+    assert_eq!(request(&app, "GET", "/api/v1/auth/me", Some(&renewed_session), Value::Null).await.0, 200);
+    let logout = app.clone().oneshot(Request::builder().method("POST")
+        .uri("/api/v1/auth/logout").header("origin", ORIGIN)
+        .header("cookie", cookie.as_str()).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(logout.status(), 204);
+    assert_eq!(request(&app, "GET", "/api/v1/auth/me", Some(&renewed_session), Value::Null).await.0, 401);
+    let replay = app.clone().oneshot(Request::builder().method("POST")
+        .uri("/api/v1/auth/refresh").header("origin", ORIGIN)
+        .header("cookie", cookie.as_str()).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(replay.status(), 401);
     let (status, body, _) = request(
         &app,
         "POST",

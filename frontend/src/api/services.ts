@@ -1,6 +1,9 @@
 import { ApiClient } from './client'
 import type {
   AttackEvent,
+  AttackGraphMatch,
+  BootstrapProgress,
+  BootstrapServerInput,
   CursorPage,
   PortReservation,
   Profile,
@@ -9,6 +12,8 @@ import type {
   ServerInput,
   TokenResponse,
   Trap,
+  TrapAction,
+  TrapActionProgress,
   TrapInput,
   User,
 } from './types'
@@ -21,6 +26,7 @@ export function createApi(client: ApiClient) {
           method: 'POST',
           body: { email, password },
         }),
+      refresh: () => client.request<TokenResponse>('/auth/refresh', { method: 'POST' }),
       register: (name: string, email: string, password: string) =>
         client.request<User>('/auth/register', {
           method: 'POST',
@@ -48,6 +54,16 @@ export function createApi(client: ApiClient) {
           method: 'POST',
           body: { email },
         }),
+      changeEmail: (currentPassword: string, newEmail: string) =>
+        client.request<{ message: string }>('/auth/change-email', {
+          method: 'POST',
+          body: { current_password: currentPassword, new_email: newEmail },
+        }),
+      changePassword: (currentPassword: string, newPassword: string) =>
+        client.request<void>('/auth/change-password', {
+          method: 'POST',
+          body: { current_password: currentPassword, new_password: newPassword },
+        }),
     },
     profiles: {
       list: () => collectPages<Profile>(client, '/profiles'),
@@ -63,6 +79,10 @@ export function createApi(client: ApiClient) {
     },
     servers: {
       list: () => collectPages<Server>(client, '/servers'),
+      bootstrap: (input: BootstrapServerInput) =>
+        client.request<BootstrapProgress>('/servers/bootstrap', { method: 'POST', body: input }),
+      bootstrapStatus: (serverId: string) =>
+        client.request<BootstrapProgress>(`/servers/${serverId}/bootstrap`),
       create: (server: ServerInput) =>
         client.request<Server>('/servers', { method: 'POST', body: server }),
       update: (server: Server, input: ServerInput) =>
@@ -91,6 +111,12 @@ export function createApi(client: ApiClient) {
         client.request<void>(`/traps/${id}`, { method: 'DELETE' }),
       events: (id: string) =>
         client.request<CursorPage<AttackEvent>>(`/traps/${id}/events?limit=100`),
+      attackMatches: (id: string) =>
+        client.request<AttackGraphMatch[]>(`/traps/${id}/attack-matches`),
+      action: (id: string, action: TrapAction) =>
+        client.request<TrapActionProgress>(`/traps/${id}/actions`, { method: 'POST', body: { action } }),
+      actionStatus: (trapId: string, actionId: string) =>
+        client.request<TrapActionProgress>(`/traps/${trapId}/actions/${actionId}`),
     },
   }
 }

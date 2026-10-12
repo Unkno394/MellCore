@@ -476,8 +476,10 @@ fn validate_hysteria_value(name: &str, value: &str) -> anyhow::Result<()> {
 
 async fn bootstrap(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<BootstrapRequest>,
 ) -> Result<Json<BootstrapResponse>, StatusCode> {
+    authorize_control(&state, &headers)?;
     validate_bootstrap_request(&request)?;
     let target = normalize_target_host(&request.host).ok_or(StatusCode::BAD_REQUEST)?;
     if state
@@ -590,7 +592,9 @@ async fn bootstrap(
 async fn bootstrap_status(
     State(state): State<AppState>,
     RoutePath(job_id): RoutePath<Uuid>,
+    headers: HeaderMap,
 ) -> Result<Json<BootstrapJobStatus>, StatusCode> {
+    authorize_control(&state, &headers)?;
     let job = state
         .bootstrap_jobs
         .lock()

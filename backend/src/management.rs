@@ -214,6 +214,7 @@ pub async fn revoke_credentials(
     for query in [
         "DELETE FROM sessions WHERE user_id=$1",
         "DELETE FROM access_tokens WHERE user_id=$1",
+        "DELETE FROM refresh_sessions WHERE user_id=$1",
         "DELETE FROM password_resets WHERE user_id=$1",
         "DELETE FROM email_verifications WHERE user_id=$1",
     ] {

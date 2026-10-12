@@ -2,6 +2,8 @@ export type Role = 'admin' | 'viewer' | 'user'
 export type TrapLevel = 'low' | 'medium'
 export type ServerStatus = 'unknown' | 'online' | 'offline' | 'error'
 export type TrapDesiredState = 'running' | 'stopped'
+export type TrapAction = 'start' | 'stop' | 'restart' | 'remove'
+export type TrapActionProgress = { action_id: string; status: 'queued' | 'succeeded' | 'failed'; detail: string | null }
 export type ActualState =
   | 'unknown'
   | 'installing'
@@ -71,6 +73,21 @@ export type Server = ServerInput & {
   updated_at: string
 }
 
+export type BootstrapServerInput = {
+  server: ServerInput
+  ssh_password: string | null
+  ssh_private_key: string | null
+  ssh_key_passphrase: string | null
+}
+
+export type BootstrapProgress = {
+  server_id: string
+  agent_id: string
+  status: 'running' | 'succeeded' | 'failed'
+  registered: boolean
+  message: string | null
+}
+
 export type PortBinding = {
   transport: Transport
   host_port: number
@@ -137,6 +154,17 @@ export type AttackEvent = {
   event: IncomingEvent
   received_at: string
   expires_at: string
+}
+
+export type AttackGraphMatch = {
+  session_key: string
+  evidence_domain: string
+  technique_key: string
+  technique_name: string
+  status: 'candidate' | 'attempt' | 'confirmed' | string
+  similarity: number
+  evidence_event_ids: string[]
+  updated_at: string
 }
 
 export type CursorPage<T> = {

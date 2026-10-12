@@ -103,13 +103,19 @@ pub fn runtime_config(trap: &Trap) -> Result<RuntimeConfig, AppError> {
 /// already validated by the profile and port-reservation logic; never user-provided compose YAML.
 pub fn deployment_command(trap: &Trap) -> Result<AgentCommand, AppError> {
     let runtime = runtime_config(trap)?;
-    let host_port = trap.ports.first().ok_or_else(AppError::internal)?.host_port;
+    let binding = trap.ports.first().ok_or_else(AppError::internal)?;
+    let host_port = binding.host_port;
     Ok(AgentCommand::DeployKozyavka(KozyavkaDeployment {
         command_id: Uuid::new_v4(),
         trap_id: runtime.trap_id,
         host_port,
         container_port: runtime.port,
         banner: runtime.banner,
-        publish_address: "0.0.0.0".into(),
+        publish_address: if binding.route_mode == crate::resources::RouteMode::Direct {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        }
+        .into(),
     }))
 }

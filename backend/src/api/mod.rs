@@ -2,8 +2,10 @@ pub mod auth;
 pub mod center_registry;
 pub mod profiles;
 pub mod servers;
+pub mod server_bootstrap;
 pub mod telemetry;
 pub mod traps;
+pub mod trap_actions;
 pub mod users;
 
 use std::{sync::Arc, time::Instant};
@@ -117,13 +119,18 @@ pub struct HealthResponse {
     info(
         title = "HoneyForge Backend",
         version = "0.1.0",
-        description = "Management API and internal telemetry ingestion. Public registration always grants user role. Email login uses Bearer JWT. Profiles are shared templates; only administrators modify them. Servers and traps are owner-scoped. Registration and desired state do not deploy anything. Port reservations are exclusive per registered server/protocol/port; dispatcher backends use distinct TCP ports. Pritvoryashka telemetry uses an independent opaque bearer token, validates trap/server ownership and is stored idempotently in PostgreSQL. SSH deployment and dispatcher execution are not implemented."
+        description = "Management API and internal telemetry ingestion. Public registration always grants user role. Email login uses Bearer JWT. Profiles are shared templates; only administrators modify them. Servers and traps are owner-scoped. The server bootstrap endpoint installs an agent through Center over SSH; ordinary server registration and desired trap state do not deploy anything. Port reservations are exclusive per registered server/protocol/port; dispatcher backends use distinct TCP ports. Pritvoryashka telemetry uses an independent opaque bearer token, validates trap/server ownership and is stored idempotently in PostgreSQL."
     ),
-    paths(live, ready, auth::register, auth::verify_email, auth::resend_verification, auth::forgot_password, auth::reset_password, auth::login, auth::me, auth::logout, users::create, users::list, users::get, users::update, users::delete, profiles::create, profiles::list, profiles::get, profiles::update, profiles::delete, servers::create, servers::list, servers::get, servers::update, servers::delete, servers::ports, traps::create, traps::list, traps::get, traps::update, traps::delete, traps::runtime_config, telemetry::ingest, telemetry::ingest_from_center, telemetry::list, telemetry::list_attack_matches, telemetry::list_graph_proposals, telemetry::review_graph_proposal),
+    paths(live, ready, auth::register, auth::verify_email, auth::resend_verification, auth::forgot_password, auth::reset_password, auth::change_password, auth::change_email, auth::login, auth::refresh, auth::me, auth::logout, users::create, users::list, users::get, users::update, users::delete, profiles::create, profiles::list, profiles::get, profiles::update, profiles::delete, servers::create, servers::list, servers::get, servers::update, servers::delete, servers::ports, server_bootstrap::start, server_bootstrap::status, traps::create, traps::list, traps::get, traps::update, traps::delete, traps::runtime_config, trap_actions::start, trap_actions::status, telemetry::ingest, telemetry::ingest_from_center, telemetry::list, telemetry::list_attack_matches, telemetry::list_graph_proposals, telemetry::review_graph_proposal),
     modifiers(&SecuritySchemes),
     components(schemas(
+        trap_actions::TrapActionRequest,
+        trap_actions::TrapActionProgress,
         HealthResponse,
         ErrorResponse,
+        auth::ChangePassword,
+        auth::ChangeEmail,
+        auth::EmailChangeAccepted,
         TelemetryBatch,
         telemetry::CenterEventInput,
         telemetry::AttackGraphMatch,
@@ -200,9 +207,14 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/api/v1/auth/forgot-password", post(auth::forgot_password))
         .route("/api/v1/auth/reset-password", post(auth::reset_password))
         .route("/api/v1/auth/login", post(auth::login))
+        .route("/api/v1/auth/change-password", post(auth::change_password))
+        .route("/api/v1/auth/change-email", post(auth::change_email))
+        .route("/api/v1/auth/refresh", post(auth::refresh))
         .route("/api/v1/auth/me", get(auth::me))
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/servers", get(servers::list).post(servers::create))
+        .route("/api/v1/servers/bootstrap", post(server_bootstrap::start))
+        .route("/api/v1/servers/{server_id}/bootstrap", get(server_bootstrap::status))
         .route(
             "/api/v1/servers/{server_id}",
             get(servers::get)
@@ -216,6 +228,8 @@ pub fn router_with_state(state: AppState) -> Router {
             get(traps::runtime_config),
         )
         .route("/api/v1/traps/{trap_id}/events", get(telemetry::list))
+        .route("/api/v1/traps/{trap_id}/actions", post(trap_actions::start))
+        .route("/api/v1/traps/{trap_id}/actions/{action_id}", get(trap_actions::status))
         .route("/api/v1/traps/{trap_id}/attack-matches", get(telemetry::list_attack_matches))
         .route("/api/v1/knowledge/proposals", get(telemetry::list_graph_proposals))
         .route("/api/v1/knowledge/proposals/{proposal_id}/review", post(telemetry::review_graph_proposal))

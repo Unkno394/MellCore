@@ -15,6 +15,18 @@ test('adds bearer token, JSON body and parses a successful response', async () =
   assert.equal(request.url, 'http://mellcore.test/api/v1/profiles')
   assert.equal(request.init.headers.get('authorization'), 'Bearer test-jwt')
   assert.equal(request.init.body, JSON.stringify({ name: 'ssh' }))
+  assert.equal(request.init.credentials, 'same-origin')
+})
+
+test('refresh rejection does not clear a still-valid access session', async () => {
+  let unauthorized = 0
+  const client = new ApiClient({
+    baseUrl: 'http://mellcore.test/api/v1', getToken: () => 'old-jwt',
+    onUnauthorized: () => { unauthorized += 1 },
+    fetchImpl: async () => new Response(JSON.stringify({ error: { code: 'unauthorized' } }), { status: 401 }),
+  })
+  await assert.rejects(client.request('/auth/refresh', { method: 'POST' }), (error) => error instanceof ApiError && error.status === 401)
+  assert.equal(unauthorized, 0)
 })
 
 test('surfaces backend request ID and invokes the unauthorized callback', async () => {

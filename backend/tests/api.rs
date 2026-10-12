@@ -55,6 +55,16 @@ async fn documentation_is_disabled_by_default() {
 }
 
 #[tokio::test]
+async fn server_bootstrap_requires_user_authentication() {
+    let response = router(&config(false))
+        .oneshot(Request::builder().method("POST").uri("/api/v1/servers/bootstrap")
+            .header("content-type", "application/json")
+            .body(Body::from("{}")).unwrap())
+        .await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn openapi_contains_management_and_telemetry_contracts() {
     let response = router(&config(true))
         .oneshot(
@@ -72,6 +82,7 @@ async fn openapi_contains_management_and_telemetry_contracts() {
     assert!(body["components"]["schemas"]["AttackEvent"].is_object());
     assert!(body["paths"]["/health/live"]["get"].is_object());
     assert!(body["paths"]["/internal/v1/telemetry/batches"]["post"].is_object());
+    assert!(body["paths"]["/api/v1/auth/refresh"]["post"].is_object());
     assert_eq!(
         body["paths"]["/internal/v1/telemetry/batches"]["post"]["security"],
         serde_json::json!([{"telemetry_bearer":[]}])
@@ -87,6 +98,8 @@ async fn openapi_contains_management_and_telemetry_contracts() {
         "reset-password",
         "verify-email",
         "resend-verification",
+        "change-email",
+        "change-password",
     ] {
         assert!(body["paths"][format!("/api/v1/auth/{route}")]["post"].is_object());
     }

@@ -49,7 +49,7 @@ export class ApiClient {
   constructor(options: ApiClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? defaultBaseUrl).replace(/\/$/, '')
     this.timeoutMs = options.timeoutMs ?? defaultTimeoutMs
-    this.fetchImpl = options.fetchImpl ?? fetch
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis)
     this.getToken = options.getToken ?? (() => null)
     this.onUnauthorized = options.onUnauthorized ?? (() => undefined)
   }
@@ -69,6 +69,7 @@ export class ApiClient {
     try {
       const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
         ...options,
+        credentials: options.credentials ?? 'same-origin',
         headers,
         body: options.body === undefined ? undefined : JSON.stringify(options.body),
         signal: controller.signal,
@@ -80,8 +81,8 @@ export class ApiClient {
       if (!response.ok) {
         const error = payload as ErrorResponse | undefined
         const requestId = error?.error?.request_id ?? headerRequestId
-        if (response.status === 401 && token) this.onUnauthorized()
-        throw new ApiError(error?.error?.message ?? `Request failed (${response.status})`, {
+        if (response.status === 401 && token && path !== '/auth/refresh') this.onUnauthorized()
+        throw new ApiError(error?.error?.message ?? `Ошибка запроса (${response.status})`, {
           status: response.status,
           code: error?.error?.code ?? 'http_error',
           requestId,
@@ -92,12 +93,12 @@ export class ApiClient {
     } catch (error) {
       if (error instanceof ApiError) throw error
       if (controller.signal.aborted) {
-        throw new ApiError('The request timed out or was cancelled.', {
+        throw new ApiError('Время ожидания истекло или запрос отменён.', {
           status: 0,
           code: controller.signal.reason === 'timeout' ? 'request_timeout' : 'request_cancelled',
         })
       }
-      throw new ApiError('Unable to reach the MellCore API.', {
+      throw new ApiError('Не удалось подключиться к API MellCore.', {
         status: 0,
         code: 'network_error',
       })
@@ -117,7 +118,17 @@ function safelyParseJson(text: string): unknown {
 }
 
 export function apiErrorMessage(error: unknown): string {
-  if (!(error instanceof ApiError)) return 'Unexpected application error.'
-  const suffix = error.requestId ? ` Request ID: ${error.requestId}` : ''
-  return `${error.message}${suffix}`
+  if (!(error instanceof ApiError)) return 'Неожиданная ошибка приложения.'
+  const knownMessages: Record<string, string> = {
+    unauthorized: 'Неверные учётные данные или срок действия сеанса истёк.',
+    forbidden: 'Доступ запрещён.',
+    not_found: 'Запрошенные данные не найдены.',
+    email_not_verified: 'Подтвердите адрес электронной почты перед входом.',
+    mail_unavailable: 'Отправка писем сейчас недоступна.',
+    database_unavailable: 'База данных сейчас недоступна.',
+    rate_limited: 'Слишком много запросов. Повторите попытку позже.',
+    internal_error: 'Внутренняя ошибка сервера.',
+  }
+  const suffix = error.requestId ? ` ID запроса: ${error.requestId}` : ''
+  return `${knownMessages[error.code] ?? error.message}${suffix}`
 }

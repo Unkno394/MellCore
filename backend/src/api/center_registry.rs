@@ -67,10 +67,8 @@ pub async fn register_trap(
         _ => return Err(AppError::invalid("Only Low and Middle traps may be registered")),
     };
     let mut tx = state.pool()?.begin().await?;
-    // The installed VPS has a single bootstrap administrator. Never adopt a
-    // trap owned by a different account or silently move an agent to a server.
-    let owner: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE username='admin' AND role='admin' AND is_active")
-        .fetch_optional(&mut *tx).await?.ok_or_else(AppError::unavailable)?;
+    // Existing agent mappings keep the authenticated owner's server identity.
+    // Legacy direct Center installations still fall back to the bootstrap admin.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
         .bind(input.agent_id.to_string()).execute(&mut *tx).await?;
     let existing_server: Option<Uuid> = sqlx::query_scalar("SELECT server_id FROM center_agent_servers WHERE agent_id=$1")
@@ -82,6 +80,13 @@ pub async fn register_trap(
         (Some(existing), Some(requested)) if existing != requested => return Err(AppError::conflict("Agent is bound to a different server")),
         (Some(existing), _) => existing,
         (None, requested) => requested.unwrap_or_else(Uuid::new_v4),
+    };
+    let owner: Uuid = if existing_server.is_some() {
+        sqlx::query_scalar("SELECT user_id FROM servers WHERE server_id=$1")
+            .bind(server_id).fetch_optional(&mut *tx).await?.ok_or_else(AppError::not_found)?
+    } else {
+        sqlx::query_scalar("SELECT id FROM users WHERE username='admin' AND role='admin' AND is_active")
+            .fetch_optional(&mut *tx).await?.ok_or_else(AppError::unavailable)?
     };
     let server = sqlx::query("SELECT user_id,host,ssh_port FROM servers WHERE server_id=$1 FOR UPDATE")
         .bind(server_id).fetch_optional(&mut *tx).await?;

@@ -84,6 +84,7 @@ def main():
         f"JWT_SECRET={config['jwt_secret']}\nFRONTEND_URL=https://{DOMAIN}\n"
         f"TELEMETRY_INGEST_TOKEN={config['telemetry_token']}\n"
         f"CENTER_INGEST_TOKEN={config['center_graph_token']}\n"
+        f"CENTER_CONTROL_TOKEN={config['control_token']}\n"
         f"TELEMETRY_PUBLIC_ENDPOINT=https://{DOMAIN}/internal/v1/telemetry/batches\n"
         "REQUIRE_EMAIL_VERIFICATION=false\nRUST_LOG=honeyforge_backend=info\n"
     )

@@ -32,6 +32,7 @@ pub struct Config {
     pub telemetry: TelemetryLimits,
     pub telemetry_ingest_token: Option<Secret>,
     pub center_ingest_token: Option<Secret>,
+    pub center_control_token: Option<Secret>,
     pub telemetry_public_endpoint: Option<String>,
     pub integration_mode: IntegrationMode,
     pub database_url: Option<Secret>,
@@ -243,6 +244,10 @@ impl Config {
             secret.expose().len() < 32 || telemetry_ingest_token.as_ref().is_some_and(|t| t.expose() == secret.expose())) {
             return Err(ConfigError { key: "CENTER_INGEST_TOKEN", reason: "requires a separate random secret of at least 32 bytes" });
         }
+        let center_control_token = lookup("CENTER_CONTROL_TOKEN")?.filter(|s| !s.is_empty()).map(Secret);
+        if center_control_token.as_ref().is_some_and(|secret| secret.expose().len() < 32) {
+            return Err(ConfigError { key: "CENTER_CONTROL_TOKEN", reason: "requires at least 32 bytes of random secret material" });
+        }
         let telemetry_public_endpoint =
             lookup("TELEMETRY_PUBLIC_ENDPOINT")?.filter(|value| !value.is_empty());
         if let Some(endpoint) = &telemetry_public_endpoint {
@@ -310,6 +315,7 @@ impl Config {
             telemetry,
             telemetry_ingest_token,
             center_ingest_token,
+            center_control_token,
             telemetry_public_endpoint,
             integration_mode: get("INTEGRATION_MODE", "mock")?
                 .parse()
