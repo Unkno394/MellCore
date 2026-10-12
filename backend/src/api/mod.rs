@@ -118,12 +118,15 @@ pub struct HealthResponse {
         version = "0.1.0",
         description = "Management API and internal telemetry ingestion. Public registration always grants user role. Email login uses Bearer JWT. Profiles are shared templates; only administrators modify them. Servers and traps are owner-scoped. Registration and desired state do not deploy anything. Port reservations are exclusive per registered server/protocol/port; dispatcher backends use distinct TCP ports. Pritvoryashka telemetry uses an independent opaque bearer token, validates trap/server ownership and is stored idempotently in PostgreSQL. SSH deployment and dispatcher execution are not implemented."
     ),
-    paths(live, ready, auth::register, auth::verify_email, auth::resend_verification, auth::forgot_password, auth::reset_password, auth::login, auth::me, auth::logout, users::create, users::list, users::get, users::update, users::delete, profiles::create, profiles::list, profiles::get, profiles::update, profiles::delete, servers::create, servers::list, servers::get, servers::update, servers::delete, servers::ports, traps::create, traps::list, traps::get, traps::update, traps::delete, traps::runtime_config, telemetry::ingest, telemetry::list),
+    paths(live, ready, auth::register, auth::verify_email, auth::resend_verification, auth::forgot_password, auth::reset_password, auth::login, auth::me, auth::logout, users::create, users::list, users::get, users::update, users::delete, profiles::create, profiles::list, profiles::get, profiles::update, profiles::delete, servers::create, servers::list, servers::get, servers::update, servers::delete, servers::ports, traps::create, traps::list, traps::get, traps::update, traps::delete, traps::runtime_config, telemetry::ingest, telemetry::ingest_from_center, telemetry::list, telemetry::list_attack_matches, telemetry::list_graph_proposals),
     modifiers(&SecuritySchemes),
     components(schemas(
         HealthResponse,
         ErrorResponse,
         TelemetryBatch,
+        telemetry::CenterEventInput,
+        telemetry::AttackGraphMatch,
+        telemetry::AttackGraphProposal,
         IncomingEvent,
         AttackEvent,
         ValidationError,
@@ -182,6 +185,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/internal/v1/telemetry/batches", post(telemetry::ingest))
+        .route("/internal/v1/center/events", post(telemetry::ingest_from_center))
         .route("/api/v1/auth/register", post(auth::register))
         .route("/api/v1/auth/verify-email", post(auth::verify_email))
         .route(
@@ -207,6 +211,8 @@ pub fn router_with_state(state: AppState) -> Router {
             get(traps::runtime_config),
         )
         .route("/api/v1/traps/{trap_id}/events", get(telemetry::list))
+        .route("/api/v1/traps/{trap_id}/attack-matches", get(telemetry::list_attack_matches))
+        .route("/api/v1/knowledge/proposals", get(telemetry::list_graph_proposals))
         .route(
             "/api/v1/traps/{trap_id}",
             get(traps::get).put(traps::update).delete(traps::delete),

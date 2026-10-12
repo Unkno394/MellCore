@@ -30,15 +30,24 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 mod credentials;
+mod clickhouse;
+mod postgres_graph_sink;
 mod telemetry_store;
+mod security_state;
+use clickhouse::ClickHouseTelemetry;
+use postgres_graph_sink::PostgresGraphSink;
 use credentials::CredentialStore;
 use telemetry_store::TelemetryStore;
+use security_state::{AgentSecurityStore, CompromisedAgent};
 
 #[derive(Parser)]
 struct Args {
     /// Root-owned credential store. Survives Center restarts and may contain a local agent.
     #[arg(long, env = "HF_CENTER_CREDENTIALS_FILE")]
     credentials_file: Option<PathBuf>,
+    /// Durable agent compromise and target-host state.
+    #[arg(long, env = "HF_CENTER_SECURITY_FILE", default_value = "/var/lib/honeyforge/center-agent-security.json")]
+    security_file: PathBuf,
     /// Durable JSON Lines sink for events received through authenticated Kazik telemetry.
     #[arg(long, env = "HF_CENTER_TELEMETRY_FILE", default_value = "/var/lib/honeyforge/telemetry/events.jsonl")]
     telemetry_file: PathBuf,
@@ -75,6 +84,11 @@ struct Args {
     /// disable the endpoint until the panel's normal authentication is connected.
     #[arg(long, env = "HF_CONTROL_TOKEN")]
     control_token: Option<String>,
+    /// Loopback-only Hysteria Traffic Stats API. Used to close an agent's active QUIC sessions.
+    #[arg(long, env = "HF_HYSTERIA_STATS_URL")]
+    hysteria_stats_url: Option<String>,
+    #[arg(long, env = "HF_HYSTERIA_STATS_SECRET")]
+    hysteria_stats_secret: Option<String>,
     /// HTTPS URL agents use after first installation. This is not the SSH address.
     #[arg(long, env = "HF_PUBLIC_CENTER_URL")]
     public_center_url: String,
@@ -85,11 +99,14 @@ struct AppState {
     enrollment_tokens: Arc<Mutex<HashMap<String, Uuid>>>,
     bootstrap_jobs: Arc<Mutex<HashMap<Uuid, BootstrapJob>>>,
     agent_credentials: Arc<Mutex<CredentialStore>>,
+    agent_security: Arc<Mutex<AgentSecurityStore>>,
     bootstrapper: Arc<dyn RemoteBootstrap>,
     public_center_url: Arc<str>,
     hysteria_connection: Option<HysteriaConnection>,
     control_token: Option<Arc<str>>,
+    hysteria_stats: Option<HysteriaStats>,
     pending_commands: Arc<Mutex<HashMap<Uuid, VecDeque<KazikEnvelope>>>>,
+    command_statuses: Arc<Mutex<HashMap<Uuid, CommandStatus>>>,
     kazik_sequence: Arc<AtomicU64>,
     telemetry_store: Arc<Mutex<TelemetryStore>>,
 }
@@ -143,6 +160,14 @@ struct BootstrapJob {
     message: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct BootstrapJobStatus {
+    agent_id: Uuid,
+    status: BootstrapJobState,
+    message: Option<String>,
+    registered: bool,
+}
+
 /// Request body Hysteria sends to `auth.type: http`. The remote address and rate are
 /// intentionally not used as identity; only the issued per-agent credential authorizes access.
 #[derive(Debug, Deserialize)]
@@ -165,6 +190,56 @@ struct HysteriaAuthResponse {
 struct QueuedCommandResponse {
     message_id: Uuid,
     status: &'static str,
+}
+
+#[derive(Clone, Serialize)]
+struct CommandStatus {
+    #[serde(skip_serializing)]
+    agent_id: Uuid,
+    status: &'static str,
+    detail: Option<String>,
+}
+
+#[derive(Clone)]
+struct HysteriaStats {
+    url: Arc<str>,
+    secret: Arc<str>,
+    client: reqwest::Client,
+}
+
+impl HysteriaStats {
+    async fn kick(&self, agent_id: Uuid) -> anyhow::Result<()> {
+        let id = agent_id.to_string();
+        self.client
+            .post(format!("{}/kick", self.url))
+            .header("Authorization", self.secret.as_ref())
+            .json(&[&id])
+            .send()
+            .await?
+            .error_for_status()?;
+        for _ in 0..3 {
+            let online: HashMap<String, u64> = self.client
+                .get(format!("{}/online", self.url))
+                .header("Authorization", self.secret.as_ref())
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if !online.contains_key(&id) {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        anyhow::bail!("agent remains online after Hysteria kick");
+    }
+}
+
+#[derive(Serialize)]
+struct RevokeResponse {
+    revoked: bool,
+    transport_disconnected: bool,
+    detail: Option<String>,
 }
 
 fn default_ssh_port() -> u16 {
@@ -244,12 +319,28 @@ async fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("HF_HYSTERIA_SERVER and HF_HYSTERIA_SNI must be supplied together"),
     };
     let control_token = args.control_token.map(Arc::<str>::from);
+    let hysteria_stats = match (args.hysteria_stats_url, args.hysteria_stats_secret) {
+        (Some(url), Some(secret))
+            if url == "http://127.0.0.1:19999" && !secret.is_empty() => Some(HysteriaStats {
+            url: Arc::from(url.trim_end_matches('/')),
+            secret: Arc::from(secret),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?,
+        }),
+        (None, None) => None,
+        _ => anyhow::bail!("HF_HYSTERIA_STATS_URL and HF_HYSTERIA_STATS_SECRET must be set together"),
+    };
     let listen = args.listen;
     let kazik_udp_listen = args.kazik_udp_listen;
+    let telemetry_file = args.telemetry_file.clone();
+    let clickhouse_telemetry = ClickHouseTelemetry::from_env()?;
+    let postgres_graph_sink = PostgresGraphSink::from_env()?;
     let state = AppState {
         enrollment_tokens: Arc::default(),
         bootstrap_jobs: Arc::default(),
         agent_credentials: Arc::new(Mutex::new(CredentialStore::open(args.credentials_file)?)),
+        agent_security: Arc::new(Mutex::new(AgentSecurityStore::open(&args.security_file)?)),
         bootstrapper: Arc::new(SshBootstrapper {
             agent_binary: args.agent_binary,
             kozyavka_image_archive: args.kozyavka_image_archive,
@@ -261,11 +352,48 @@ async fn main() -> anyhow::Result<()> {
         public_center_url: Arc::from(args.public_center_url),
         hysteria_connection,
         control_token,
+        hysteria_stats,
         pending_commands: Arc::default(),
+        command_statuses: Arc::default(),
         kazik_sequence: Arc::new(AtomicU64::new(1)),
-        telemetry_store: Arc::new(Mutex::new(TelemetryStore::open(args.telemetry_file)?)),
+        telemetry_store: Arc::new(Mutex::new(TelemetryStore::open(&telemetry_file)?)),
     };
+    if let Some(sink) = clickhouse_telemetry {
+        let spool = telemetry_file.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                match sink.flush_spool(&spool).await {
+                    Ok(0) => {}
+                    Ok(events) => info!(events, "trap telemetry inserted into ClickHouse"),
+                    Err(error) => warn!(%error, "ClickHouse telemetry insert failed; durable spool retained"),
+                }
+            }
+        });
+        info!("ClickHouse telemetry sink enabled");
+    } else {
+        warn!("ClickHouse telemetry sink is disabled; set HF_CENTER_CLICKHOUSE_URL and credentials");
+    }
+    if let Some(sink) = postgres_graph_sink {
+        let spool = telemetry_file.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                match sink.flush_spool(&spool).await {
+                    Ok(0) => {}
+                    Ok(events) => info!(events, "Center events indexed by PostgreSQL attack graph"),
+                    Err(error) => warn!(%error, "PostgreSQL graph ingestion failed; durable Center spool retained"),
+                }
+            }
+        });
+        info!("PostgreSQL attack graph sink enabled");
+    } else {
+        warn!("PostgreSQL attack graph sink disabled; Center telemetry continues to ClickHouse");
+    }
     tokio::spawn(kazik_udp_receiver(kazik_udp_listen, state.clone()));
+    tokio::spawn(retry_compromised_kicks(state.clone()));
     let app = Router::new()
         .route("/", get(dev_panel))
         .route("/v1/agents/bootstrap", post(bootstrap))
@@ -273,6 +401,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/agents/register", post(register))
         .route("/v1/hysteria/auth", post(hysteria_auth))
         .route("/v1/agents/{agent_id}/commands", post(queue_command))
+        .route("/v1/agents/{agent_id}/commands/{message_id}", get(command_status))
+        .route("/v1/agents/{agent_id}/revoke", post(revoke_agent))
+        .route("/v1/agents/compromised", get(list_compromised_agents))
         .with_state(state);
     info!(address = %listen, "HoneyForge center listening");
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -302,6 +433,11 @@ async fn bootstrap(
     Json(request): Json<BootstrapRequest>,
 ) -> Result<Json<BootstrapResponse>, StatusCode> {
     validate_bootstrap_request(&request)?;
+    let target = normalize_target_host(&request.host).ok_or(StatusCode::BAD_REQUEST)?;
+    if state.agent_security.lock().await.target_is_compromised(&target) {
+        warn!(target_host = %target, "refused bootstrap to a host previously marked compromised");
+        return Err(StatusCode::CONFLICT);
+    }
     let authentication = if request.ssh_password.is_some() {
         "password"
     } else {
@@ -317,6 +453,10 @@ async fn bootstrap(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
     let agent_id = Uuid::new_v4();
+    if let Err(error) = state.agent_security.lock().await.set_target(agent_id, target) {
+        tracing::error!(%error, %agent_id, "could not persist target host for new agent");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     let token = Uuid::new_v4().to_string();
     let initial_trap_id = request.initial_high_ubuntu.as_ref().map(|_| Uuid::new_v4());
     let initial_command_json = match (request.initial_high_ubuntu, initial_trap_id) {
@@ -396,15 +536,26 @@ async fn bootstrap(
 async fn bootstrap_status(
     State(state): State<AppState>,
     RoutePath(job_id): RoutePath<Uuid>,
-) -> Result<Json<BootstrapJob>, StatusCode> {
-    state
+) -> Result<Json<BootstrapJobStatus>, StatusCode> {
+    let job = state
         .bootstrap_jobs
         .lock()
         .await
         .get(&job_id)
         .cloned()
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let registered = state
+        .agent_credentials
+        .lock()
+        .await
+        .get(&job.agent_id)
+        .is_some();
+    Ok(Json(BootstrapJobStatus {
+        agent_id: job.agent_id,
+        status: job.status,
+        message: job.message,
+        registered,
+    }))
 }
 
 fn validate_bootstrap_request(request: &BootstrapRequest) -> Result<(), StatusCode> {
@@ -438,6 +589,21 @@ fn validate_bootstrap_request(request: &BootstrapRequest) -> Result<(), StatusCo
         }
         _ => Err(StatusCode::BAD_REQUEST),
     }
+}
+
+fn normalize_target_host(host: &str) -> Option<String> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(ip.to_string());
+    }
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > 253
+        || !normalized.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+        || normalized.split('.').any(|label| label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-'))
+    {
+        return None;
+    }
+    Some(normalized)
 }
 
 fn validate_initial_high(request: &BootstrapRequest) -> Result<(), StatusCode> {
@@ -489,8 +655,12 @@ async fn hysteria_auth(
     State(state): State<AppState>,
     Json(request): Json<HysteriaAuthRequest>,
 ) -> Json<HysteriaAuthResponse> {
+    let security = state.agent_security.lock().await;
     let credentials = state.agent_credentials.lock().await;
     let agent_id = credentials.authenticate(&request.auth);
+    if agent_id.is_some_and(|id| security.is_compromised(&id)) {
+        return Json(HysteriaAuthResponse { ok: false, id: None });
+    }
     Json(HysteriaAuthResponse {
         ok: agent_id.is_some(),
         id: agent_id.map(|value| value.to_string()),
@@ -505,14 +675,12 @@ async fn queue_command(
     headers: HeaderMap,
     Json(command): Json<AgentCommand>,
 ) -> Result<Json<QueuedCommandResponse>, StatusCode> {
-    let Some(expected_token) = &state.control_token else {
-        return Err(StatusCode::NOT_FOUND);
-    };
-    let supplied_token = headers
-        .get("x-honeyforge-control-token")
-        .and_then(|value| value.to_str().ok());
-    if supplied_token != Some(expected_token.as_ref()) {
-        return Err(StatusCode::UNAUTHORIZED);
+    authorize_control(&state, &headers)?;
+    // Keep the security-state lock until the queue write completes. The incident
+    // path takes it first too, so a command cannot slip in behind compromise handling.
+    let security = state.agent_security.lock().await;
+    if security.is_compromised(&agent_id) {
+        return Err(StatusCode::GONE);
     }
     let credential = state
         .agent_credentials
@@ -527,6 +695,11 @@ async fn queue_command(
         .unwrap_or_default();
     let envelope = KazikEnvelope::new(agent_id, credential, now, KazikBody::Command { command });
     let message_id = envelope.message_id;
+    state.command_statuses.lock().await.insert(message_id, CommandStatus {
+        agent_id,
+        status: "queued",
+        detail: None,
+    });
     state
         .pending_commands
         .lock()
@@ -534,10 +707,122 @@ async fn queue_command(
         .entry(agent_id)
         .or_default()
         .push_back(envelope);
+    drop(security);
     Ok(Json(QueuedCommandResponse {
         message_id,
         status: "queued",
     }))
+}
+
+async fn command_status(
+    State(state): State<AppState>,
+    RoutePath((agent_id, message_id)): RoutePath<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Json<CommandStatus>, StatusCode> {
+    authorize_control(&state, &headers)?;
+    let status = state.command_statuses.lock().await.get(&message_id).cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if status.agent_id != agent_id {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(status))
+}
+
+fn authorize_control(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
+    let Some(expected_token) = &state.control_token else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let supplied_token = headers
+        .get("x-honeyforge-control-token")
+        .and_then(|value| value.to_str().ok());
+    if supplied_token != Some(expected_token.as_ref()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(())
+}
+
+async fn revoke_agent(
+    State(state): State<AppState>,
+    RoutePath(agent_id): RoutePath<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<RevokeResponse>, StatusCode> {
+    authorize_control(&state, &headers)?;
+    // Persist denial before touching the live QUIC session: reconnection must already fail.
+    let revoked = state.agent_credentials.lock().await.remove(&agent_id).map_err(|error| {
+        tracing::error!(%error, %agent_id, "could not persist agent revocation");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    state.enrollment_tokens.lock().await.retain(|_, id| *id != agent_id);
+    state.pending_commands.lock().await.remove(&agent_id);
+    let (transport_disconnected, detail) = match &state.hysteria_stats {
+        Some(stats) => match stats.kick(agent_id).await {
+            Ok(()) => (true, None),
+            Err(error) => {
+                warn!(%error, %agent_id, "agent revoked but Hysteria disconnect failed; retry revoke");
+                (false, Some("Доступ отозван, но активную Hysteria-сессию не удалось закрыть. Повтори отзыв.".into()))
+            }
+        },
+        None => (false, Some("Доступ отозван; Hysteria Traffic Stats API не настроен. Активная сессия может оставаться открытой.".into())),
+    };
+    info!(%agent_id, revoked, transport_disconnected, "agent revocation processed");
+    Ok(Json(RevokeResponse { revoked, transport_disconnected, detail }))
+}
+
+async fn list_compromised_agents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<CompromisedAgent>>, StatusCode> {
+    authorize_control(&state, &headers)?;
+    Ok(Json(state.agent_security.lock().await.compromised()))
+}
+
+async fn mark_agent_compromised(
+    state: &AppState,
+    agent_id: Uuid,
+    event: &kazik_protocol::TrapEvent,
+) -> anyhow::Result<()> {
+    // Persist the deny-list first: even if another write fails, auth, commands and
+    // telemetry reject this agent after a restart.
+    state.agent_security.lock().await.mark_compromised(agent_id, event)?;
+    if let Err(error) = state.agent_credentials.lock().await.remove(&agent_id) {
+        tracing::error!(%error, %agent_id, "compromise is persisted but credential-file revocation failed");
+    }
+    state.enrollment_tokens.lock().await.retain(|_, id| *id != agent_id);
+    state.pending_commands.lock().await.remove(&agent_id);
+    state.command_statuses.lock().await.retain(|_, status| status.agent_id != agent_id);
+    warn!(%agent_id, trap_id = %event.trap_id, "agent and target VPS marked compromised; credentials revoked and commands blocked");
+    Ok(())
+}
+
+async fn disconnect_compromised_agent(state: &AppState, agent_id: Uuid) {
+    let result = match &state.hysteria_stats {
+        Some(stats) => stats.kick(agent_id).await,
+        None => Err(anyhow::anyhow!("Hysteria Traffic Stats API is not configured")),
+    };
+    match result {
+        Ok(()) => {
+            if let Err(error) = state.agent_security.lock().await.set_transport_disconnected(agent_id, true) {
+                tracing::error!(%error, %agent_id, "Hysteria session was closed but disconnect status could not be persisted");
+            }
+            info!(%agent_id, "compromised agent Hysteria session closed");
+        }
+        Err(error) => warn!(%error, %agent_id, "compromised agent remains on disconnect retry list"),
+    }
+}
+
+async fn retry_compromised_kicks(state: AppState) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+    loop {
+        interval.tick().await;
+        let pending: Vec<_> = state.agent_security.lock().await.compromised()
+            .into_iter()
+            .filter(|record| !record.transport_disconnected)
+            .map(|record| record.agent_id)
+            .collect();
+        for agent_id in pending {
+            disconnect_compromised_agent(&state, agent_id).await;
+        }
+    }
 }
 
 async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
@@ -562,7 +847,8 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
             tracing::warn!(%peer, "discarded malformed Kazik packet");
             continue;
         };
-        let authorized = state
+        let compromised = state.agent_security.lock().await.is_compromised(&envelope.agent_id);
+        let authorized = !compromised && state
             .agent_credentials
             .lock()
             .await
@@ -573,18 +859,40 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
             continue;
         }
         if let KazikBody::Ack(ack) = &envelope.body {
-            if matches!(
-                ack.disposition,
-                AckDisposition::Applied | AckDisposition::Duplicate
-            ) {
+            if matches!(ack.disposition, AckDisposition::Applied | AckDisposition::Duplicate | AckDisposition::Rejected) {
                 let mut pending = state.pending_commands.lock().await;
                 if let Some(commands) = pending.get_mut(&envelope.agent_id) {
                     commands.retain(|command| command.message_id != ack.acknowledged_message_id);
                 }
+                if let Some(status) = state.command_statuses.lock().await.get_mut(&ack.acknowledged_message_id) {
+                    status.status = if matches!(ack.disposition, AckDisposition::Rejected) { "rejected" } else { "applied" };
+                    status.detail = ack.detail.clone();
+                }
             }
-            // ACKs terminate a delivery exchange; ACKing an ACK would create an infinite loop.
+            // Agent stores command-result ACKs in SQLite. Confirm receipt; the agent does not
+            // ACK this reply, so there is no ACK loop.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as i64)
+                .unwrap_or_default();
+            let reply = KazikEnvelope::new(
+                envelope.agent_id,
+                envelope.transport_credential.clone(),
+                now,
+                KazikBody::Ack(Acknowledgement {
+                    acknowledged_message_id: envelope.message_id,
+                    disposition: AckDisposition::Accepted,
+                    detail: None,
+                }),
+            );
+            if let Ok(packet) = reply.encode_hfsp(0, sequence) {
+                if let Err(error) = socket.send_to(&packet, peer).await {
+                    warn!(%error, %peer, "could not confirm agent command ACK");
+                }
+            }
             continue;
         }
+        let mut compromise_to_kick = None;
         let disposition = match &envelope.body {
             KazikBody::Telemetry { events } => {
                 let stored = match state.telemetry_store.lock().await.persist(envelope.agent_id, events) {
@@ -595,6 +903,13 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
                     }
                 };
                 tracing::info!(agent_id = %envelope.agent_id, received = events.len(), stored, "Kazik telemetry persisted");
+                if let Some(incident) = events.iter().find(|event| AgentSecurityStore::is_confirmed_escape(event)) {
+                    if let Err(error) = mark_agent_compromised(&state, envelope.agent_id, incident).await {
+                        tracing::error!(%error, agent_id = %envelope.agent_id, "could not persist compromise state; leaving incident unacknowledged");
+                        continue;
+                    }
+                    compromise_to_kick = Some(envelope.agent_id);
+                }
                 AckDisposition::Accepted
             }
             KazikBody::Heartbeat { .. } => AckDisposition::Accepted,
@@ -627,6 +942,11 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
             }
             Err(error) => tracing::error!(%error, "could not encode Kazik ACK"),
         }
+        if let Some(agent_id) = compromise_to_kick {
+            // ACK the durable incident before closing the QUIC session so the agent
+            // can stop retrying and execute its locally armed emergency response.
+            disconnect_compromised_agent(&state, agent_id).await;
+        }
         if matches!(envelope.body, KazikBody::Heartbeat { .. }) {
             send_next_command(&socket, peer, &state, envelope.agent_id).await;
         }
@@ -639,6 +959,9 @@ async fn send_next_command(
     state: &AppState,
     agent_id: Uuid,
 ) {
+    if state.agent_security.lock().await.is_compromised(&agent_id) {
+        return;
+    }
     let command = state
         .pending_commands
         .lock()
@@ -661,7 +984,7 @@ async fn send_next_command(
 
 fn render_install_script(token: &str, center_url: &str) -> String {
     let mut script = format!(
-        "#!/bin/sh\nset -eu\nif [ \"$(id -u)\" -eq 0 ]; then SUDO=''; else SUDO='sudo -n'; fi\nensure_docker() {{\n  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then return; fi\n  [ -r /etc/os-release ] || {{ echo 'Cannot identify Linux distribution' >&2; exit 1; }}\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        echo 'Regional Ubuntu mirror configured; switching to archive.ubuntu.com before package update' >&2\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2\n      $SUDO systemctl enable --now docker\n      ;;\n    fedora)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    rhel|centos|rocky|almalinux)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    arch|manjaro)\n      $SUDO pacman -Sy --noconfirm docker docker-compose\n      $SUDO systemctl enable --now docker\n      ;;\n    alpine)\n      $SUDO apk add docker docker-cli-compose\n      $SUDO rc-update add docker default\n      $SUDO service docker start\n      ;;\n    *) echo \"Unsupported Linux distribution: $ID\" >&2; exit 1 ;;\n  esac\n  docker compose version >/dev/null\n}}\n$SUDO install -d -m 0700 /etc/honeyforge\n$SUDO install -m 0755 /tmp/hf-agent-bootstrap /usr/local/bin/hf-agent\nif [ -f /tmp/hf-kozyavka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-kozyavka-image.tar\n  rm -f /tmp/hf-kozyavka-image.tar\nfi\nprintf '%s' '{token}' | $SUDO tee /etc/honeyforge/enrollment-token >/dev/null\nif command -v systemctl >/dev/null 2>&1; then\n  $SUDO tee /etc/systemd/system/hf-agent.service >/dev/null <<'UNIT'\n[Unit]\nDescription=HoneyForge agent\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nEnvironment=HF_CENTER_URL={center_url}\nEnvironment=HF_KOZYAVKA_IMAGE=honeyforge-low:local\nExecStart=/usr/local/bin/hf-agent\nRestart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\nUNIT\n  $SUDO systemctl daemon-reload\n  $SUDO systemctl enable --now hf-agent.service\nelif command -v rc-update >/dev/null 2>&1; then\n  $SUDO tee /etc/init.d/hf-agent >/dev/null <<'OPENRC'\n#!/sbin/openrc-run\nname=\"HoneyForge agent\"\ncommand=\"/usr/local/bin/hf-agent\"\ncommand_background=\"yes\"\npidfile=\"/run/hf-agent.pid\"\nexport HF_CENTER_URL={center_url}\nexport HF_KOZYAVKA_IMAGE=honeyforge-low:local\nOPENRC\n  $SUDO chmod 0755 /etc/init.d/hf-agent\n  $SUDO rc-update add hf-agent default\n  $SUDO rc-service hf-agent start\nelse\n  echo 'Unsupported init system: systemd or OpenRC is required' >&2\n  exit 1\nfi\nrm -f /tmp/hf-agent-bootstrap\n"
+        "#!/bin/sh\nset -eu\nif [ \"$(id -u)\" -eq 0 ]; then SUDO=''; else SUDO='sudo -n'; fi\nensure_docker() {{\n  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then return; fi\n  [ -r /etc/os-release ] || {{ echo 'Cannot identify Linux distribution' >&2; exit 1; }}\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        echo 'Regional Ubuntu mirror configured; switching to archive.ubuntu.com before package update' >&2\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 bpftrace nftables\n      $SUDO systemctl enable --now docker\n      ;;\n    fedora)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    rhel|centos|rocky|almalinux)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    arch|manjaro)\n      $SUDO pacman -Sy --noconfirm docker docker-compose\n      $SUDO systemctl enable --now docker\n      ;;\n    alpine)\n      $SUDO apk add docker docker-cli-compose\n      $SUDO rc-update add docker default\n      $SUDO service docker start\n      ;;\n    *) echo \"Unsupported Linux distribution: $ID\" >&2; exit 1 ;;\n  esac\n  docker compose version >/dev/null\n}}\nif ! command -v bpftrace >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1; then\n  if [ ! -r /etc/os-release ]; then echo 'Cannot identify Linux distribution' >&2; exit 1; fi\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y bpftrace nftables\n      ;;\n    *) echo 'Install bpftrace and nftables for HoneyForge security monitoring' >&2 ;;\n  esac\nfi\n$SUDO install -d -m 0700 /etc/honeyforge\n$SUDO install -m 0755 /tmp/hf-agent-bootstrap /usr/local/bin/hf-agent\nif [ -f /tmp/hf-kozyavka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-kozyavka-image.tar\n  rm -f /tmp/hf-kozyavka-image.tar\nfi\nprintf '%s' '{token}' | $SUDO tee /etc/honeyforge/enrollment-token >/dev/null\nif command -v systemctl >/dev/null 2>&1; then\n  $SUDO tee /etc/systemd/system/hf-agent.service >/dev/null <<'UNIT'\n[Unit]\nDescription=HoneyForge agent\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nEnvironment=HF_CENTER_URL={center_url}\nEnvironment=HF_KOZYAVKA_IMAGE=honeyforge-low:local\nExecStart=/usr/local/bin/hf-agent\nRestart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\nUNIT\n  $SUDO systemctl daemon-reload\n  $SUDO systemctl enable --now hf-agent.service\nelif command -v rc-update >/dev/null 2>&1; then\n  $SUDO tee /etc/init.d/hf-agent >/dev/null <<'OPENRC'\n#!/sbin/openrc-run\nname=\"HoneyForge agent\"\ncommand=\"/usr/local/bin/hf-agent\"\ncommand_background=\"yes\"\npidfile=\"/run/hf-agent.pid\"\nexport HF_CENTER_URL={center_url}\nexport HF_KOZYAVKA_IMAGE=honeyforge-low:local\nOPENRC\n  $SUDO chmod 0755 /etc/init.d/hf-agent\n  $SUDO rc-update add hf-agent default\n  $SUDO rc-service hf-agent start\nelse\n  echo 'Unsupported init system: systemd or OpenRC is required' >&2\n  exit 1\nfi\nrm -f /tmp/hf-agent-bootstrap\n"
     );
     script.push_str(
         "\nif [ -f /tmp/hf-high-ubuntu-ssh.tar.gz ]; then\n  $SUDO install -d -m 0755 /usr/local/lib/honeyforge\n  $SUDO tar -xzf /tmp/hf-high-ubuntu-ssh.tar.gz -C /usr/local/lib/honeyforge\n  $SUDO chmod -R a-w /usr/local/lib/honeyforge/high-ubuntu-ssh/cloud-init\n  $SUDO find /usr/local/lib/honeyforge/high-ubuntu-ssh/scripts -type f -exec chmod 0755 {} \\;\n  rm -f /tmp/hf-high-ubuntu-ssh.tar.gz\nfi\nif [ -f /tmp/hf-initial-command.json ]; then\n  $SUDO install -d -m 0700 /var/lib/honeyforge/inbox\n  $SUDO install -m 0600 /tmp/hf-initial-command.json /var/lib/honeyforge/inbox/initial-high.json\n  rm -f /tmp/hf-initial-command.json\nfi\n",
@@ -866,6 +1189,9 @@ mod tests {
     fn accepts_ipv4_and_raw_ipv6_with_password() {
         assert!(validate_bootstrap_request(&password_request("203.0.113.42")).is_ok());
         assert!(validate_bootstrap_request(&password_request("2001:db8::42")).is_ok());
+        assert_eq!(normalize_target_host("2001:DB8::42").as_deref(), Some("2001:db8::42"));
+        assert_eq!(normalize_target_host("VPS.Example.Test.").as_deref(), Some("vps.example.test"));
+        assert!(normalize_target_host("bad host").is_none());
     }
 
     #[test]

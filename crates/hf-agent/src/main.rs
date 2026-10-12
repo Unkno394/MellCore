@@ -8,6 +8,9 @@ use std::{
 };
 
 mod sandbox;
+mod emergency;
+mod security_monitor;
+mod security_policy;
 mod telemetry;
 
 use anyhow::Context;
@@ -100,6 +103,81 @@ impl SharedTcpDeployment {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatcherConfig {
+    version: u8,
+    listeners: Vec<DispatcherListener>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatcherListener {
+    listen: SocketAddr,
+    targets: Vec<DispatcherTarget>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatcherTarget {
+    trap_id: uuid::Uuid,
+    address: SocketAddr,
+    weight: u8,
+}
+
+impl DispatcherConfig {
+    /// Remove every route to this trap. Remaining weights keep their relative proportions.
+    fn without_trap(mut self, trap_id: uuid::Uuid) -> anyhow::Result<Option<Self>> {
+        anyhow::ensure!(self.version == 1, "unsupported Dispatcher config version");
+        anyhow::ensure!(!self.listeners.is_empty(), "Dispatcher has no listeners");
+        let mut seen = std::collections::HashSet::new();
+        for listener in &self.listeners {
+            anyhow::ensure!(seen.insert(listener.listen), "duplicate Dispatcher listener");
+            anyhow::ensure!(!listener.targets.is_empty(), "Dispatcher listener has no targets");
+            anyhow::ensure!(listener.targets.iter().map(|target| u32::from(target.weight)).sum::<u32>() == 100,
+                "Dispatcher target weights do not total 100");
+            anyhow::ensure!(listener.targets.iter().all(|target| target.weight > 0 && target.address.ip().is_loopback()),
+                "invalid Dispatcher target");
+        }
+        let mut changed = false;
+        for listener in &mut self.listeners {
+            let before = listener.targets.len();
+            listener.targets.retain(|target| target.trap_id != trap_id);
+            if listener.targets.len() != before {
+                changed = true;
+                if !listener.targets.is_empty() {
+                    normalize_dispatcher_weights(&mut listener.targets)?;
+                }
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        self.listeners.retain(|listener| !listener.targets.is_empty());
+        Ok(Some(self))
+    }
+}
+
+fn normalize_dispatcher_weights(targets: &mut [DispatcherTarget]) -> anyhow::Result<()> {
+    let total: u32 = targets.iter().map(|target| u32::from(target.weight)).sum();
+    anyhow::ensure!(total > 0 && targets.len() <= 100, "invalid Dispatcher target weights");
+    let mut assigned = 0_u32;
+    let mut remainder = Vec::with_capacity(targets.len());
+    for (index, target) in targets.iter_mut().enumerate() {
+        let scaled = u32::from(target.weight) * 100;
+        let weight = scaled / total;
+        anyhow::ensure!(weight > 0, "Dispatcher target weight would become zero");
+        target.weight = weight as u8;
+        assigned += weight;
+        remainder.push((index, scaled % total));
+    }
+    remainder.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    for (index, _) in remainder.into_iter().take((100 - assigned) as usize) {
+        targets[index].weight += 1;
+    }
+    Ok(())
+}
+
 impl ComposeProjectStore {
     fn new(state_dir: &Path) -> Self {
         Self {
@@ -159,6 +237,8 @@ impl ComposeProjectStore {
         if completed.exists() {
             return Ok(serde_json::from_slice(&fs::read(completed)?)?);
         }
+        let deferred_remove = matches!(&command, AgentCommand::RemoveTrap { .. })
+            && self.root.join(trap_id.to_string()).join("compose.yaml").is_file();
         let result = match command {
             AgentCommand::DeployKozyavka(deployment) => {
                 ensure_docker_runtime()?;
@@ -185,7 +265,14 @@ impl ComposeProjectStore {
                 self.reconcile_tcp_port_group(group, kozyavka_image, pritvoryashka_image, agent_id)
             }
             AgentCommand::StopTrap { .. } => self.compose_down(trap_id, false),
-            AgentCommand::RemoveTrap { .. } => self.compose_down(trap_id, true),
+            AgentCommand::RemoveTrap { .. } if deferred_remove => self.prepare_remove(trap_id),
+            AgentCommand::RemoveTrap { .. } => {
+                let high_root = std::env::var_os("HF_HIGH_ROOT")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/var/lib/honeyforge/high"));
+                anyhow::ensure!(high_root.join(trap_id.to_string()).is_dir(), "unknown trap {trap_id}");
+                LibvirtSandboxManager::new(default_recipe_dir()).reset(trap_id)
+            }
         };
         let result = match result {
             Ok(()) => CommandResult {
@@ -201,7 +288,7 @@ impl ComposeProjectStore {
                 detail: error.to_string(),
             },
         };
-        if result.success {
+        if result.success && !deferred_remove {
             fs::create_dir_all(completed.parent().expect("command parent"))?;
             atomic_write(&completed, &serde_json::to_vec(&result)?)?;
         }
@@ -250,7 +337,7 @@ impl ComposeProjectStore {
             )?;
         }
         let compose = format!(
-            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    command: [\"--config\", \"/etc/honeyforge/config.json\"]\n    ports:\n      - \"{}:{}:{}/tcp\"\n    volumes:\n      - ./config.json:/etc/honeyforge/config.json:ro\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    init: true\n",
+            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    command: [\"--config\", \"/etc/honeyforge/config.json\"]\n    ports:\n      - \"{}:{}:{}/tcp\"\n    volumes:\n      - ./config.json:/etc/honeyforge/config.json:ro\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: 128m\n    cpus: 0.50\n    pids_limit: 64\n    ulimits:\n      nofile:\n        soft: 256\n        hard: 256\n    init: true\n",
             deployment.trap_id.simple(),
             image,
             deployment.publish_address,
@@ -274,7 +361,7 @@ impl ComposeProjectStore {
         if deployment.trap_id.is_nil()
             || deployment.server_id.is_nil()
             || deployment.host_port == 0
-            || !(1..=10_000).contains(&deployment.max_connections)
+            || !(1..=128).contains(&deployment.max_connections)
             || deployment.hostname.is_empty()
             || deployment.hostname.len() > 64
             || !deployment
@@ -326,7 +413,7 @@ impl ComposeProjectStore {
             &serde_json::to_vec_pretty(&container_config)?,
         )?;
         let mut compose = format!(
-            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    ports:\n      - \"{}:{}:2222/tcp\"\n    volumes:\n      - ./pritvoryashka.json:/etc/honeyforge/pritvoryashka.json:ro\n      - ./runtime:/var/lib/pritvoryashka\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    init: true\n",
+            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    ports:\n      - \"{}:{}:2222/tcp\"\n    volumes:\n      - ./pritvoryashka.json:/etc/honeyforge/pritvoryashka.json:ro\n      - ./runtime:/var/lib/pritvoryashka\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: 512m\n    cpus: 1.0\n    pids_limit: 256\n    ulimits:\n      nofile:\n        soft: 1024\n        hard: 1024\n    init: true\n",
             deployment.trap_id.simple(),
             image,
             deployment.publish_address,
@@ -486,6 +573,95 @@ impl ComposeProjectStore {
         Ok(())
     }
 
+    fn prepare_remove(&self, trap_id: uuid::Uuid) -> anyhow::Result<()> {
+        let project_dir = self.root.join(trap_id.to_string());
+        anyhow::ensure!(project_dir.join("compose.yaml").is_file(), "unknown Compose trap {trap_id}");
+        let manifest: serde_json::Value = serde_json::from_slice(&fs::read(project_dir.join("manifest.json"))?)?;
+        let shared_backend = manifest["publish_address"].as_str() == Some("127.0.0.1");
+        let previous_dispatcher = self.detach_dispatcher_target(trap_id, shared_backend)?;
+        if let Err(error) = self.compose(&project_dir, trap_id, ["stop"]) {
+            if let Some(previous) = previous_dispatcher {
+                // `compose stop` may have stopped the container despite returning an error.
+                // Restore the backend before publishing its old Dispatcher route again.
+                if let Err(restart) = self.compose(&project_dir, trap_id, ["up", "-d"]) {
+                    return Err(anyhow::anyhow!(
+                        "could not stop trap ({error}); backend restart failed ({restart}); Dispatcher route remains detached"
+                    ));
+                }
+                if let Err(rollback) = self.restore_dispatcher(&previous) {
+                    return Err(anyhow::anyhow!(
+                        "could not stop trap ({error}); Dispatcher rollback also failed: {rollback}"
+                    ));
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn detach_dispatcher_target(&self, trap_id: uuid::Uuid, shared_backend: bool) -> anyhow::Result<Option<Vec<u8>>> {
+        let path = Path::new("/etc/honeyforge/dispatcher.json");
+        let previous = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if shared_backend {
+                    let status = Command::new("systemctl")
+                        .args(["is-active", "--quiet", "hf-dispatcher.service"])
+                        .status()?;
+                    anyhow::ensure!(!status.success(),
+                        "Dispatcher is active without its configuration; refusing to stop a shared trap");
+                }
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let config: DispatcherConfig = serde_json::from_slice(&previous)
+            .context("invalid Dispatcher configuration; refusing to remove a trap")?;
+        let Some(updated) = config.without_trap(trap_id)? else {
+            if shared_backend {
+                // A previous attempt may have written the new config before a crash. Restart
+                // before stopping the backend so no process keeps serving stale routes.
+                run_program("systemctl", &["restart", "hf-dispatcher.service"])?;
+                run_program("systemctl", &["is-active", "--quiet", "hf-dispatcher.service"])?;
+            }
+            return Ok(None);
+        };
+        let transition = if updated.listeners.is_empty() {
+            // No public routes remain. Stop the listener and prevent it from starting on boot.
+            run_program("systemctl", &["disable", "--now", "hf-dispatcher.service"])
+                .and_then(|_| fs::remove_file(path).map_err(Into::into))
+        } else {
+            atomic_write(path, &serde_json::to_vec_pretty(&updated)?)?;
+            run_program("systemctl", &["restart", "hf-dispatcher.service"])
+                .and_then(|_| run_program("systemctl", &["is-active", "--quiet", "hf-dispatcher.service"]))
+        };
+        if let Err(error) = transition {
+            if let Err(rollback) = self.restore_dispatcher(&previous) {
+                return Err(anyhow::anyhow!(
+                    "Dispatcher update failed ({error}); rollback also failed: {rollback}"
+                ));
+            }
+            return Err(error);
+        }
+        tracing::info!(%trap_id, "Dispatcher route removed before stopping trap");
+        Ok(Some(previous))
+    }
+
+    fn restore_dispatcher(&self, previous: &[u8]) -> anyhow::Result<()> {
+        atomic_write(Path::new("/etc/honeyforge/dispatcher.json"), previous)?;
+        run_program("systemctl", &["enable", "--now", "hf-dispatcher.service"])?;
+        run_program("systemctl", &["restart", "hf-dispatcher.service"])
+    }
+
+    fn finish_remove(&self, trap_id: uuid::Uuid, result: &CommandResult) -> anyhow::Result<()> {
+        // The caller has put final Low/Middle events into SQLite before `down` removes the
+        // Docker container and the Middle runtime directory.
+        self.compose_down(trap_id, true)?;
+        let completed = self.root.join("commands").join(format!("{}.json", result.command_id));
+        fs::create_dir_all(completed.parent().expect("command parent"))?;
+        atomic_write(&completed, &serde_json::to_vec(result)?)
+    }
+
     fn compose<const N: usize>(
         &self,
         project_dir: &Path,
@@ -545,6 +721,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     fs::create_dir_all(&args.state_dir)?;
+    if let Err(error) = emergency::install(&args.state_dir) {
+        if emergency::armed() {
+            return Err(error.context("armed emergency service could not be installed"));
+        }
+        tracing::warn!(%error, "emergency service installation failed; monitoring will continue unarmed");
+    }
     let identity_path = args.state_dir.join("identity.json");
     let identity = match load_identity(&identity_path)? {
         Some(identity) => identity,
@@ -582,13 +764,19 @@ async fn main() -> anyhow::Result<()> {
     let compose_projects = ComposeProjectStore::new(&args.state_dir);
     fs::create_dir_all(&compose_projects.root)?;
     if let Some(command_file) = args.command_file {
+        anyhow::ensure!(emergency::pending(&args.state_dir)?.is_none(), "confirmed security incident blocks local commands");
         let command: AgentCommand = serde_json::from_slice(&fs::read(command_file)?)?;
-        let result = compose_projects.apply(
+        let deferred_remove = compose_remove_id(&compose_projects, &command);
+        let mut result = compose_projects.apply(
             command,
             &args.kozyavka_image,
             &args.pritvoryashka_image,
             identity.agent_id,
         )?;
+        if let Some(trap_id) = deferred_remove.filter(|_| result.success) {
+            let mut outbox = SqliteKazikOutbox::open(args.state_dir.join("kazik-outbox.sqlite"))?;
+            result = finalize_removed_trap(&compose_projects, &args.state_dir, &identity, &mut outbox, trap_id, result)?;
+        }
         println!("{}", serde_json::to_string(&result)?);
         if !result.success {
             anyhow::bail!("command application failed: {}", result.detail);
@@ -623,13 +811,15 @@ async fn main() -> anyhow::Result<()> {
         .await;
     }
     loop {
-        process_inbox(
-            &inbox,
-            &compose_projects,
-            &args.kozyavka_image,
-            &args.pritvoryashka_image,
-            identity.agent_id,
-        );
+        if emergency::pending(&args.state_dir)?.is_none() {
+            process_inbox(
+                &inbox,
+                &compose_projects,
+                &args.kozyavka_image,
+                &args.pritvoryashka_image,
+                &identity,
+            );
+        }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
@@ -644,24 +834,45 @@ async fn run_kazik_hysteria_loop(
     socks: SocketAddr,
     center_udp: SocketAddr,
 ) -> anyhow::Result<()> {
-    let transport = Arc::new(HysteriaSocks5UdpTransport::connect(socks, center_udp).await?);
-    let sender = FailoverSender::new(vec![transport.clone()])
-        .map_err(|error| anyhow::anyhow!("Kazik transport setup failed: {error}"))?;
+    let mut transport: Option<Arc<HysteriaSocks5UdpTransport>> = None;
+    let mut sender: Option<FailoverSender> = None;
+    let mut reconnect = tokio::time::interval(Duration::from_secs(5));
+    let mut outbox_retry = tokio::time::interval(Duration::from_secs(5));
     let mut outbox = SqliteKazikOutbox::open(state_dir.join("kazik-outbox.sqlite"))?;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
     let mut telemetry_poll = tokio::time::interval(Duration::from_secs(5));
+    let mut emergency_tick = tokio::time::interval(Duration::from_secs(1));
+    let existing_incident = emergency::pending(state_dir)?;
+    let mut incident_active = existing_incident.is_some();
+    let mut pending_emergency = existing_incident.filter(|incident| incident.response_armed).map(|incident| PendingEmergency {
+        message_id: incident.message_id,
+        began: std::time::Instant::now(),
+        last_attempt: None,
+    });
+    let incident_flag = Arc::new(std::sync::atomic::AtomicBool::new(incident_active));
+    let (security_tx, mut security_rx) = tokio::sync::mpsc::channel(256);
+    tokio::spawn(security_monitor::run(projects.root.clone(), security_tx));
+    let (confirmed_tx, mut confirmed_rx) = tokio::sync::mpsc::channel(8);
+    let validation_slots = Arc::new(tokio::sync::Semaphore::new(4));
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<CommandJob>(32);
     let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<CommandExecution>(32);
     let worker_projects = projects.clone();
     let worker_kozyavka_image = kozyavka_image.to_owned();
     let worker_pritvoryashka_image = pritvoryashka_image.to_owned();
     let worker_agent_id = identity.agent_id;
+    let worker_incident_flag = incident_flag.clone();
     tokio::spawn(async move {
         while let Some(job) = command_rx.recv().await {
+            let removed_trap = compose_remove_id(&worker_projects, &job.command);
             let projects = worker_projects.clone();
             let kozyavka_image = worker_kozyavka_image.clone();
             let pritvoryashka_image = worker_pritvoryashka_image.clone();
+            let incident_flag = worker_incident_flag.clone();
             let result = tokio::task::spawn_blocking(move || {
+                anyhow::ensure!(
+                    !incident_flag.load(std::sync::atomic::Ordering::SeqCst),
+                    "confirmed security incident blocks new commands"
+                );
                 projects.apply(
                     job.command,
                     &kozyavka_image,
@@ -672,9 +883,12 @@ async fn run_kazik_hysteria_loop(
             .await
             .map_err(|error| anyhow::anyhow!("command worker panicked: {error}"))
             .and_then(|result| result);
+            let (completion, completion_rx) = tokio::sync::oneshot::channel();
             if result_tx
                 .send(CommandExecution {
                     message_id: job.message_id,
+                    removed_trap,
+                    completion: removed_trap.map(|_| completion),
                     result,
                 })
                 .await
@@ -682,27 +896,159 @@ async fn run_kazik_hysteria_loop(
             {
                 break;
             }
+            if removed_trap.is_some() {
+                let _ = completion_rx.await;
+            }
         }
     });
-    tracing::info!(agent_id = %identity.agent_id, transport = transport.name(), "Kazik Hysteria loop started");
+    tracing::info!(agent_id = %identity.agent_id, "Kazik loop and independent security monitor started");
     loop {
-        process_inbox(
-            inbox,
-            projects,
-            kozyavka_image,
-            pritvoryashka_image,
-            identity.agent_id,
-        );
+        if !incident_active {
+            process_inbox(
+                inbox,
+                projects,
+                kozyavka_image,
+                pritvoryashka_image,
+                &identity,
+            );
+        }
+        let receiving_transport = transport.clone();
         tokio::select! {
+            _ = outbox_retry.tick(), if sender.is_some() => {
+                if let Some(sender) = sender.as_ref() {
+                    if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
+                        tracing::warn!(%error, "Kazik outbox delivery retry failed");
+                    }
+                }
+            }
+            _ = reconnect.tick(), if transport.is_none() => {
+                match HysteriaSocks5UdpTransport::connect(socks, center_udp).await {
+                    Ok(connected) => {
+                        let connected = Arc::new(connected);
+                        match FailoverSender::new(vec![connected.clone()]) {
+                            Ok(ready) => {
+                                tracing::info!(transport = connected.name(), "Kazik transport connected");
+                                transport = Some(connected);
+                                sender = Some(ready);
+                                if let Some(sender) = sender.as_ref() {
+                                    if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
+                                        tracing::warn!(%error, "queued Kazik packets await retry");
+                                    }
+                                }
+                            }
+                            Err(error) => tracing::warn!(%error, "Kazik transport setup failed"),
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "Hysteria SOCKS5 is unavailable; security monitor remains active"),
+                }
+            }
+            Some(observation) = security_rx.recv() => {
+                if !incident_active {
+                    if let Some(candidate) = observation.candidate {
+                        if let Ok(permit) = validation_slots.clone().try_acquire_owned() {
+                            let tx = confirmed_tx.clone();
+                            let trap_root = projects.root.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                match security_monitor::confirm_escape(&candidate, &trap_root).await {
+                                    Ok(Some(event)) => { let _ = tx.send(event).await; }
+                                    Ok(None) => {}
+                                    Err(error) => tracing::warn!(%error, "escape confirmation failed; host remains online"),
+                                }
+                            });
+                        } else {
+                            tracing::warn!("escape validation slots are full; candidate was not validated");
+                        }
+                    }
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_millis() as i64;
+                outbox.enqueue(KazikEnvelope::new(
+                    identity.agent_id,
+                    identity.transport_credential.clone(),
+                    now,
+                    KazikBody::Telemetry { events: vec![observation.event] },
+                ))?;
+                if let Some(sender) = sender.as_ref() {
+                    if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
+                        tracing::warn!(%error, "security event remains in SQLite outbox");
+                    }
+                }
+            }
+            Some(event) = confirmed_rx.recv() => {
+                if !incident_active {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_millis() as i64;
+                    let envelope = KazikEnvelope::new(
+                        identity.agent_id,
+                        identity.transport_credential.clone(),
+                        now,
+                        KazikBody::Telemetry { events: vec![event.clone()] },
+                    );
+                    let message_id = envelope.message_id;
+                    outbox.enqueue(envelope)?;
+                    let response_armed = emergency::armed();
+                    emergency::record(state_dir, &event, message_id)?;
+                    incident_active = true;
+                    incident_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if response_armed {
+                        pending_emergency = Some(PendingEmergency {
+                            message_id,
+                            began: std::time::Instant::now(),
+                            last_attempt: None,
+                        });
+                    }
+                    tracing::error!(trap_id = %event.trap_id, %message_id, "confirmed escape recorded; alert queued before emergency response");
+                    if let Some(sender) = sender.as_ref() {
+                        if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
+                            tracing::warn!(%error, "confirmed escape alert remains in SQLite outbox");
+                        }
+                    }
+                }
+            }
+            _ = emergency_tick.tick(), if pending_emergency.is_some() => {
+                let should_attempt = pending_emergency.as_ref().is_some_and(|pending| {
+                    pending.began.elapsed() >= Duration::from_secs(15)
+                        && pending.last_attempt.is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
+                });
+                if should_attempt {
+                    if let Some(pending) = pending_emergency.as_mut() {
+                        pending.last_attempt = Some(std::time::Instant::now());
+                    }
+                    match emergency::start(state_dir) {
+                        Ok(()) => pending_emergency = None,
+                        Err(error) => tracing::error!(%error, "could not start emergency service; will retry"),
+                    }
+                }
+            }
             Some(execution) = result_rx.recv() => {
-                let (disposition, detail) = match execution.result {
+                let mut result = execution.result;
+                let finalization = match (execution.removed_trap, &result) {
+                    (Some(trap_id), Ok(command_result)) if command_result.success => {
+                        Some((trap_id, command_result.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((trap_id, command_result)) = finalization {
+                    result = finalize_removed_trap(
+                        projects, state_dir, &identity, &mut outbox, trap_id, command_result,
+                    );
+                }
+                if let Some(completion) = execution.completion {
+                    let _ = completion.send(());
+                }
+                let (disposition, detail) = match result {
                     Ok(result) if result.success => (AckDisposition::Applied, None),
                     Ok(result) => (AckDisposition::Rejected, Some(result.detail)),
                     Err(error) => (AckDisposition::Rejected, Some(error.to_string())),
                 };
                 enqueue_ack(&mut outbox, &identity, execution.message_id, disposition, detail)?;
-                if let Err(error) = send_pending_once(&mut outbox, &sender, 64).await {
-                    tracing::warn!(%error, "command result ACK remains in SQLite outbox");
+                if let Some(sender) = sender.as_ref() {
+                    if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
+                        tracing::warn!(%error, "command result ACK remains in SQLite outbox");
+                    }
                 }
             }
             _ = telemetry_poll.tick() => {
@@ -714,8 +1060,10 @@ async fn run_kazik_hysteria_loop(
                 ) {
                     Ok(count) if count > 0 => {
                         tracing::info!(events = count, "trap telemetry queued for Center");
-                        if let Err(error) = send_pending_once(&mut outbox, &sender, 64).await {
-                            tracing::warn!(%error, "trap telemetry remains in durable outbox");
+                        if let Some(sender) = sender.as_ref() {
+                            if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
+                                tracing::warn!(%error, "trap telemetry remains in durable outbox");
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -739,11 +1087,18 @@ async fn run_kazik_hysteria_loop(
                         active_trap_count,
                     }},
                 ))?;
-                if let Err(error) = send_pending_once(&mut outbox, &sender, 64).await {
-                    tracing::warn!(%error, "Kazik pending packets remain in SQLite outbox");
+                if let Some(sender) = sender.as_ref() {
+                    if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
+                        tracing::warn!(%error, "Kazik pending packets remain in SQLite outbox");
+                    }
                 }
             }
-            received = transport.receive() => match received {
+            received = async move {
+                match receiving_transport {
+                    Some(transport) => transport.receive().await,
+                    None => std::future::pending().await,
+                }
+            } => match received {
                 Ok(packet) => match KazikEnvelope::decode_hfsp(&packet) {
                     Ok((envelope, _, _)) if envelope.agent_id == identity.agent_id
                         && envelope.transport_credential == identity.transport_credential => {
@@ -751,15 +1106,21 @@ async fn run_kazik_hysteria_loop(
                             KazikBody::Ack(ack)
                                 if matches!(ack.disposition, AckDisposition::Accepted | AckDisposition::Applied | AckDisposition::Duplicate) => {
                                     outbox.acknowledge(ack.acknowledged_message_id)?;
+                                    if pending_emergency.as_ref().is_some_and(|pending| pending.message_id == ack.acknowledged_message_id) {
+                                        match emergency::start(state_dir) {
+                                            Ok(()) => pending_emergency = None,
+                                            Err(error) => tracing::error!(%error, "alert acknowledged but emergency service could not start"),
+                                        }
+                                    }
                                 }
                             KazikBody::Command { command } => {
-                                if command_tx.try_send(CommandJob { message_id: envelope.message_id, command }).is_err() {
+                                if incident_active || command_tx.try_send(CommandJob { message_id: envelope.message_id, command }).is_err() {
                                     enqueue_ack(
                                         &mut outbox,
                                         &identity,
                                         envelope.message_id,
                                         AckDisposition::Rejected,
-                                        Some("agent command queue is full or unavailable".into()),
+                                        Some("agent is handling a confirmed security incident, or command queue is unavailable".into()),
                                     )?;
                                 }
                             }
@@ -780,7 +1141,8 @@ async fn run_kazik_hysteria_loop(
                 },
                 Err(error) => {
                     tracing::warn!(%error, "Kazik transport receive failed; retrying");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    transport = None;
+                    sender = None;
                 }
             }
         }
@@ -792,8 +1154,16 @@ struct CommandJob {
     command: AgentCommand,
 }
 
+struct PendingEmergency {
+    message_id: uuid::Uuid,
+    began: std::time::Instant,
+    last_attempt: Option<std::time::Instant>,
+}
+
 struct CommandExecution {
     message_id: uuid::Uuid,
+    removed_trap: Option<uuid::Uuid>,
+    completion: Option<tokio::sync::oneshot::Sender<()>>,
     result: anyhow::Result<CommandResult>,
 }
 
@@ -1083,12 +1453,36 @@ fn run_program(program: &str, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn compose_remove_id(projects: &ComposeProjectStore, command: &AgentCommand) -> Option<uuid::Uuid> {
+    match command {
+        AgentCommand::RemoveTrap { trap_id, .. }
+            if projects.root.join(trap_id.to_string()).join("compose.yaml").is_file() => Some(*trap_id),
+        _ => None,
+    }
+}
+
+fn finalize_removed_trap(
+    projects: &ComposeProjectStore,
+    state_dir: &Path,
+    identity: &AgentIdentity,
+    outbox: &mut SqliteKazikOutbox,
+    trap_id: uuid::Uuid,
+    result: CommandResult,
+) -> anyhow::Result<CommandResult> {
+    let count = telemetry::collect_new_events(&projects.root, state_dir, identity, outbox)?;
+    if count > 0 {
+        tracing::info!(events = count, %trap_id, "final trap telemetry queued before removal");
+    }
+    projects.finish_remove(trap_id, &result)?;
+    Ok(result)
+}
+
 fn process_inbox(
     inbox: &Path,
     projects: &ComposeProjectStore,
     kozyavka_image: &str,
     pritvoryashka_image: &str,
-    agent_id: uuid::Uuid,
+    identity: &AgentIdentity,
 ) {
     let entries = match fs::read_dir(inbox) {
         Ok(entries) => entries,
@@ -1106,7 +1500,15 @@ fn process_inbox(
             .map_err(anyhow::Error::from)
             .and_then(|bytes| Ok(serde_json::from_slice::<AgentCommand>(&bytes)?))
             .and_then(|command| {
-                projects.apply(command, kozyavka_image, pritvoryashka_image, agent_id)
+                let deferred_remove = compose_remove_id(projects, &command);
+                let result = projects.apply(command, kozyavka_image, pritvoryashka_image, identity.agent_id)?;
+                if let Some(trap_id) = deferred_remove.filter(|_| result.success) {
+                    let state_dir = inbox.parent().expect("inbox parent");
+                    let mut outbox = SqliteKazikOutbox::open(state_dir.join("kazik-outbox.sqlite"))?;
+                    finalize_removed_trap(projects, state_dir, identity, &mut outbox, trap_id, result)
+                } else {
+                    Ok(result)
+                }
             });
         match result {
             Ok(result) if result.success => {
@@ -1159,7 +1561,83 @@ fn atomic_write(path: &Path, content: &[u8]) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Platform, parse_platform};
+    use super::{DispatcherConfig, DispatcherListener, DispatcherTarget, Platform, parse_platform};
+    use uuid::Uuid;
+
+    fn target(weight: u8) -> DispatcherTarget {
+        DispatcherTarget {
+            trap_id: Uuid::new_v4(),
+            address: "127.0.0.1:31001".parse().unwrap(),
+            weight,
+        }
+    }
+
+    #[test]
+    fn removing_a_shared_trap_rebalances_remaining_routes() {
+        let first = target(25);
+        let removed = target(25);
+        let third = target(50);
+        let config = DispatcherConfig {
+            version: 1,
+            listeners: vec![DispatcherListener {
+                listen: "0.0.0.0:2222".parse().unwrap(),
+                targets: vec![first.clone(), removed.clone(), third.clone()],
+            }],
+        };
+        let updated = config.without_trap(removed.trap_id).unwrap().unwrap();
+        assert_eq!(updated.listeners[0].targets.len(), 2);
+        assert_eq!(updated.listeners[0].targets[0].trap_id, first.trap_id);
+        assert_eq!(updated.listeners[0].targets[0].weight, 33);
+        assert_eq!(updated.listeners[0].targets[1].trap_id, third.trap_id);
+        assert_eq!(updated.listeners[0].targets[1].weight, 67);
+        let pair = DispatcherConfig {
+            version: 1,
+            listeners: vec![DispatcherListener {
+                listen: "0.0.0.0:2222".parse().unwrap(),
+                targets: vec![target(50), target(50)],
+            }],
+        };
+        let removed = pair.listeners[0].targets[0].trap_id;
+        let updated = pair.without_trap(removed).unwrap().unwrap();
+        assert_eq!(updated.listeners[0].targets[0].weight, 100);
+    }
+
+    #[test]
+    fn removing_last_group_member_drops_only_its_listener() {
+        let removed = target(100);
+        let survivor = target(100);
+        let config = DispatcherConfig {
+            version: 1,
+            listeners: vec![
+                DispatcherListener {
+                    listen: "0.0.0.0:2222".parse().unwrap(),
+                    targets: vec![removed.clone()],
+                },
+                DispatcherListener {
+                    listen: "0.0.0.0:2223".parse().unwrap(),
+                    targets: vec![survivor.clone()],
+                },
+            ],
+        };
+        let updated = config.without_trap(removed.trap_id).unwrap().unwrap();
+        assert_eq!(updated.listeners.len(), 1);
+        assert_eq!(updated.listeners[0].listen, "0.0.0.0:2223".parse().unwrap());
+        assert_eq!(updated.listeners[0].targets[0].trap_id, survivor.trap_id);
+        assert!(updated.without_trap(survivor.trap_id).unwrap().unwrap().listeners.is_empty());
+    }
+
+    #[test]
+    fn malformed_dispatcher_routes_are_not_rewritten() {
+        let removed = target(40);
+        let config = DispatcherConfig {
+            version: 1,
+            listeners: vec![DispatcherListener {
+                listen: "0.0.0.0:2222".parse().unwrap(),
+                targets: vec![removed.clone()],
+            }],
+        };
+        assert!(config.without_trap(removed.trap_id).is_err());
+    }
 
     #[test]
     fn recognizes_supported_distribution_ids() {

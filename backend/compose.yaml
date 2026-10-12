@@ -1,4 +1,4 @@
-# Local PostgreSQL only. No external server, host data or existing service touched.
+# Local PostgreSQL and ClickHouse only. No external server, host data or existing service touched.
 services:
   postgres:
     image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
@@ -18,5 +18,30 @@ services:
       timeout: 3s
       retries: 12
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8
+    environment:
+      CLICKHOUSE_DB: honeyforge
+      CLICKHOUSE_USER: honeyforge
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Set a local CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "127.0.0.1:${CLICKHOUSE_PORT:-8123}:8123"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ../deploy/vps/clickhouse/001-telemetry.sql:/docker-entrypoint-initdb.d/001-telemetry.sql:ro
+    mem_limit: 1g
+    cpus: 1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+
 volumes:
   postgres_data:
+  clickhouse_data:

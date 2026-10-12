@@ -18,7 +18,7 @@ artifact_dir=$(realpath "$artifact_dir")
 python3 "$repo/deploy/vps/validate-artifacts.py" "$artifact_dir"
 exec 9>/root/.mellcore-install.lock
 flock -n 9 || { echo 'Установка уже выполняется.' >&2; exit 1; }
-trap 'echo "Остановка на строке $LINENO. Данные PostgreSQL и сертификаты сохранены; можно повторить скрипт после исправления причины." >&2' ERR
+trap 'echo "Остановка на строке $LINENO. Данные PostgreSQL, ClickHouse и сертификаты сохранены; можно повторить скрипт после исправления причины." >&2' ERR
 systemctl list-units --no-pager >/dev/null
 docker info >/dev/null
 nginx -t
@@ -53,7 +53,7 @@ fi
 apt-get update
 apt-get install -y libssl3t64 libssh2-1t64 ca-certificates python3 openssl curl
 if [[ ! -f /etc/honeyforge/mellcore-secrets.json ]]; then
-    for port in 1080 18080 18081 54329 2222 31001 31002; do
+    for port in 1080 18080 18081 54329 8123 2222 31001 31002; do
         listeners=$(ss -H -ltn "sport = :$port")
         [[ -z $listeners ]] || { echo "TCP $port уже занят; требуется выбрать другой порт." >&2; exit 1; }
     done
@@ -108,12 +108,18 @@ getent passwd honeyforge >/dev/null || useradd --system --home-dir /var/lib/hone
 install -d -m 0755 /etc/honeyforge
 chown root:honeyforge /etc/honeyforge/backend.env
 chmod 0640 /etc/honeyforge/backend.env
-docker compose --env-file /etc/honeyforge/postgres.env -p mellcore-vps -f "$repo/backend/compose.yaml" up -d postgres
+docker compose --env-file /etc/honeyforge/postgres.env -p mellcore-vps -f "$repo/backend/compose.yaml" up -d postgres clickhouse
 docker update --restart unless-stopped mellcore-vps-postgres-1 >/dev/null
+docker update --restart unless-stopped mellcore-vps-clickhouse-1 >/dev/null
 for attempt in $(seq 1 60); do
     if docker compose --env-file /etc/honeyforge/postgres.env -p mellcore-vps -f "$repo/backend/compose.yaml" exec -T postgres pg_isready -U honeyforge -d honeyforge >/dev/null; then break; fi
     sleep 2
 done
+for attempt in $(seq 1 90); do
+    if docker compose --env-file /etc/honeyforge/postgres.env -p mellcore-vps -f "$repo/backend/compose.yaml" exec -T clickhouse clickhouse-client --query 'SELECT 1' >/dev/null 2>&1; then break; fi
+    sleep 2
+done
+docker compose --env-file /etc/honeyforge/postgres.env -p mellcore-vps -f "$repo/backend/compose.yaml" exec -T clickhouse clickhouse-client --query 'SELECT 1' >/dev/null
 systemctl stop honeyforge-backend 2>/dev/null || true
 docker compose --env-file /etc/honeyforge/postgres.env -p mellcore-vps -f "$repo/backend/compose.yaml" exec -T postgres pg_dump -U honeyforge -d honeyforge > "/root/mellcore-backups/database-$(date +%Y%m%d-%H%M%S).sql"
 set -a

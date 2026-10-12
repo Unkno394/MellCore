@@ -33,6 +33,19 @@ impl CredentialStore {
     pub(crate) fn insert(&mut self, agent_id: Uuid, credential: String) -> anyhow::Result<()> {
         let mut next = self.entries.clone();
         next.insert(agent_id, credential);
+        self.persist(next)
+    }
+
+    pub(crate) fn remove(&mut self, agent_id: &Uuid) -> anyhow::Result<bool> {
+        let mut next = self.entries.clone();
+        if next.remove(agent_id).is_none() {
+            return Ok(false);
+        }
+        self.persist(next)?;
+        Ok(true)
+    }
+
+    fn persist(&mut self, next: HashMap<Uuid, String>) -> anyhow::Result<()> {
         if let Some(path) = &self.path {
             let temporary = path.with_extension("tmp");
             let mut options = fs::OpenOptions::new();
@@ -67,9 +80,20 @@ mod tests {
         let restored = CredentialStore::open(Some(path)).unwrap();
         assert_eq!(restored.authenticate("transport-secret"), Some(agent));
         assert_eq!(restored.authenticate("wrong"), None);
+        let mut restored = restored;
+        assert!(restored.remove(&agent).unwrap());
+        assert_eq!(CredentialStore::open(Some(dir.join("credentials.json"))).unwrap().get(&agent), None);
+        assert!(!restored.remove(&agent).unwrap());
         let mut broken = CredentialStore::open(Some(dir.join("missing/credentials.json"))).unwrap();
         assert!(broken.insert(agent, "not-persisted".into()).is_err());
         assert_eq!(broken.authenticate("not-persisted"), None);
+        let vanished = dir.join("vanished");
+        fs::create_dir(&vanished).unwrap();
+        let mut stored = CredentialStore::open(Some(vanished.join("credentials.json"))).unwrap();
+        stored.insert(agent, "still-authorized".into()).unwrap();
+        fs::remove_dir_all(vanished).unwrap();
+        assert!(stored.remove(&agent).is_err());
+        assert_eq!(stored.authenticate("still-authorized"), Some(agent));
         fs::remove_dir_all(dir).unwrap();
     }
 }

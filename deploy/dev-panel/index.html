@@ -56,6 +56,34 @@
     </form>
   </section>
 
+  <section>
+    <h2>3. Удалить ловушку</h2>
+    <p class="hint">Останавливает контейнер и удаляет проект на агенте. Уже отправленные события остаются в центре.</p>
+    <form id="remove-trap-form">
+      <fieldset>
+        <label>Agent ID<input id="remove-agent-id" required placeholder="UUID агента"></label>
+        <label>Trap ID<input id="remove-trap-id" required placeholder="UUID ловушки"></label>
+      </fieldset>
+      <button>Удалить ловушку</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>4. Отозвать доступ агента</h2>
+    <p class="hint">После отзыва агент больше не сможет подключаться к центру. Сначала удали его ловушки, если они больше не нужны.</p>
+    <form id="revoke-agent-form">
+      <label>Agent ID<input id="revoke-agent-id" required placeholder="UUID агента"></label>
+      <button>Отозвать доступ</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>5. Скомпрометированные VDS</h2>
+    <p class="hint">Center блокирует команды и телеметрию для таких агентов. Повторная установка на тот же hostname/IP запрещена до ручного разбора инцидента.</p>
+    <button id="refresh-compromised" type="button">Обновить список</button>
+    <pre id="compromised-list">Загрузка…</pre>
+  </section>
+
   <section><strong>Статус</strong><div id="status">Готово.</div></section>
 
   <script>
@@ -85,19 +113,47 @@
       return body ? JSON.parse(body) : null;
     }
 
-    async function waitForBootstrap(jobId, agentId) {
+    async function refreshCompromised() {
+      const records = await request('/v1/agents/compromised');
+      $('compromised-list').textContent = records.length
+        ? records.map(item => `${item.target || 'VDS без сохранённого адреса'} | agent ${item.agent_id} | trap ${item.trap_id} | ${item.transport_disconnected ? 'Hysteria отключена' : 'закрытие Hysteria ожидает/повторяется'}`).join('\n')
+        : 'Инцидентов нет.';
+    }
+    $('refresh-compromised').onclick = () => refreshCompromised().catch(error => {
+      $('compromised-list').textContent = `Не удалось загрузить: ${error.message}`;
+    });
+
+    async function waitForBootstrap(jobId) {
       const deadline = Date.now() + 20 * 60 * 1000;
       while (Date.now() < deadline) {
         const job = await request(`/v1/agents/bootstrap/${encodeURIComponent(jobId)}`);
-        if (job.status === 'succeeded') {
-          status(`Агент установлен. Agent ID: ${agentId}\nТеперь можно поставить ловушку.`);
+        if (job.status === 'succeeded' && job.registered) {
+          $('agent-id').value = job.agent_id;
+          $('remove-agent-id').value = job.agent_id;
+          $('revoke-agent-id').value = job.agent_id;
+          status(`Агент зарегистрирован. Agent ID: ${job.agent_id}\nТеперь можно поставить ловушку.`);
           return;
         }
         if (job.status === 'failed') throw new Error(job.message || 'Установка агента завершилась ошибкой.');
-        status(`Устанавливаю агента на сервере…\nAgent ID: ${agentId}\nМожно закрыть страницу — установка продолжится.`);
+        const progress = job.status === 'succeeded'
+          ? 'Установка завершена, жду регистрации агента в центре…'
+          : 'Устанавливаю агента на сервере…';
+        status(`${progress}\nAgent ID появится после регистрации. Можно закрыть страницу — установка продолжится.`);
         await new Promise(resolve => setTimeout(resolve, 3000));
       }
-      throw new Error('Установка ещё выполняется. Обнови страницу и проверь статус позже.');
+      throw new Error('Агент не зарегистрировался в центре. Проверь журнал hf-agent на целевом сервере.');
+    }
+
+    async function waitForCommand(agentId, messageId, action) {
+      const deadline = Date.now() + 10 * 60 * 1000;
+      while (Date.now() < deadline) {
+        const command = await request(`/v1/agents/${encodeURIComponent(agentId)}/commands/${encodeURIComponent(messageId)}`);
+        if (command.status === 'applied') return status(`${action} выполнено агентом.`);
+        if (command.status === 'rejected') throw new Error(command.detail || 'Агент отклонил команду.');
+        status(`${action}: жду подтверждение агента…`);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+      throw new Error('Подтверждение не пришло за 10 минут. Проверь состояние агента.');
     }
 
     $('bootstrap-form').onsubmit = async event => {
@@ -111,13 +167,13 @@
         ssh_key_passphrase: null
       };
       if ((key && !body.ssh_private_key) || (!key && !body.ssh_password)) return status('Заполни SSH-данные.');
+      $('agent-id').value = '';
       event.submitter.disabled = true; status('Подключаюсь по SSH и устанавливаю агент…');
       try {
         const result = await request('/v1/agents/bootstrap', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
-        $('agent-id').value = result.agent_id;
         $('ssh-password').value = ''; $('ssh-key').value = '';
-        status(`Установка запущена. Agent ID: ${result.agent_id}`);
-        await waitForBootstrap(result.job_id, result.agent_id);
+        status('Установка запущена. Жду регистрацию агента…');
+        await waitForBootstrap(result.job_id);
       } catch (error) { status(`Ошибка bootstrap: ${error.message}`); }
       finally { event.submitter.disabled = false; }
     };
@@ -139,10 +195,48 @@
         const result = await request(`/v1/agents/${encodeURIComponent(agentId)}/commands`, {
           method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(command)
         });
-        status(`Команда ${result.status}: ${result.message_id}\nАгент заберёт её на ближайшем heartbeat (до 20 секунд).`);
+        $('remove-agent-id').value = agentId;
+        $('remove-trap-id').value = command.trap_id;
+        status(`Команда ${result.status}: ${result.message_id}\nTrap ID: ${command.trap_id}\nАгент заберёт её на ближайшем heartbeat (до 20 секунд).`);
+        await waitForCommand(agentId, result.message_id, `Постановка ловушки ${command.trap_id}`);
       } catch (error) { status(`Ошибка постановки ловушки: ${error.message}`); }
       finally { event.submitter.disabled = false; }
     };
+
+    $('remove-trap-form').onsubmit = async event => {
+      event.preventDefault();
+      const agentId = $('remove-agent-id').value.trim();
+      const trapId = $('remove-trap-id').value.trim();
+      const command = {type:'remove_trap', command_id:uuid(), trap_id:trapId};
+      event.submitter.disabled = true;
+      status('Отправляю команду удаления ловушки…');
+      try {
+        const result = await request(`/v1/agents/${encodeURIComponent(agentId)}/commands`, {
+          method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(command)
+        });
+        status(`Удаление поставлено в очередь: ${result.message_id}\nTrap ID: ${trapId}. Жду подтверждение агента…`);
+        await waitForCommand(agentId, result.message_id, `Удаление ловушки ${trapId}`);
+      } catch (error) { status(`Ошибка удаления ловушки: ${error.message}`); }
+      finally { event.submitter.disabled = false; }
+    };
+
+    $('revoke-agent-form').onsubmit = async event => {
+      event.preventDefault();
+      const agentId = $('revoke-agent-id').value.trim();
+      event.submitter.disabled = true;
+      status('Отзываю доступ агента и закрываю соединение Hysteria…');
+      try {
+        const result = await request(`/v1/agents/${encodeURIComponent(agentId)}/revoke`, {method:'POST'});
+        status(result.transport_disconnected
+          ? `Доступ агента ${agentId} отозван; Hysteria-сессия закрыта.`
+          : `Доступ агента ${agentId} отозван. ${result.detail || 'Закрытие сессии не подтверждено.'}`);
+      } catch (error) { status(`Ошибка отзыва агента: ${error.message}`); }
+      finally { event.submitter.disabled = false; }
+    };
+
+    refreshCompromised().catch(error => {
+      $('compromised-list').textContent = `Не удалось загрузить: ${error.message}`;
+    });
   </script>
 </body>
 </html>

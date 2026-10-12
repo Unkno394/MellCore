@@ -1088,9 +1088,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "chrono",
  "clap",
  "hf-core",
  "kazik-protocol",
+ "reqwest",
  "serde",
  "serde_json",
  "ssh2",
@@ -1098,6 +1100,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "url",
 ]
 
 [[package]]

@@ -30,9 +30,13 @@ center_help = subprocess.run([str(root / 'bin/hf-center'), '--help'], check=True
                              capture_output=True, text=True, timeout=10).stdout
 if 'HF_CENTER_CREDENTIALS_FILE' not in center_help:
     raise SystemExit('hf-center устарел: соберите его из текущего crates/hf-center и замените бинарник.')
+if 'HF_HYSTERIA_STATS_URL' not in center_help:
+    raise SystemExit('hf-center устарел: отсутствует отзыв активной Hysteria-сессии.')
 agent_binary = (root / 'bin/hf-agent').read_bytes()
 if b'HF_TELEMETRY_PUBLIC_ENDPOINT' not in agent_binary or b'HF_TELEMETRY_INGEST_TOKEN' not in agent_binary:
     raise SystemExit('hf-agent устарел: соберите его из текущего crates/hf-agent и замените бинарник.')
+if b'final trap telemetry queued before removal' not in agent_binary:
+    raise SystemExit('hf-agent устарел: отсутствует безопасное удаление ловушки.')
 
 for filename, tag in [('low.tar', 'honeyforge-low:local'),
                       ('middle.tar', 'honeyforge-pritvoryashka:local')]:

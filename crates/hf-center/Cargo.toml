@@ -9,12 +9,15 @@ anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 clap.workspace = true
+chrono.workspace = true
 hf-core = { path = "../hf-core" }
 kazik-protocol = { path = "../kazik-protocol" }
 serde.workspace = true
 serde_json.workspace = true
+reqwest.workspace = true
 ssh2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+url.workspace = true
