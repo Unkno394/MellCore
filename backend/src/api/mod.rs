@@ -1,11 +1,11 @@
 pub mod auth;
 pub mod center_registry;
 pub mod profiles;
-pub mod servers;
 pub mod server_bootstrap;
+pub mod servers;
 pub mod telemetry;
-pub mod traps;
 pub mod trap_actions;
+pub mod traps;
 pub mod users;
 
 use std::{sync::Arc, time::Instant};
@@ -195,9 +195,18 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/internal/v1/telemetry/batches", post(telemetry::ingest))
-        .route("/internal/v1/center/events", post(telemetry::ingest_from_center))
-        .route("/internal/v1/center/traps", post(center_registry::register_trap))
-        .route("/internal/v1/center/traps/removed", post(center_registry::mark_removed))
+        .route(
+            "/internal/v1/center/events",
+            post(telemetry::ingest_from_center),
+        )
+        .route(
+            "/internal/v1/center/traps",
+            post(center_registry::register_trap),
+        )
+        .route(
+            "/internal/v1/center/traps/removed",
+            post(center_registry::mark_removed),
+        )
         .route("/api/v1/auth/register", post(auth::register))
         .route("/api/v1/auth/verify-email", post(auth::verify_email))
         .route(
@@ -214,7 +223,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/servers", get(servers::list).post(servers::create))
         .route("/api/v1/servers/bootstrap", post(server_bootstrap::start))
-        .route("/api/v1/servers/{server_id}/bootstrap", get(server_bootstrap::status))
+        .route(
+            "/api/v1/servers/{server_id}/bootstrap",
+            get(server_bootstrap::status),
+        )
         .route(
             "/api/v1/servers/{server_id}",
             get(servers::get)
@@ -229,10 +241,22 @@ pub fn router_with_state(state: AppState) -> Router {
         )
         .route("/api/v1/traps/{trap_id}/events", get(telemetry::list))
         .route("/api/v1/traps/{trap_id}/actions", post(trap_actions::start))
-        .route("/api/v1/traps/{trap_id}/actions/{action_id}", get(trap_actions::status))
-        .route("/api/v1/traps/{trap_id}/attack-matches", get(telemetry::list_attack_matches))
-        .route("/api/v1/knowledge/proposals", get(telemetry::list_graph_proposals))
-        .route("/api/v1/knowledge/proposals/{proposal_id}/review", post(telemetry::review_graph_proposal))
+        .route(
+            "/api/v1/traps/{trap_id}/actions/{action_id}",
+            get(trap_actions::status),
+        )
+        .route(
+            "/api/v1/traps/{trap_id}/attack-matches",
+            get(telemetry::list_attack_matches),
+        )
+        .route(
+            "/api/v1/knowledge/proposals",
+            get(telemetry::list_graph_proposals),
+        )
+        .route(
+            "/api/v1/knowledge/proposals/{proposal_id}/review",
+            post(telemetry::review_graph_proposal),
+        )
         .route(
             "/api/v1/traps/{trap_id}",
             get(traps::get).put(traps::update).delete(traps::delete),

@@ -4,7 +4,7 @@
 //! packets and does not know whether HFSP frames travel through Hysteria, TCP,
 //! HTTPS or LoRa.  Transport security belongs to the transport implementation.
 
-use std::net::IpAddr;
+use std::{net::IpAddr, time::Duration};
 
 use hf_core::{AgentCommand, HfspCodecError, HfspFrame, HfspMessageKind};
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const KAZIK_PROTOCOL_VERSION: u16 = 1;
+/// Application-level limits keep telemetry within one practical Hysteria UDP datagram while
+/// retaining the existing HFSP/Kazik version and envelope shape.
+pub const MAX_TELEMETRY_BATCH_EVENTS: usize = 20;
+pub const MAX_TELEMETRY_PACKET_BYTES: usize = 16 * 1024;
+pub const MAX_TELEMETRY_BATCH_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -9,6 +9,140 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/api/v1/auth/change-email": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "operationId": "change_email",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangeEmail"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmailChangeAccepted"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/auth/change-password": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "operationId": "change_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePassword"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Password changed; all sessions are revoked"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/api/v1/auth/forgot-password": {
       "post": {
         "tags": [
@@ -1928,6 +2062,158 @@
         ]
       }
     },
+    "/api/v1/traps/{trap_id}/actions": {
+      "post": {
+        "tags": [
+          "traps"
+        ],
+        "operationId": "start",
+        "parameters": [
+          {
+            "name": "trap_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TrapActionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrapActionProgress"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/traps/{trap_id}/actions/{action_id}": {
+      "get": {
+        "tags": [
+          "traps"
+        ],
+        "operationId": "status",
+        "parameters": [
+          {
+            "name": "trap_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "action_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrapActionProgress"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/api/v1/traps/{trap_id}/attack-matches": {
       "get": {
         "tags": [
@@ -2908,6 +3194,41 @@
         },
         "additionalProperties": false
       },
+      "ChangeEmail": {
+        "type": "object",
+        "required": [
+          "current_password",
+          "new_email"
+        ],
+        "properties": {
+          "current_password": {
+            "type": "string",
+            "writeOnly": true
+          },
+          "new_email": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChangePassword": {
+        "type": "object",
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "properties": {
+          "current_password": {
+            "type": "string",
+            "writeOnly": true
+          },
+          "new_password": {
+            "type": "string",
+            "writeOnly": true
+          }
+        },
+        "additionalProperties": false
+      },
       "CommandType": {
         "type": "string",
         "enum": [
@@ -2917,6 +3238,35 @@
           "apply_config",
           "remove"
         ]
+      },
+      "ContainerResourceLimits": {
+        "type": "object",
+        "required": [
+          "cpu_cores",
+          "memory_mb",
+          "pids"
+        ],
+        "properties": {
+          "cpu_cores": {
+            "type": "number",
+            "format": "double",
+            "maximum": 1,
+            "minimum": 0.05
+          },
+          "memory_mb": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 512,
+            "minimum": 32
+          },
+          "pids": {
+            "type": "integer",
+            "format": "int32",
+            "maximum": 256,
+            "minimum": 16
+          }
+        },
+        "additionalProperties": false
       },
       "CreateTrap": {
         "type": "object",
@@ -2983,6 +3333,17 @@
           "stopped",
           "removed"
         ]
+      },
+      "EmailChangeAccepted": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
       },
       "ErrorBody": {
         "type": "object",
@@ -3391,6 +3752,7 @@
           "honeypot_type",
           "service_type",
           "config",
+          "resources",
           "version",
           "created_at",
           "updated_at"
@@ -3416,6 +3778,9 @@
           },
           "name": {
             "type": "string"
+          },
+          "resources": {
+            "$ref": "#/components/schemas/ContainerResourceLimits"
           },
           "service_type": {
             "type": "string"
@@ -3452,6 +3817,16 @@
           },
           "name": {
             "type": "string"
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ContainerResourceLimits"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "service_type": {
             "type": "string"
@@ -3935,6 +4310,7 @@
           "profile_snapshot",
           "config",
           "effective_config",
+          "resources",
           "desired_state",
           "actual_state",
           "version",
@@ -3975,6 +4351,9 @@
             "type": "integer",
             "format": "int64"
           },
+          "resources": {
+            "$ref": "#/components/schemas/ContainerResourceLimits"
+          },
           "server_id": {
             "type": "string",
             "format": "uuid"
@@ -3996,6 +4375,49 @@
             "format": "int64"
           }
         }
+      },
+      "TrapAction": {
+        "type": "string",
+        "enum": [
+          "start",
+          "stop",
+          "restart",
+          "remove"
+        ]
+      },
+      "TrapActionProgress": {
+        "type": "object",
+        "required": [
+          "action_id",
+          "status"
+        ],
+        "properties": {
+          "action_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "TrapActionRequest": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/TrapAction"
+          }
+        },
+        "additionalProperties": false
       },
       "TrapDesiredState": {
         "type": "string",
@@ -4033,6 +4455,17 @@
           "profile_id": {
             "type": "string",
             "format": "uuid"
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ContainerResourceLimits",
+                "description": "Optional per-container budget; omitted values inherit profile defaults."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false

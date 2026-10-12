@@ -20,7 +20,10 @@ use hf_core::{
     AgentCommand, AgentRegistration, BootstrapScript, CoreError, HighUbuntuDeployment,
     HysteriaConnection, RegisteredAgent, RemoteBootstrap, SshBootstrapTarget,
 };
-use kazik_protocol::{AckDisposition, Acknowledgement, KazikBody, KazikEnvelope};
+use kazik_protocol::{
+    AckDisposition, Acknowledgement, KazikBody, KazikEnvelope, MAX_TELEMETRY_BATCH_EVENTS,
+    MAX_TELEMETRY_PACKET_BYTES,
+};
 use serde::{Deserialize, Serialize};
 use ssh2::Session;
 use tokio::sync::Mutex;
@@ -1056,7 +1059,10 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
         }
         let mut unregistered_telemetry = false;
         if let KazikBody::Telemetry { events } = &envelope.body {
-            if events.is_empty() || events.len() > 128 || events.iter().any(|event|
+            if length > MAX_TELEMETRY_PACKET_BYTES
+                || events.is_empty()
+                || events.len() > MAX_TELEMETRY_BATCH_EVENTS
+                || events.iter().any(|event|
                 event.event_id.is_nil() || event.trap_id.is_nil()
                 || event.event_type.is_empty() || event.event_type.len() > 128
                 || event.service_type.len() > 64 || event.protocol.len() > 32
