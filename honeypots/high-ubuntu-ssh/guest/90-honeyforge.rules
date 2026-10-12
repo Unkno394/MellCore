@@ -1,0 +1,17 @@
+## HoneyForge High audit rules. These report kernel observations, never shell history.
+-b 8192
+--backlog_wait_time 60000
+-a always,exit -F arch=b64 -S execve,execveat -F auid!=unset -k hf_exec
+-a always,exit -F arch=b32 -S execve,execveat -F auid!=unset -k hf_exec
+-a always,exit -F arch=b64 -S exit,exit_group -F auid!=unset -k hf_exit
+-a always,exit -F arch=b32 -S exit,exit_group -F auid!=unset -k hf_exit
+-a always,exit -F arch=b64 -S connect -F auid!=unset -k hf_net_connect
+-a always,exit -F arch=b32 -S connect -F auid!=unset -k hf_net_connect
+-a always,exit -F arch=b64 -F dir=/etc -F perm=wa -k hf_file_etc
+-a always,exit -F arch=b32 -F dir=/etc -F perm=wa -k hf_file_etc
+-a always,exit -F arch=b64 -F dir=/root -F perm=wa -k hf_file_root
+-a always,exit -F arch=b32 -F dir=/root -F perm=wa -k hf_file_root
+-a always,exit -F arch=b64 -F dir=/home -F perm=wa -k hf_file_home
+-a always,exit -F arch=b32 -F dir=/home -F perm=wa -k hf_file_home
+-a always,exit -F arch=b64 -F dir=/srv/operations -F perm=wa -k hf_file_operations
+-a always,exit -F arch=b32 -F dir=/srv/operations -F perm=wa -k hf_file_operations

@@ -1135,6 +1135,7 @@ dependencies = [
  "hf-core",
  "kazik-protocol",
  "rusqlite",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

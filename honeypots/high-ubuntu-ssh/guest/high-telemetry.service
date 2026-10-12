@@ -1,0 +1,22 @@
+[Unit]
+Description=HoneyForge High guest telemetry sensor
+After=systemd-journald.service auditd.service
+Before=shutdown.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/honeyforge/high-telemetry-sensor
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+StateDirectory=honeyforge-high-telemetry
+StateDirectoryMode=0700
+RestrictAddressFamilies=AF_UNIX
+ReadOnlyPaths=-/var/log/audit
+
+[Install]
+WantedBy=multi-user.target

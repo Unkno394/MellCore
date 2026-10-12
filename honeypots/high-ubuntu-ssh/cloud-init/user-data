@@ -1,8 +1,4 @@
 #cloud-config
-package_update: true
-packages:
-  - openssh-server
-  - qemu-guest-agent
 users:
   - name: analyst
     groups: [adm, systemd-journal]
@@ -12,6 +8,26 @@ users:
 ssh_pwauth: true
 disable_root: false
 write_files:
+  - path: /usr/local/lib/honeyforge/high-telemetry-sensor
+    owner: root:root
+    permissions: '0755'
+    encoding: b64
+    content: SENSOR_B64
+  - path: /etc/systemd/system/honeyforge-high-telemetry.service
+    owner: root:root
+    permissions: '0644'
+    encoding: b64
+    content: SENSOR_SERVICE_B64
+  - path: /usr/local/lib/honeyforge/high_telemetry_audit.py
+    owner: root:root
+    permissions: '0644'
+    encoding: b64
+    content: AUDIT_SENSOR_B64
+  - path: /etc/audit/rules.d/90-honeyforge.rules
+    owner: root:root
+    permissions: '0600'
+    encoding: b64
+    content: AUDIT_RULES_B64
   - path: /etc/ssh/sshd_config.d/90-honeyforge.conf
     permissions: '0644'
     content: |
@@ -19,7 +35,12 @@ write_files:
       PermitRootLogin prohibit-password
       X11Forwarding no
 runcmd:
-  - systemctl enable --now ssh
-  - systemctl enable --now qemu-guest-agent
+  - test -x /usr/bin/python3
+  - test -x /usr/sbin/sshd
   - mkdir -p /srv/operations/backups
+  - systemctl daemon-reload
+  - sh -c 'if command -v auditctl >/dev/null 2>&1; then augenrules --load && systemctl enable --now auditd; fi'
+  - sh -c 'if command -v qemu-ga >/dev/null 2>&1; then systemctl enable --now qemu-guest-agent; fi'
+  - systemctl enable --now ssh
+  - systemctl enable --now honeyforge-high-telemetry.service
   - sh -c 'echo quarterly-report-placeholder > /srv/operations/backups/q4.txt'

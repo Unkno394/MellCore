@@ -5,6 +5,7 @@ instance_id=${1:?instance UUID}
 external_port=${2:?external TCP port}
 vm_name="hf-high-$instance_id"
 bridge=virbr-hfhigh
+root_dir=${HF_HIGH_ROOT:-/var/lib/honeyforge/high}
 
 case "$external_port" in
   ''|*[!0-9]*) echo "external SSH port must be numeric" >&2; exit 1 ;;
@@ -13,6 +14,8 @@ esac
   echo "external SSH port is outside 1..65535" >&2
   exit 1
 }
+# Re-assert the isolated network and guest-to-host firewall policy after host/agent restarts.
+sh "$(dirname "$0")/create-network.sh"
 # A host listener means this port is already occupied by SSH, the agent, or another service.
 # Do not steal it with a NAT rule.
 if ss -H -ltn "( sport = :$external_port )" 2>/dev/null | grep -q .; then
@@ -36,4 +39,4 @@ iptables -C FORWARD -p tcp -d "$guest_ip" --dport 22 -j ACCEPT 2>/dev/null ||
   iptables -A FORWARD -p tcp -d "$guest_ip" --dport 22 -j ACCEPT
 iptables -C FORWARD -p tcp -s "$guest_ip" --sport 22 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
   iptables -A FORWARD -p tcp -s "$guest_ip" --sport 22 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-printf '%s\n' "$guest_ip" > "/var/lib/honeyforge/high/$instance_id/guest-ip"
+printf '%s\n' "$guest_ip" > "$root_dir/$instance_id/guest-ip"

@@ -27,6 +27,8 @@ virt-install \
   --disk "path=$instance_dir/disk.qcow2,format=qcow2,bus=virtio" \
   --disk "path=$instance_dir/seed.iso,device=cdrom,readonly=on" \
   --network "network=hf-high-isolated,model=virtio" \
+  --channel "unix,path=$instance_dir/telemetry.sock,mode=bind,target.type=virtio,target.name=org.honeyforge.telemetry.0" \
+  --channel "unix,target.type=virtio,target.name=org.qemu.guest_agent.0" \
   --graphics none \
   --noautoconsole
 
