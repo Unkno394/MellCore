@@ -50,9 +50,22 @@
         <label>Внешний TCP порт<input id="trap-port" type="number" min="1" max="65535" value="2222" required></label>
         <label id="banner-label" class="wide">SSH banner Low<input id="banner" value="SSH-2.0-OpenSSH_9.6" maxlength="253"></label>
         <label id="hostname-label" class="wide hidden">Имя сервера Middle<input id="middle-hostname" value="srv-app-01" maxlength="64"></label>
-        <label id="server-id-label" class="wide hidden">Server ID Middle<input id="server-id"></label>
       </fieldset>
       <button>Поставить ловушку</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>Существующая ловушка</h2>
+    <p class="hint">После обновления Center свяжи ранее установленную Low/Middle с реестром. Сверь ID и порт с manifest.json на агенте.</p>
+    <form id="register-trap-form">
+      <fieldset>
+        <label>Agent ID<input id="register-agent-id" required placeholder="UUID агента"></label>
+        <label>Trap ID<input id="register-trap-id" required placeholder="UUID ловушки"></label>
+        <label>Уровень<select id="register-tier"><option value="low">Low</option><option value="middle">Middle</option></select></label>
+        <label>Внешний TCP порт<input id="register-port" type="number" min="1" max="65535" required></label>
+      </fieldset>
+      <button>Зарегистрировать существующую ловушку</button>
     </form>
   </section>
 
@@ -90,7 +103,6 @@
     const $ = id => document.getElementById(id);
     const status = message => $('status').textContent = message;
     const uuid = () => crypto.randomUUID();
-    $('server-id').value = uuid();
 
     function setAuthFields() {
       const key = $('auth-kind').value === 'key';
@@ -101,7 +113,6 @@
       const middle = $('trap-kind').value === 'middle';
       $('banner-label').classList.toggle('hidden', middle);
       $('hostname-label').classList.toggle('hidden', !middle);
-      $('server-id-label').classList.toggle('hidden', !middle);
     }
     $('auth-kind').onchange = setAuthFields;
     $('trap-kind').onchange = setTrapFields;
@@ -187,7 +198,7 @@
         type:'deploy_kozyavka', command_id:uuid(), trap_id:uuid(), host_port:port,
         container_port:2222, banner:$('banner').value, publish_address:'0.0.0.0'
       } : {
-        type:'deploy_pritvoryashka', command_id:uuid(), trap_id:uuid(), server_id:$('server-id').value.trim(),
+        type:'deploy_pritvoryashka', command_id:uuid(), trap_id:uuid(), server_id:uuid(),
         host_port:port, publish_address:'0.0.0.0', hostname:$('middle-hostname').value.trim(), max_connections:128
       };
       event.submitter.disabled = true; status('Ставлю команду в очередь агента…');
@@ -217,6 +228,21 @@
         status(`Удаление поставлено в очередь: ${result.message_id}\nTrap ID: ${trapId}. Жду подтверждение агента…`);
         await waitForCommand(agentId, result.message_id, `Удаление ловушки ${trapId}`);
       } catch (error) { status(`Ошибка удаления ловушки: ${error.message}`); }
+      finally { event.submitter.disabled = false; }
+    };
+
+    $('register-trap-form').onsubmit = async event => {
+      event.preventDefault();
+      const agentId = $('register-agent-id').value.trim();
+      const body = {trap_id:$('register-trap-id').value.trim(),
+        tier:$('register-tier').value, host_port:Number($('register-port').value)};
+      event.submitter.disabled = true;
+      try {
+        const result = await request(`/v1/agents/${encodeURIComponent(agentId)}/traps/register`, {
+          method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)
+        });
+        status(`Ловушка ${result.trap_id} зарегистрирована. Server ID: ${result.server_id}`);
+      } catch (error) { status(`Ошибка регистрации ловушки: ${error.message}`); }
       finally { event.submitter.disabled = false; }
     };
 

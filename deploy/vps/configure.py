@@ -74,12 +74,16 @@ def main():
     if "clickhouse_password" not in config:
         config["clickhouse_password"] = secrets.token_urlsafe(32)
         write(secret_path, json.dumps(config, indent=2))
+    if "center_graph_token" not in config:
+        config["center_graph_token"] = secrets.token_urlsafe(32)
+        write(secret_path, json.dumps(config, indent=2))
     backend_env = (
         "API_BIND=127.0.0.1:18080\nDOCS_ENABLED=true\nINTEGRATION_MODE=mock\n"
         f"DATABASE_URL=postgres://honeyforge:{config['postgres_password']}@127.0.0.1:54329/honeyforge\n"
         "DATABASE_ALLOW_INSECURE_LOCAL=true\nDATABASE_MAX_CONNECTIONS=5\n"
         f"JWT_SECRET={config['jwt_secret']}\nFRONTEND_URL=https://{DOMAIN}\n"
         f"TELEMETRY_INGEST_TOKEN={config['telemetry_token']}\n"
+        f"CENTER_INGEST_TOKEN={config['center_graph_token']}\n"
         f"TELEMETRY_PUBLIC_ENDPOINT=https://{DOMAIN}/internal/v1/telemetry/batches\n"
         "REQUIRE_EMAIL_VERIFICATION=false\nRUST_LOG=honeyforge_backend=info\n"
     )
@@ -94,10 +98,12 @@ def main():
         "HF_HYSTERIA_BINARY=/usr/local/bin/hysteria\n"
         f"HF_PUBLIC_CENTER_URL=https://{DOMAIN}\nHF_HYSTERIA_SERVER={DOMAIN}:443\nHF_HYSTERIA_SNI={DOMAIN}\n"
         "HF_CENTER_CREDENTIALS_FILE=/var/lib/honeyforge/center-credentials.json\n"
+        f"HF_LOCAL_AGENT_ID={config['agent_id']}\nHF_LOCAL_AGENT_TARGET={DOMAIN}\n"
         "HF_CENTER_CLICKHOUSE_URL=http://127.0.0.1:8123\nHF_CENTER_CLICKHOUSE_USER=honeyforge\n"
         f"HF_CENTER_CLICKHOUSE_PASSWORD={config['clickhouse_password']}\n"
         "HF_CENTER_POSTGRES_TELEMETRY_URL=http://127.0.0.1:18080/internal/v1/center/events\n"
-        f"HF_CENTER_POSTGRES_TELEMETRY_TOKEN={config['telemetry_token']}\n"
+        "HF_CENTER_REGISTRY_URL=http://127.0.0.1:18080/internal/v1/center/traps\n"
+        f"HF_CENTER_POSTGRES_TELEMETRY_TOKEN={config['center_graph_token']}\n"
         "HF_KOZYAVKA_IMAGE_ARCHIVE=/opt/mellcore/artifacts/low.tar\n"
         "HF_PRITVORYASHKA_IMAGE_ARCHIVE=/opt/mellcore/artifacts/middle.tar\n"
         "HF_HIGH_UBUNTU_RECIPE_ARCHIVE=/opt/mellcore/artifacts/hf-high-ubuntu-ssh.tar.gz\n"

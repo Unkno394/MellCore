@@ -26,6 +26,7 @@ pub struct TelemetryStore {
     path: PathBuf,
     file: File,
     seen: HashSet<(Uuid, Uuid)>,
+    rejected_seen: HashSet<(Uuid, Uuid)>,
 }
 
 impl TelemetryStore {
@@ -54,7 +55,42 @@ impl TelemetryStore {
             .with_context(|| format!("open telemetry file {}", path.display()))?;
         #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        Ok(Self { path, file, seen })
+        let mut rejected_seen = HashSet::new();
+        if let Ok(file) = File::open(path.with_extension("rejected.jsonl")) {
+            for line in BufReader::new(file).lines().flatten() {
+                if let Ok(record) = serde_json::from_str::<StoredTelemetryEvent>(&line) {
+                    rejected_seen.insert((record.agent_id, record.event.event_id));
+                }
+            }
+        }
+        Ok(Self { path, file, seen, rejected_seen })
+    }
+
+    /// Durable quarantine for events whose trap is absent from Center's registry.
+    /// The exact event is kept for operator reconciliation and manual replay.
+    pub fn reject(&mut self, agent_id: Uuid, events: &[TrapEvent]) -> anyhow::Result<usize> {
+        let path = self.path.with_extension("rejected.jsonl");
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&path)?;
+        let received_at_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+        let mut count = 0;
+        let mut pending = HashSet::new();
+        for event in events {
+            if self.rejected_seen.contains(&(agent_id, event.event_id))
+                || !pending.insert((agent_id, event.event_id)) { continue; }
+            serde_json::to_writer(&mut file, &StoredTelemetryEvent {
+                agent_id, received_at_unix_ms, event: event.clone(),
+            })?;
+            file.write_all(b"\n")?;
+            count += 1;
+        }
+        file.flush()?;
+        file.sync_data()?;
+        self.rejected_seen.extend(pending);
+        Ok(count)
     }
 
     /// Returns the number of newly stored events. The caller must ACK only after this succeeds.
@@ -130,5 +166,22 @@ mod tests {
         assert_eq!(reopened.persist(agent_id, &[event]).unwrap(), 0);
         assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 1);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn quarantined_unknown_trap_is_durable_and_not_in_main_spool() {
+        let path = std::env::temp_dir().join(format!("hf-rejected-{}.jsonl", Uuid::new_v4()));
+        let agent = Uuid::new_v4();
+        let event = event(Uuid::new_v4());
+        {
+            let mut store = TelemetryStore::open(&path).unwrap();
+            assert_eq!(store.reject(agent, &[event.clone()]).unwrap(), 1);
+        }
+        let mut restored = TelemetryStore::open(&path).unwrap();
+        assert_eq!(restored.reject(agent, &[event]).unwrap(), 0);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+        assert_eq!(fs::read_to_string(path.with_extension("rejected.jsonl")).unwrap().lines().count(), 1);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(path.with_extension("rejected.jsonl")).unwrap();
     }
 }

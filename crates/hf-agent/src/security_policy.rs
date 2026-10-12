@@ -11,6 +11,52 @@ pub(crate) enum TrapTier {
     Middle,
 }
 
+/// Decision about an observed host syscall. These are audit decisions, not
+/// proof that a container crossed into the host namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActionDecision { Allowed, Alert, IsolateTrap }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Operation { Execute, Open, Connect }
+
+#[derive(Clone, Copy)]
+pub(crate) struct ObservedAction<'a> {
+    pub tier: TrapTier,
+    pub operation: Operation,
+    pub resource: &'a str,
+    pub succeeded: bool,
+    pub inside_trap: bool,
+}
+
+pub(crate) fn evaluate(action: ObservedAction<'_>) -> ActionDecision {
+    if !action.inside_trap { return ActionDecision::Alert; }
+    match action.operation {
+        Operation::Execute if action.tier.allowed_executable(action.resource) => ActionDecision::Allowed,
+        Operation::Execute => ActionDecision::Alert,
+        Operation::Open if hf_core::security::container_runtime_socket(action.resource) => {
+            if action.succeeded { ActionDecision::IsolateTrap } else { ActionDecision::Alert }
+        }
+        Operation::Open if action.resource.starts_with("/host/")
+            || matches!(action.resource, "/etc/shadow" | "/etc/passwd" | "/proc/1/root"
+                | "/proc/1/ns/pid" | "/proc/1/ns/mnt" | "/var/lib/docker") => ActionDecision::Alert,
+        // The honeypots are inbound listeners. Outbound attempts need review,
+        // but a connection alone is not proof of host compromise.
+        Operation::Connect if action.succeeded => ActionDecision::Alert,
+        _ => ActionDecision::Allowed,
+    }
+}
+
+pub(crate) fn dangerous_configuration(reason: &str) -> bool {
+    matches!(reason,
+        "privileged mode is enabled" | "host PID namespace is enabled"
+        | "host network namespace is enabled" | "host IPC namespace is enabled"
+        | "host user or cgroup namespace is explicitly shared"
+        | "namespace sharing with another container is forbidden"
+        | "additional capabilities or device access are forbidden"
+        | "unconfined seccomp or LSM profile is forbidden"
+        | "mount set differs from the tier allowlist")
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ResourceLimits {
     pub memory_bytes: u64,
@@ -40,7 +86,8 @@ impl TrapTier {
     }
 
     pub(crate) fn allowed_executable(self, raw: &str) -> bool {
-        let path = raw.strip_suffix(" (deleted)").unwrap_or(raw);
+        // A deleted executable has lost its on-disk identity; require review.
+        let path = raw;
         match self {
             Self::Low => matches!(path,
                 "/usr/local/bin/honeyforge-low"
@@ -76,6 +123,23 @@ pub(crate) fn violations(tier: TrapTier, inspect: &Value, project_dir: &std::pat
     if host["PidMode"].as_str() == Some("host") { result.push("host PID namespace is enabled"); }
     if host["NetworkMode"].as_str() == Some("host") { result.push("host network namespace is enabled"); }
     if host["IpcMode"].as_str() == Some("host") { result.push("host IPC namespace is enabled"); }
+    for field in ["PidMode", "IpcMode", "NetworkMode"] {
+        if host[field].as_str().is_some_and(|v| v.starts_with("container:")) {
+            result.push("namespace sharing with another container is forbidden");
+        }
+    }
+    if host["UsernsMode"].as_str() == Some("host") || host["CgroupnsMode"].as_str() == Some("host") {
+        result.push("host user or cgroup namespace is explicitly shared");
+    }
+    for field in ["CapAdd", "Devices", "DeviceRequests", "DeviceCgroupRules"] {
+        if !host[field].is_null() && !host[field].as_array().is_some_and(|v| v.is_empty()) {
+            result.push("additional capabilities or device access are forbidden");
+        }
+    }
+    if host["SecurityOpt"].as_array().is_some_and(|opts| opts.iter().any(|v|
+        v.as_str().is_some_and(|v| v.contains("unconfined")))) {
+        result.push("unconfined seccomp or LSM profile is forbidden");
+    }
     if tier == TrapTier::Low
         && !matches!(inspect["Config"]["User"].as_str(), Some("65532" | "65532:65532"))
     { result.push("Low container is not running as image UID 65532"); }
@@ -113,10 +177,14 @@ pub(crate) fn violations(tier: TrapTier, inspect: &Value, project_dir: &std::pat
                     let source = mount["Source"].as_str().unwrap_or("");
                     let destination_ok = mount["Destination"].as_str() == Some(*destination);
                     let write_ok = mount["RW"].as_bool() == Some(*writable);
-                    let source_ok = source.starts_with(expected_project.as_ref())
-                        && (source == expected_project.as_ref()
-                            || source.starts_with(&format!("{expected_project}/")));
-                    destination_ok && write_ok && source_ok
+                    let filename = match *destination {
+                        "/etc/honeyforge/config.json" => "config.json",
+                        "/etc/honeyforge/pritvoryashka.json" => "pritvoryashka.json",
+                        _ => "runtime",
+                    };
+                    let source_ok = source == format!("{expected_project}/{filename}");
+                    let propagation_ok = matches!(mount["Propagation"].as_str(), Some("rprivate" | "private"));
+                    destination_ok && write_ok && source_ok && propagation_ok && mount["Type"] == "bind"
                 });
                 if !valid { result.push("mount set differs from the tier allowlist"); break; }
             }
@@ -179,6 +247,36 @@ mod tests {
     }
 
     #[test]
+    fn resource_action_outcome_and_environment_change_the_decision() {
+        let mut action = ObservedAction { tier: TrapTier::Middle, operation: Operation::Open,
+            resource: "/run/docker.sock", succeeded: false, inside_trap: true };
+        assert_eq!(evaluate(action), ActionDecision::Alert);
+        action.succeeded = true;
+        assert_eq!(evaluate(action), ActionDecision::IsolateTrap);
+        action.inside_trap = false;
+        assert_eq!(evaluate(action), ActionDecision::Alert);
+        action.inside_trap = true;
+        action.resource = "/etc/honeyforge/pritvoryashka.json";
+        assert_eq!(evaluate(action), ActionDecision::Allowed);
+        action.operation = Operation::Connect;
+        assert_eq!(evaluate(action), ActionDecision::Alert);
+        action.succeeded = false;
+        assert_eq!(evaluate(action), ActionDecision::Allowed);
+    }
+
+    #[test]
+    fn all_known_runtime_sockets_are_alerted_or_isolated_by_result() {
+        for path in ["/run/docker.sock", "/var/run/containerd/containerd.sock",
+            "/run/podman/podman.sock", "/var/run/crio/crio.sock"] {
+            let mut action = ObservedAction { tier: TrapTier::Low, operation: Operation::Open,
+                resource: path, succeeded: false, inside_trap: true };
+            assert_eq!(evaluate(action), ActionDecision::Alert, "{path}");
+            action.succeeded = true;
+            assert_eq!(evaluate(action), ActionDecision::IsolateTrap, "{path}");
+        }
+    }
+
+    #[test]
     fn tier_limits_are_bounded_and_distinct() {
         let low = TrapTier::Low.limits();
         let middle = TrapTier::Middle.limits();
@@ -211,9 +309,14 @@ mod tests {
                 "Ulimits":[{"Name":"nofile","Soft":256,"Hard":256}],
                 "PortBindings":{"2222/tcp":[{"HostIp":"0.0.0.0","HostPort":"2222"}]}
             },
-            "Mounts":[{"Source":root.join("config.json").to_string_lossy(),"Destination":"/etc/honeyforge/config.json","RW":false}]
+            "Mounts":[{"Type":"bind","Propagation":"rprivate","Source":root.join("config.json").to_string_lossy(),"Destination":"/etc/honeyforge/config.json","RW":false}]
         });
         assert!(violations(TrapTier::Low, &inspect, &root).is_empty());
+        let mut hostile = inspect.clone();
+        hostile["HostConfig"]["CapAdd"] = json!(["SYS_ADMIN"]);
+        hostile["HostConfig"]["SecurityOpt"] = json!(["no-new-privileges:true", "seccomp=unconfined"]);
+        hostile["Mounts"][0]["Source"] = json!(root.to_string_lossy());
+        assert!(violations(TrapTier::Low, &hostile, &root).len() >= 3);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

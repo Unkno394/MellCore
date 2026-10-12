@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 const ORIGIN: &str = "http://127.0.0.1:8080";
 const PASSWORD: &str = "test-only-long-password";
+const CENTER_TOKEN: &str = "test-only-center-secret-separate-32-bytes";
 const TELEMETRY_TOKEN: &str = "test-only-telemetry-token-32-bytes-long";
 
 struct Session {
@@ -106,6 +107,7 @@ async fn postgres_management_and_security_end_to_end() {
             "JWT_SECRET" => Some("test-only-signing-secret-at-least-32-bytes".into()),
             "LOGIN_PER_MINUTE" => Some("100".into()),
             "TELEMETRY_INGEST_TOKEN" => Some(TELEMETRY_TOKEN.into()),
+            "CENTER_INGEST_TOKEN" => Some(CENTER_TOKEN.into()),
             "TELEMETRY_PUBLIC_ENDPOINT" => {
                 Some("http://127.0.0.1:8080/internal/v1/telemetry/batches".into())
             }

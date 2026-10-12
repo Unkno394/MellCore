@@ -38,8 +38,6 @@ struct MiddleEvent {
     source_ip: Option<IpAddr>,
     source_port: Option<u16>,
     destination_port: Option<u16>,
-    protocol: String,
-    service_type: String,
     payload: Value,
     metadata: Value,
 }
@@ -123,7 +121,12 @@ fn collect_middle(
         }
         next_offset += read as u64;
         match serde_json::from_slice::<MiddleBatch>(&line) {
-            Ok(batch) => events.extend(batch.events.into_iter().map(Into::into)),
+            Ok(batch) => events.extend(batch.events.into_iter().map(|event| {
+                let mut event = TrapEvent::from(event);
+                // The file belongs to this project; its content cannot select another trap.
+                event.trap_id = trap_id;
+                event
+            })),
             Err(error) => tracing::warn!(%error, trap_id = %trap_id, "skipping malformed Middle telemetry line"),
         }
     }
@@ -255,7 +258,15 @@ fn write_cursor(path: &Path, value: &[u8]) -> anyhow::Result<()> {
 }
 
 impl From<MiddleEvent> for TrapEvent {
-    fn from(event: MiddleEvent) -> Self {
+    fn from(mut event: MiddleEvent) -> Self {
+        // Container-controlled JSON cannot impersonate the host observer.
+        if !event.metadata.is_object() { event.metadata = serde_json::json!({}); }
+        event.metadata["source"] = serde_json::json!("pritvoryashka");
+        event.metadata["evidence_domain"] = serde_json::json!("simulated");
+        if let Some(metadata) = event.metadata.as_object_mut() {
+            metadata.remove("assessment");
+            metadata.remove("validation");
+        }
         Self {
             event_id: event.event_id,
             trap_id: event.trap_id,
@@ -266,8 +277,8 @@ impl From<MiddleEvent> for TrapEvent {
             source_ip: event.source_ip,
             source_port: event.source_port,
             destination_port: event.destination_port,
-            protocol: event.protocol,
-            service_type: event.service_type,
+            protocol: "tcp".into(),
+            service_type: "ssh".into(),
             payload: event.payload,
             metadata: event.metadata,
         }
@@ -302,6 +313,20 @@ mod tests {
         assert_eq!(normalized.source_sequence_no, Some(3));
         assert_eq!(normalized.destination_port, Some(2224));
         assert_eq!(normalized.payload["username"], "probe");
+        assert_eq!(normalized.metadata["source"], "pritvoryashka");
+    }
+
+    #[test]
+    fn container_cannot_impersonate_host_monitor() {
+        let input = serde_json::json!({
+            "event_id":Uuid::new_v4(),"trap_id":Uuid::new_v4(),"event_type":"security.escape_confirmed",
+            "occurred_at":"2026-10-11T20:00:00Z","protocol":"local","service_type":"host_monitor",
+            "payload":{},"metadata":{"source":"hf-agent-ebpf","assessment":"confirmed","validation":"two_samples_proc_docker_v2"}
+        });
+        let event = TrapEvent::from(serde_json::from_value::<MiddleEvent>(input).unwrap());
+        assert_eq!(event.service_type, "ssh");
+        assert_eq!(event.metadata["source"], "pritvoryashka");
+        assert!(event.metadata.get("validation").is_none());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Stable domain contracts. Network transports and infrastructure live outside this crate.
 
 pub mod math;
+pub mod security;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

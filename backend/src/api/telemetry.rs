@@ -24,7 +24,7 @@ pub struct IngestResponse {
     pub duplicate_events: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CenterEventInput {
     pub agent_id: Uuid,
@@ -47,6 +47,8 @@ pub struct AttackEventPage {
 
 #[derive(Serialize, ToSchema)]
 pub struct AttackGraphMatch {
+    pub session_key: String,
+    pub evidence_domain: String,
     pub technique_key: String,
     pub technique_name: String,
     pub status: String,
@@ -62,11 +64,26 @@ pub struct AttackGraphProposal {
     pub process_class: String,
     pub resource_class: String,
     pub outcome: String,
-    pub sample_event_id: Uuid,
+    pub sample_event_id: Option<Uuid>,
     pub evidence_count: i64,
     pub suggested_technique: Option<Uuid>,
     pub first_seen: chrono::DateTime<Utc>,
     pub last_seen: chrono::DateTime<Utc>,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewGraphProposal {
+    pub decision: String,
+    pub technique_id: Option<Uuid>,
+    pub predecessor_node_id: Option<Uuid>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ReviewGraphResult {
+    pub proposal_id: Uuid,
+    pub status: String,
+    pub node_id: Option<Uuid>,
 }
 
 #[derive(FromRow)]
@@ -130,10 +147,11 @@ pub async fn list_attack_matches(
 ) -> Result<Json<Vec<AttackGraphMatch>>, AppError> {
     let pool = state.pool()?;
     crate::resources::traps::get(pool, &principal, trap_id).await?;
-    let rows = sqlx::query("SELECT t.technique_key,t.name,gp.status,gp.similarity,gp.evidence_event_ids,gp.updated_at FROM attack_graph_progress gp JOIN attack_techniques t USING(technique_id) WHERE gp.trap_id=$1 ORDER BY gp.updated_at DESC LIMIT 100")
+    let rows = sqlx::query("SELECT gp.session_key,split_part(gp.session_key,':',1) AS evidence_domain,t.technique_key,t.name,gp.status,gp.similarity,gp.evidence_event_ids,gp.updated_at FROM attack_graph_progress gp JOIN attack_techniques t USING(technique_id) WHERE gp.trap_id=$1 ORDER BY gp.updated_at DESC LIMIT 100")
         .bind(trap_id).fetch_all(pool).await?;
     use sqlx::Row;
     let matches = rows.into_iter().map(|row| AttackGraphMatch {
+        session_key: row.get("session_key"), evidence_domain: row.get("evidence_domain"),
         technique_key: row.get("technique_key"), technique_name: row.get("name"),
         status: row.get("status"), similarity: row.get("similarity"),
         evidence_event_ids: row.get("evidence_event_ids"), updated_at: row.get("updated_at"),
@@ -157,6 +175,61 @@ pub async fn list_graph_proposals(
         first_seen: row.get("first_seen"), last_seen: row.get("last_seen"),
     }).collect();
     Ok(Json(proposals))
+}
+
+/// Human approval is required before a novel action becomes graph knowledge.
+/// The accepted node is always attempt-level; a review never grants authority
+/// to declare a host escape without independent validated observer evidence.
+#[utoipa::path(post,path="/api/v1/knowledge/proposals/{proposal_id}/review",tag="telemetry",security(("bearer"=[])),params(("proposal_id"=Uuid,Path)),request_body=ReviewGraphProposal,responses((status=200,body=ReviewGraphResult),(status=403,body=crate::errors::ErrorResponse),(status=409,body=crate::errors::ErrorResponse)))]
+pub async fn review_graph_proposal(
+    State(state): State<AppState>, principal: Principal,
+    Path(proposal_id): Path<Uuid>, Json(input): Json<ReviewGraphProposal>,
+) -> Result<Json<ReviewGraphResult>, AppError> {
+    principal.require_admin()?;
+    if !matches!(input.decision.as_str(), "accept" | "reject") {
+        return Err(AppError::invalid("Decision must be accept or reject"));
+    }
+    if input.decision == "reject" && (input.technique_id.is_some() || input.predecessor_node_id.is_some()) {
+        return Err(AppError::invalid("Rejected proposals cannot create graph nodes"));
+    }
+    let mut tx = state.pool()?.begin().await?;
+    use sqlx::Row;
+    let row = sqlx::query("SELECT status,action_kind,process_class,resource_class,outcome,suggested_technique FROM attack_graph_proposals WHERE proposal_id=$1 FOR UPDATE")
+        .bind(proposal_id).fetch_optional(&mut *tx).await?.ok_or_else(AppError::not_found)?;
+    if row.get::<String, _>("status") != "pending" { return Err(AppError::conflict("Proposal was already reviewed")); }
+    let mut node_id = None;
+    let status = if input.decision == "accept" {
+        let technique = input.technique_id.or(row.get("suggested_technique"))
+            .ok_or_else(|| AppError::invalid("Choose an existing technique"))?;
+        let known: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM attack_techniques WHERE technique_id=$1 AND status='known')")
+            .bind(technique).fetch_one(&mut *tx).await?;
+        if !known { return Err(AppError::invalid("Technique is unknown or pending review")); }
+        if let Some(predecessor) = input.predecessor_node_id {
+            let belongs: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM attack_graph_nodes WHERE node_id=$1 AND technique_id=$2)")
+                .bind(predecessor).bind(technique).fetch_one(&mut *tx).await?;
+            if !belongs { return Err(AppError::invalid("Predecessor does not belong to technique")); }
+        }
+        let id = Uuid::new_v4();
+        let node_key = format!("variant.{}", id.simple());
+        sqlx::query("INSERT INTO attack_graph_nodes(node_id,technique_id,node_key,action_kind,process_class,resource_class,expected_outcome,evidence_level) VALUES($1,$2,$3,$4,$5,$6,$7,'attempt')")
+            .bind(id).bind(technique).bind(node_key)
+            .bind(row.get::<String, _>("action_kind"))
+            .bind(row.get::<String, _>("process_class"))
+            .bind(row.get::<String, _>("resource_class"))
+            .bind(row.get::<String, _>("outcome"))
+            .execute(&mut *tx).await?;
+        if let Some(predecessor) = input.predecessor_node_id {
+            sqlx::query("INSERT INTO attack_graph_edges(technique_id,from_node,to_node) VALUES($1,$2,$3)")
+                .bind(technique).bind(predecessor).bind(id).execute(&mut *tx).await?;
+        }
+        node_id = Some(id);
+        "accepted"
+    } else { "rejected" };
+    sqlx::query("UPDATE attack_graph_proposals SET status=$2,reviewed_by=$3,reviewed_at=now(),accepted_node_id=$4 WHERE proposal_id=$1")
+        .bind(proposal_id).bind(status).bind(principal.user.id).bind(node_id)
+        .execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(Json(ReviewGraphResult { proposal_id, status: status.to_owned(), node_id }))
 }
 
 impl TryFrom<StoredAttackEvent> for AttackEvent {
@@ -212,6 +285,12 @@ pub async fn ingest(
     Json(batch): Json<TelemetryBatch>,
 ) -> Result<(StatusCode, Json<IngestResponse>), AppError> {
     authorize(&state, &headers)?;
+    persist_batch(state, batch, false).await
+}
+
+async fn persist_batch(state: AppState, mut batch: TelemetryBatch, trusted_center: bool)
+    -> Result<(StatusCode, Json<IngestResponse>), AppError>
+{
     batch
         .validate(&state.config.telemetry, Utc::now())
         .map_err(validation_error)?;
@@ -219,6 +298,10 @@ pub async fn ingest(
     let body = serde_json::to_vec(&batch).map_err(|_| AppError::invalid("Invalid telemetry"))?;
     let batch_hash = Sha256::digest(body).to_vec();
     let mut tx = pool.begin().await?;
+    // A per-agent transaction lock serializes progress, including its first INSERT.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(batch.agent_id.to_string()).execute(&mut *tx).await?;
+
 
     if let Some(existing) = sqlx::query_scalar::<_, Vec<u8>>(
         "SELECT batch_hash FROM telemetry_batches WHERE batch_id=$1 FOR SHARE",
@@ -271,6 +354,7 @@ pub async fn ingest(
         .execute(&mut *tx)
         .await?;
 
+    batch.events.sort_by_key(|event| (event.occurred_at, event.sequence_no));
     let mut accepted_events = 0_usize;
     let mut duplicate_events = 0_usize;
     let received_at = Utc::now();
@@ -293,11 +377,16 @@ pub async fn ingest(
             if existing != hash {
                 return Err(AppError::conflict("Conflicting telemetry event ID"));
             }
+            // Middle may send the same event directly before Center mirrors it.
+            // The trusted, agent-bound Center delivery must still index the graph.
+            if trusted_center {
+                crate::attack_graph::observe(&mut tx, batch.agent_id, batch.server_id, event, true).await?;
+            }
             duplicate_events += 1;
             continue;
         }
         insert_event(&mut tx, &batch, event, &hash, received_at, expires_at).await?;
-        crate::attack_graph::observe(&mut tx, batch.agent_id, batch.server_id, event).await?;
+        crate::attack_graph::observe(&mut tx, batch.agent_id, batch.server_id, event, trusted_center).await?;
         accepted_events += 1;
     }
     tx.commit().await?;
@@ -317,10 +406,11 @@ pub async fn ingest(
 pub async fn ingest_from_center(
     State(state): State<AppState>, headers: HeaderMap, Json(input): Json<CenterEventInput>,
 ) -> Result<(StatusCode, Json<IngestResponse>), AppError> {
-    authorize(&state, &headers)?;
+    authorize_center(&state, &headers)?;
     let pool = state.pool()?;
-    let server_id: Uuid = sqlx::query_scalar("SELECT server_id FROM traps WHERE trap_id=$1")
-        .bind(input.event.trap_id).fetch_optional(pool).await?.ok_or_else(AppError::not_found)?;
+    let trap_id = input.event.trap_id;
+    let server_id: Uuid = sqlx::query_scalar("SELECT t.server_id FROM traps t JOIN center_agent_traps cat ON cat.trap_id=t.trap_id JOIN center_agent_servers cas ON cas.agent_id=cat.agent_id AND cas.server_id=t.server_id WHERE t.trap_id=$1 AND cat.agent_id=$2 AND cat.state <> 'removed'")
+        .bind(trap_id).bind(input.agent_id).fetch_optional(pool).await?.ok_or_else(AppError::not_found)?;
     let batch = TelemetryBatch {
         schema_version: SCHEMA_VERSION,
         // Stable across retries, so the existing idempotent batch path applies.
@@ -329,7 +419,10 @@ pub async fn ingest_from_center(
         server_id,
         events: vec![input.event],
     };
-    ingest(State(state), headers, Json(batch)).await
+    let result = persist_batch(state.clone(), batch, true).await?;
+    sqlx::query("UPDATE center_agent_traps SET state='running',updated_at=now() WHERE trap_id=$1 AND agent_id=$2 AND state='provisioning'")
+        .bind(trap_id).bind(input.agent_id).execute(state.pool()?).await?;
+    Ok(result)
 }
 
 async fn insert_event(
@@ -380,6 +473,14 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
         .as_bytes();
     let supplied = telemetry_bearer(headers).unwrap_or_default();
     if !constant_time_eq(expected, supplied) {
+        return Err(AppError::unauthorized());
+    }
+    Ok(())
+}
+
+pub(crate) fn authorize_center(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+    let expected = state.config.center_ingest_token.as_ref().ok_or_else(AppError::unauthorized)?;
+    if !constant_time_eq(expected.expose().as_bytes(), telemetry_bearer(headers).unwrap_or_default()) {
         return Err(AppError::unauthorized());
     }
     Ok(())

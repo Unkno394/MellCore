@@ -86,6 +86,26 @@ struct AgentIdentity {
 #[derive(Clone)]
 struct ComposeProjectStore {
     root: PathBuf,
+    mutation_lock: Arc<std::sync::Mutex<()>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct QuarantineMarker {
+    trigger: kazik_protocol::TrapEvent,
+    result_event_id: uuid::Uuid,
+}
+
+fn quarantine_result(marker: &QuarantineMarker, applied: bool) -> kazik_protocol::TrapEvent {
+    let mut event = marker.trigger.clone();
+    event.payload["trigger_event_type"] = serde_json::json!(event.event_type.clone());
+    event.payload["trigger_event_id"] = serde_json::json!(event.event_id);
+    event.event_type = if applied { "security.trap_quarantined" } else { "security.trap_quarantine_failed" }.into();
+    event.payload["quarantine_result"] = serde_json::json!(if applied { "applied" } else { "failed" });
+    event.metadata["assessment"] = serde_json::json!(if applied { "isolated" } else { "suspicious_unconfirmed" });
+    event.event_id = marker.result_event_id;
+    event.occurred_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|value| value.as_millis() as i64).unwrap_or_default();
+    event
 }
 
 #[derive(Clone)]
@@ -182,6 +202,7 @@ impl ComposeProjectStore {
     fn new(state_dir: &Path) -> Self {
         Self {
             root: state_dir.join("traps"),
+            mutation_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -213,6 +234,8 @@ impl ComposeProjectStore {
         pritvoryashka_image: &str,
         agent_id: uuid::Uuid,
     ) -> anyhow::Result<CommandResult> {
+        let _mutation = self.mutation_lock.lock()
+            .map_err(|_| anyhow::anyhow!("trap mutation lock is poisoned"))?;
         let command_id = command.command_id();
         let trap_id = match &command {
             AgentCommand::DeployKozyavka(deployment) => deployment.trap_id,
@@ -237,6 +260,14 @@ impl ComposeProjectStore {
         if completed.exists() {
             return Ok(serde_json::from_slice(&fs::read(completed)?)?);
         }
+        let deploying_quarantined = match &command {
+            AgentCommand::DeployKozyavka(_) | AgentCommand::DeployPritvoryashka(_) =>
+                self.root.join(trap_id.to_string()).join("security-quarantine.json").exists(),
+            AgentCommand::ReconcileTcpPortGroup(group) => group.members.iter().any(|member|
+                self.root.join(member.trap_id.to_string()).join("security-quarantine.json").exists()),
+            _ => false,
+        };
+        anyhow::ensure!(!deploying_quarantined, "trap is isolated after a security incident");
         let deferred_remove = matches!(&command, AgentCommand::RemoveTrap { .. })
             && self.root.join(trap_id.to_string()).join("compose.yaml").is_file();
         let result = match command {
@@ -599,6 +630,68 @@ impl ComposeProjectStore {
         Ok(())
     }
 
+    /// Unlike normal deletion, security isolation never rolls back to a running
+    /// container when route removal or Docker stop fails. Both are attempted.
+    fn isolate_project(&self, trap_id: uuid::Uuid) -> anyhow::Result<()> {
+        let project = self.root.join(trap_id.to_string());
+        let route = fs::read(project.join("manifest.json"))
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).map_err(Into::into))
+            .and_then(|manifest| self.detach_dispatcher_target(trap_id,
+                manifest["publish_address"].as_str() == Some("127.0.0.1")).map(|_| ()));
+        let stopped = self.compose(&project, trap_id, ["stop"]);
+        route?;
+        stopped?;
+        Ok(())
+    }
+
+    /// Preserve the trap and its evidence, detach only its Dispatcher route and
+    /// stop its container. Docker stop closes its established network sockets.
+    fn quarantine_trap(&self, trigger: &kazik_protocol::TrapEvent) -> anyhow::Result<kazik_protocol::TrapEvent> {
+        let _mutation = self.mutation_lock.lock()
+            .map_err(|_| anyhow::anyhow!("trap mutation lock is poisoned"))?;
+        let trap_id = trigger.trap_id;
+        let project = self.root.join(trap_id.to_string());
+        anyhow::ensure!(project.join("compose.yaml").is_file()
+            && (project.join("config.json").is_file() || project.join("pritvoryashka.json").is_file()),
+            "only an existing Low/Middle trap may be quarantined");
+        let marker = project.join("security-quarantine.json");
+        let record: QuarantineMarker = if marker.exists() {
+            serde_json::from_slice(&fs::read(&marker)?)?
+        } else {
+            let record = QuarantineMarker { trigger: trigger.clone(), result_event_id: uuid::Uuid::new_v4() };
+            atomic_write(&marker, &serde_json::to_vec(&record)?)?;
+            fs::File::open(&marker)?.sync_all()?;
+            fs::File::open(&project)?.sync_all()?;
+            record
+        };
+        anyhow::ensure!(record.trigger.trap_id == trap_id, "quarantine marker trap ID mismatch");
+        self.isolate_project(trap_id)?;
+        Ok(quarantine_result(&record, true))
+    }
+
+    fn recover_quarantines(&self) -> anyhow::Result<Vec<kazik_protocol::TrapEvent>> {
+        let mut results = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let Ok(trap_id) = uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()) else { continue };
+            let marker = entry.path().join("security-quarantine.json");
+            if marker.is_file() {
+                let result = (|| -> anyhow::Result<kazik_protocol::TrapEvent> {
+                    let record: QuarantineMarker = serde_json::from_slice(&fs::read(&marker)?)?;
+                    anyhow::ensure!(record.trigger.trap_id == trap_id, "quarantine marker trap ID mismatch");
+                    self.isolate_project(trap_id)?;
+                    Ok(quarantine_result(&record, true))
+                })();
+                match result {
+                    Ok(event) => results.push(event),
+                    Err(error) => tracing::error!(%trap_id, %error, "could not reapply trap quarantine after restart"),
+                }
+            }
+        }
+        Ok(results)
+    }
+
     fn detach_dispatcher_target(&self, trap_id: uuid::Uuid, shared_backend: bool) -> anyhow::Result<Option<Vec<u8>>> {
         let path = Path::new("/etc/honeyforge/dispatcher.json");
         let previous = match fs::read(path) {
@@ -843,6 +936,27 @@ async fn run_kazik_hysteria_loop(
     let mut telemetry_poll = tokio::time::interval(Duration::from_secs(5));
     let mut emergency_tick = tokio::time::interval(Duration::from_secs(1));
     let existing_incident = emergency::pending(state_dir)?;
+    let mut incident_message_id = existing_incident.as_ref().map(|incident| incident.message_id);
+    let mut missing_alert = None;
+    if let Some(incident) = existing_incident.as_ref() {
+        if emergency::alert_was_acknowledged(state_dir, incident.message_id)? {
+            // The ACK marker is durable before the SQLite deletion. Finish an
+            // interrupted deletion without resurrecting an acknowledged alert.
+            outbox.acknowledge(incident.message_id)?;
+        } else if outbox.contains(incident.message_id)? {
+            outbox.prioritize(incident.message_id)?;
+        } else {
+            let event = emergency::alert_event(state_dir, incident)?;
+            let mut envelope = KazikEnvelope::new(
+                identity.agent_id,
+                identity.transport_credential.clone(),
+                event.occurred_at_unix_ms,
+                KazikBody::Telemetry { events: vec![event] },
+            );
+            envelope.message_id = incident.message_id;
+            missing_alert = Some(envelope);
+        }
+    }
     let mut incident_active = existing_incident.is_some();
     let mut pending_emergency = existing_incident.filter(|incident| incident.response_armed).map(|incident| PendingEmergency {
         message_id: incident.message_id,
@@ -853,9 +967,18 @@ async fn run_kazik_hysteria_loop(
     let (security_tx, mut security_rx) = tokio::sync::mpsc::channel(256);
     tokio::spawn(security_monitor::run(projects.root.clone(), security_tx));
     let (confirmed_tx, mut confirmed_rx) = tokio::sync::mpsc::channel(8);
+    let (quarantine_tx, mut quarantine_rx) = tokio::sync::mpsc::channel(32);
     let validation_slots = Arc::new(tokio::sync::Semaphore::new(4));
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<CommandJob>(32);
     let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<CommandExecution>(32);
+    match projects.recover_quarantines() {
+        Ok(events) => for event in events {
+            outbox.enqueue(KazikEnvelope::new(identity.agent_id,
+                identity.transport_credential.clone(), event.occurred_at_unix_ms,
+                KazikBody::Telemetry { events: vec![event] }))?;
+        },
+        Err(error) => tracing::error!(%error, "could not scan persisted trap quarantines"),
+    }
     let worker_projects = projects.clone();
     let worker_kozyavka_image = kozyavka_image.to_owned();
     let worker_pritvoryashka_image = pritvoryashka_image.to_owned();
@@ -914,7 +1037,14 @@ async fn run_kazik_hysteria_loop(
         }
         let receiving_transport = transport.clone();
         tokio::select! {
-            _ = outbox_retry.tick(), if sender.is_some() => {
+            _ = outbox_retry.tick() => {
+                if let Some(alert) = missing_alert.clone() {
+                    let message_id = alert.message_id;
+                    match outbox.enqueue(alert).and_then(|_| outbox.prioritize(message_id)) {
+                        Ok(()) => missing_alert = None,
+                        Err(error) => tracing::error!(%error, %message_id, "escape alert could not be restored to SQLite; will retry"),
+                    }
+                }
                 if let Some(sender) = sender.as_ref() {
                     if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
                         tracing::warn!(%error, "Kazik outbox delivery retry failed");
@@ -943,6 +1073,35 @@ async fn run_kazik_hysteria_loop(
                 }
             }
             Some(observation) = security_rx.recv() => {
+                if observation.event.payload["policy_decision"] == "isolate_trap"
+                    && !incident_active {
+                    let projects = projects.clone();
+                    let trap_id = observation.event.trap_id;
+                    let event_id = observation.event.event_id;
+                    let candidate_is_being_validated = observation.candidate.is_some();
+                    let tx = quarantine_tx.clone();
+                    let trigger = observation.event.clone();
+                    tokio::spawn(async move {
+                        // Give the independent second-sample host-escape check a
+                        // brief chance to preserve evidence before stopping the trap.
+                        if candidate_is_being_validated {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                        let fallback = trigger.clone();
+                        let outcome = match tokio::task::spawn_blocking(move || projects.quarantine_trap(&trigger)).await {
+                            Ok(Ok(event)) => {
+                                tracing::error!(%trap_id, %event_id, "Low/Middle trap isolated; existing sessions closed");
+                                event
+                            }
+                            result => {
+                                tracing::error!(%trap_id, ?result, "trap quarantine failed; manual intervention required");
+                                quarantine_result(&QuarantineMarker { trigger: fallback,
+                                    result_event_id: uuid::Uuid::new_v4() }, false)
+                            }
+                        };
+                        let _ = tx.send(outcome).await;
+                    });
+                }
                 if !incident_active {
                     if let Some(candidate) = observation.candidate {
                         if let Ok(permit) = validation_slots.clone().try_acquire_owned() {
@@ -976,6 +1135,18 @@ async fn run_kazik_hysteria_loop(
                     }
                 }
             }
+            Some(event) = quarantine_rx.recv() => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
+                outbox.enqueue(KazikEnvelope::new(identity.agent_id,
+                    identity.transport_credential.clone(), now,
+                    KazikBody::Telemetry { events: vec![event] }))?;
+                if let Some(sender) = sender.as_ref() {
+                    if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
+                        tracing::warn!(%error, "quarantine result remains in SQLite outbox");
+                    }
+                }
+            }
             Some(event) = confirmed_rx.recv() => {
                 if !incident_active {
                     let now = std::time::SystemTime::now()
@@ -988,10 +1159,10 @@ async fn run_kazik_hysteria_loop(
                         KazikBody::Telemetry { events: vec![event.clone()] },
                     );
                     let message_id = envelope.message_id;
-                    outbox.enqueue(envelope)?;
                     let response_armed = emergency::armed();
                     emergency::record(state_dir, &event, message_id)?;
                     incident_active = true;
+                    incident_message_id = Some(message_id);
                     incident_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                     if response_armed {
                         pending_emergency = Some(PendingEmergency {
@@ -1000,7 +1171,14 @@ async fn run_kazik_hysteria_loop(
                             last_attempt: None,
                         });
                     }
-                    tracing::error!(trap_id = %event.trap_id, %message_id, "confirmed escape recorded; alert queued before emergency response");
+                    // A database failure must not cancel an already recorded local response.
+                    match outbox.enqueue(envelope.clone()).and_then(|_| outbox.prioritize(message_id)) {
+                        Ok(()) => tracing::error!(trap_id = %event.trap_id, %message_id, "confirmed escape recorded; alert queued before emergency response"),
+                        Err(error) => {
+                            missing_alert = Some(envelope);
+                            tracing::error!(%error, %message_id, "could not queue escape alert; local response remains active and queueing will retry");
+                        }
+                    }
                     if let Some(sender) = sender.as_ref() {
                         if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
                             tracing::warn!(%error, "confirmed escape alert remains in SQLite outbox");
@@ -1105,6 +1283,10 @@ async fn run_kazik_hysteria_loop(
                         match envelope.body {
                             KazikBody::Ack(ack)
                                 if matches!(ack.disposition, AckDisposition::Accepted | AckDisposition::Applied | AckDisposition::Duplicate) => {
+                                    if incident_message_id == Some(ack.acknowledged_message_id) {
+                                        emergency::record_alert_ack(state_dir, ack.acknowledged_message_id)?;
+                                        missing_alert = None;
+                                    }
                                     outbox.acknowledge(ack.acknowledged_message_id)?;
                                     if pending_emergency.as_ref().is_some_and(|pending| pending.message_id == ack.acknowledged_message_id) {
                                         match emergency::start(state_dir) {
@@ -1561,8 +1743,27 @@ fn atomic_write(path: &Path, content: &[u8]) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatcherConfig, DispatcherListener, DispatcherTarget, Platform, parse_platform};
+    use super::{DispatcherConfig, DispatcherListener, DispatcherTarget, Platform, QuarantineMarker, quarantine_result, parse_platform};
     use uuid::Uuid;
+
+    #[test]
+    fn quarantine_recovery_reuses_the_same_event_id() {
+        let trigger = kazik_protocol::TrapEvent {
+            event_id: Uuid::new_v4(), trap_id: Uuid::new_v4(), session_id: None,
+            source_sequence_no: None, occurred_at_unix_ms: 1, event_type: "security.resource_access".into(),
+            source_ip: None, source_port: None, destination_port: None,
+            protocol: "local".into(), service_type: "host_monitor".into(),
+            payload: serde_json::json!({"policy_decision":"isolate_trap"}),
+            metadata: serde_json::json!({"source":"hf-agent-ebpf"}),
+        };
+        let marker = QuarantineMarker { trigger, result_event_id: Uuid::new_v4() };
+        let first = quarantine_result(&marker, true);
+        let replay = quarantine_result(&marker, true);
+        assert_eq!(first.event_id, replay.event_id);
+        assert_eq!(first.payload["trigger_event_id"], marker.trigger.event_id.to_string());
+        assert_eq!(first.event_type, "security.trap_quarantined");
+        assert_eq!(quarantine_result(&marker, false).event_type, "security.trap_quarantine_failed");
+    }
 
     fn target(weight: u8) -> DispatcherTarget {
         DispatcherTarget {

@@ -44,8 +44,6 @@ write_secret('/etc/honeyforge/center.env', {
     'HF_CENTER_CLICKHOUSE_URL': 'http://127.0.0.1:8123',
     'HF_CENTER_CLICKHOUSE_USER': 'honeyforge',
     'HF_CENTER_CLICKHOUSE_PASSWORD': config['clickhouse_password'],
-    'HF_CENTER_POSTGRES_TELEMETRY_URL': 'http://127.0.0.1:18080/internal/v1/center/events',
-    'HF_CENTER_POSTGRES_TELEMETRY_TOKEN': config['telemetry_token'],
 })
 PY
 

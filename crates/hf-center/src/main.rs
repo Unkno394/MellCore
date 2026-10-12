@@ -11,7 +11,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path as RoutePath, State},
+    extract::{DefaultBodyLimit, Path as RoutePath, State},
     http::{HeaderMap, StatusCode},
     response::Html,
     routing::{get, post},
@@ -32,13 +32,16 @@ use uuid::Uuid;
 mod credentials;
 mod clickhouse;
 mod postgres_graph_sink;
+mod backend_registry;
+mod ingress_budget;
 mod telemetry_store;
 mod security_state;
 use clickhouse::ClickHouseTelemetry;
 use postgres_graph_sink::PostgresGraphSink;
+use backend_registry::BackendRegistry;
 use credentials::CredentialStore;
 use telemetry_store::TelemetryStore;
-use security_state::{AgentSecurityStore, CompromisedAgent};
+use security_state::{AgentSecurityStore, CompromisedAgent, IsolatedTrap, ResponseTier};
 
 #[derive(Parser)]
 struct Args {
@@ -109,6 +112,8 @@ struct AppState {
     command_statuses: Arc<Mutex<HashMap<Uuid, CommandStatus>>>,
     kazik_sequence: Arc<AtomicU64>,
     telemetry_store: Arc<Mutex<TelemetryStore>>,
+    backend_registry: Option<BackendRegistry>,
+    hysteria_auth_budget: Arc<Mutex<(std::time::Instant, u32)>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +197,21 @@ struct QueuedCommandResponse {
     status: &'static str,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExistingTrapRegistration {
+    trap_id: Uuid,
+    tier: String,
+    host_port: u16,
+}
+
+#[derive(Serialize)]
+struct ExistingTrapResponse {
+    agent_id: Uuid,
+    server_id: Uuid,
+    trap_id: Uuid,
+}
+
 #[derive(Clone, Serialize)]
 struct CommandStatus {
     #[serde(skip_serializing)]
@@ -226,7 +246,7 @@ impl HysteriaStats {
                 .error_for_status()?
                 .json()
                 .await?;
-            if !online.contains_key(&id) {
+            if online.get(&id).copied().unwrap_or(0) == 0 {
                 return Ok(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -336,6 +356,7 @@ async fn main() -> anyhow::Result<()> {
     let telemetry_file = args.telemetry_file.clone();
     let clickhouse_telemetry = ClickHouseTelemetry::from_env()?;
     let postgres_graph_sink = PostgresGraphSink::from_env()?;
+    let backend_registry = BackendRegistry::from_env()?;
     let state = AppState {
         enrollment_tokens: Arc::default(),
         bootstrap_jobs: Arc::default(),
@@ -357,7 +378,17 @@ async fn main() -> anyhow::Result<()> {
         command_statuses: Arc::default(),
         kazik_sequence: Arc::new(AtomicU64::new(1)),
         telemetry_store: Arc::new(Mutex::new(TelemetryStore::open(&telemetry_file)?)),
+        backend_registry,
+        hysteria_auth_budget: Arc::new(Mutex::new((std::time::Instant::now(), 0))),
     };
+    if let (Ok(local_id), Ok(local_host)) = (
+        std::env::var("HF_LOCAL_AGENT_ID"), std::env::var("HF_LOCAL_AGENT_TARGET")) {
+        let local_id: Uuid = local_id.parse()?;
+        let mut security = state.agent_security.lock().await;
+        if security.target(&local_id).is_none() {
+            security.set_target(local_id, local_host, 22)?;
+        }
+    }
     if let Some(sink) = clickhouse_telemetry {
         let spool = telemetry_file.clone();
         tokio::spawn(async move {
@@ -383,7 +414,7 @@ async fn main() -> anyhow::Result<()> {
                 interval.tick().await;
                 match sink.flush_spool(&spool).await {
                     Ok(0) => {}
-                    Ok(events) => info!(events, "Center events indexed by PostgreSQL attack graph"),
+                    Ok(events) => info!(events, "Center graph spool records processed (rejections retained separately)"),
                     Err(error) => warn!(%error, "PostgreSQL graph ingestion failed; durable Center spool retained"),
                 }
             }
@@ -399,11 +430,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/agents/bootstrap", post(bootstrap))
         .route("/v1/agents/bootstrap/{job_id}", get(bootstrap_status))
         .route("/v1/agents/register", post(register))
-        .route("/v1/hysteria/auth", post(hysteria_auth))
+        .route("/v1/hysteria/auth", post(hysteria_auth).layer(DefaultBodyLimit::max(4096)))
         .route("/v1/agents/{agent_id}/commands", post(queue_command))
         .route("/v1/agents/{agent_id}/commands/{message_id}", get(command_status))
         .route("/v1/agents/{agent_id}/revoke", post(revoke_agent))
+        .route("/v1/agents/{agent_id}/traps/register", post(register_existing_trap))
         .route("/v1/agents/compromised", get(list_compromised_agents))
+        .route("/v1/traps/isolated", get(list_isolated_traps))
         .with_state(state);
     info!(address = %listen, "HoneyForge center listening");
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -453,7 +486,7 @@ async fn bootstrap(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
     let agent_id = Uuid::new_v4();
-    if let Err(error) = state.agent_security.lock().await.set_target(agent_id, target) {
+    if let Err(error) = state.agent_security.lock().await.set_target(agent_id, target, request.ssh_port) {
         tracing::error!(%error, %agent_id, "could not persist target host for new agent");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -655,6 +688,15 @@ async fn hysteria_auth(
     State(state): State<AppState>,
     Json(request): Json<HysteriaAuthRequest>,
 ) -> Json<HysteriaAuthResponse> {
+    // This endpoint is consulted before Hysteria admits a client. Bound the
+    // credential-check work even when the request carries an unknown password.
+    let mut budget = state.hysteria_auth_budget.lock().await;
+    if budget.0.elapsed() >= std::time::Duration::from_secs(1) {
+        *budget = (std::time::Instant::now(), 0);
+    }
+    if budget.1 >= 512 { return Json(HysteriaAuthResponse { ok: false, id: None }); }
+    budget.1 += 1;
+    drop(budget);
     let security = state.agent_security.lock().await;
     let credentials = state.agent_credentials.lock().await;
     let agent_id = credentials.authenticate(&request.auth);
@@ -669,19 +711,54 @@ async fn hysteria_auth(
 
 /// This is deliberately disabled unless `HF_CONTROL_TOKEN` is configured. It is an internal
 /// bridge for the panel/control-plane service, not an internet-facing substitute for user auth.
+async fn register_existing_trap(
+    State(state): State<AppState>,
+    RoutePath(agent_id): RoutePath<Uuid>,
+    headers: HeaderMap,
+    Json(input): Json<ExistingTrapRegistration>,
+) -> Result<Json<ExistingTrapResponse>, StatusCode> {
+    authorize_control(&state, &headers)?;
+    if input.trap_id.is_nil() || input.host_port == 0
+        || !matches!(input.tier.as_str(), "low" | "middle") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let registry = state.backend_registry.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut security = state.agent_security.lock().await;
+    if security.is_compromised(&agent_id) { return Err(StatusCode::GONE); }
+    if state.agent_credentials.lock().await.get(&agent_id).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let (target, ssh_port) = security.target(&agent_id).ok_or(StatusCode::CONFLICT)?;
+    let server_id = registry.register(agent_id, input.trap_id, target, ssh_port,
+        &input.tier, input.host_port).await.map_err(|error| {
+            warn!(%error, "existing trap registration failed"); StatusCode::BAD_GATEWAY
+        })?;
+    security.register_trap(agent_id, input.trap_id).map_err(|error| {
+        warn!(%error, "could not persist existing trap ownership"); StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(ExistingTrapResponse { agent_id, server_id, trap_id: input.trap_id }))
+}
+
 async fn queue_command(
     State(state): State<AppState>,
     RoutePath(agent_id): RoutePath<Uuid>,
     headers: HeaderMap,
-    Json(command): Json<AgentCommand>,
+    Json(mut command): Json<AgentCommand>,
 ) -> Result<Json<QueuedCommandResponse>, StatusCode> {
     authorize_control(&state, &headers)?;
     // Keep the security-state lock until the queue write completes. The incident
     // path takes it first too, so a command cannot slip in behind compromise handling.
-    let security = state.agent_security.lock().await;
+    let mut security = state.agent_security.lock().await;
     if security.is_compromised(&agent_id) {
         return Err(StatusCode::GONE);
     }
+    let deploys_isolated = match &command {
+        AgentCommand::DeployKozyavka(item) => security.is_trap_isolated(item.trap_id),
+        AgentCommand::DeployPritvoryashka(item) => security.is_trap_isolated(item.trap_id),
+        AgentCommand::ReconcileTcpPortGroup(group) => group.members.iter().any(|member| security.is_trap_isolated(member.trap_id)),
+        _ => false,
+    };
+    if deploys_isolated { return Err(StatusCode::CONFLICT); }
     let credential = state
         .agent_credentials
         .lock()
@@ -689,12 +766,41 @@ async fn queue_command(
         .get(&agent_id)
         .cloned()
         .ok_or(StatusCode::NOT_FOUND)?;
+    match &mut command {
+        AgentCommand::DeployKozyavka(deployment) => {
+            let registry = state.backend_registry.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            let (target, ssh_port) = security.target(&agent_id).ok_or(StatusCode::CONFLICT)?;
+            registry.register(agent_id, deployment.trap_id, target, ssh_port, "low", deployment.host_port)
+                .await.map_err(|error| { warn!(%error, "backend trap registration failed"); StatusCode::BAD_GATEWAY })?;
+            security.register_trap(agent_id, deployment.trap_id)
+                .map_err(|error| { warn!(%error, "could not persist trap ownership"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        }
+        AgentCommand::DeployPritvoryashka(deployment) => {
+            let registry = state.backend_registry.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            let (target, ssh_port) = security.target(&agent_id).ok_or(StatusCode::CONFLICT)?;
+            let server_id = registry.register(agent_id, deployment.trap_id, target, ssh_port, "middle", deployment.host_port)
+                .await.map_err(|error| { warn!(%error, "backend trap registration failed"); StatusCode::BAD_GATEWAY })?;
+            deployment.server_id = server_id;
+            security.register_trap(agent_id, deployment.trap_id)
+                .map_err(|error| { warn!(%error, "could not persist trap ownership"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        }
+        AgentCommand::StopTrap { trap_id, .. } | AgentCommand::RemoveTrap { trap_id, .. } => {
+            if !security.owns_trap(agent_id, *trap_id) { return Err(StatusCode::NOT_FOUND); }
+        }
+        _ => {}
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default();
+    let removal = match &command { AgentCommand::RemoveTrap { trap_id, .. } => Some(*trap_id), _ => None };
     let envelope = KazikEnvelope::new(agent_id, credential, now, KazikBody::Command { command });
     let message_id = envelope.message_id;
+    if let Some(trap_id) = removal {
+        security.record_removal(message_id, agent_id, trap_id).map_err(|error| {
+            warn!(%error, "could not persist pending trap removal"); StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
     state.command_statuses.lock().await.insert(message_id, CommandStatus {
         agent_id,
         status: "queued",
@@ -776,6 +882,13 @@ async fn list_compromised_agents(
     Ok(Json(state.agent_security.lock().await.compromised()))
 }
 
+async fn list_isolated_traps(
+    State(state): State<AppState>, headers: HeaderMap,
+) -> Result<Json<Vec<IsolatedTrap>>, StatusCode> {
+    authorize_control(&state, &headers)?;
+    Ok(Json(state.agent_security.lock().await.isolated_traps()))
+}
+
 async fn mark_agent_compromised(
     state: &AppState,
     agent_id: Uuid,
@@ -814,13 +927,14 @@ async fn retry_compromised_kicks(state: AppState) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
     loop {
         interval.tick().await;
-        let pending: Vec<_> = state.agent_security.lock().await.compromised()
-            .into_iter()
-            .filter(|record| !record.transport_disconnected)
-            .map(|record| record.agent_id)
-            .collect();
-        for agent_id in pending {
-            disconnect_compromised_agent(&state, agent_id).await;
+        let records = state.agent_security.lock().await.compromised();
+        for record in records {
+            if let Err(error) = state.agent_credentials.lock().await.remove(&record.agent_id) {
+                tracing::error!(%error, agent_id=%record.agent_id, "retry of credential revocation failed");
+            }
+            if !record.transport_disconnected {
+                disconnect_compromised_agent(&state, record.agent_id).await;
+            }
         }
     }
 }
@@ -834,6 +948,7 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
         }
     };
     info!(%listen, "Kazik UDP receiver listening behind transport adapters");
+    let mut budget = ingress_budget::IngressBudget::default();
     let mut buffer = vec![0_u8; hf_core::HFSP_HEADER_LEN + hf_core::HFSP_MAX_PAYLOAD_LEN];
     loop {
         let (length, peer) = match socket.recv_from(&mut buffer).await {
@@ -843,8 +958,10 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
                 continue;
             }
         };
+        // Reject floods before HFSP parsing, JSON allocation or credential lookup.
+        if !budget.allow_preauth(length, std::time::Instant::now()) { continue; }
         let Ok((envelope, sequence, _)) = KazikEnvelope::decode_hfsp(&buffer[..length]) else {
-            tracing::warn!(%peer, "discarded malformed Kazik packet");
+            tracing::debug!(%peer, "discarded malformed Kazik packet");
             continue;
         };
         let compromised = state.agent_security.lock().await.is_compromised(&envelope.agent_id);
@@ -855,11 +972,47 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
             .get(&envelope.agent_id)
             .is_some_and(|credential| credential == &envelope.transport_credential);
         if !authorized {
-            tracing::warn!(agent_id = %envelope.agent_id, %peer, "discarded Kazik packet with invalid agent credential");
+            tracing::debug!(agent_id = %envelope.agent_id, %peer, "discarded Kazik packet with invalid agent credential");
             continue;
+        }
+        if !budget.allow(envelope.agent_id, length, std::time::Instant::now()) {
+            continue; // No ACK: retry after the budget resets.
+        }
+        let mut unregistered_telemetry = false;
+        if let KazikBody::Telemetry { events } = &envelope.body {
+            if events.is_empty() || events.len() > 128 || events.iter().any(|event|
+                event.event_id.is_nil() || event.trap_id.is_nil()
+                || event.event_type.is_empty() || event.event_type.len() > 128
+                || event.service_type.len() > 64 || event.protocol.len() > 32
+                || !event.payload.is_object() || !event.metadata.is_object()) {
+                tracing::debug!(agent_id=%envelope.agent_id, "discarded invalid telemetry shape");
+                continue;
+            }
+            let security = state.agent_security.lock().await;
+            if events.iter().any(|event| !security.owns_trap(envelope.agent_id, event.trap_id)) {
+                unregistered_telemetry = true;
+            }
         }
         if let KazikBody::Ack(ack) = &envelope.body {
             if matches!(ack.disposition, AckDisposition::Applied | AckDisposition::Duplicate | AckDisposition::Rejected) {
+                let mut security = state.agent_security.lock().await;
+                if let Some(removal) = security.pending_removal(ack.acknowledged_message_id) {
+                    if removal.agent_id != envelope.agent_id { continue; }
+                    let applied = !matches!(ack.disposition, AckDisposition::Rejected);
+                    if applied {
+                        let Some(registry) = state.backend_registry.as_ref() else { continue };
+                        if let Err(error) = registry.mark_removed(envelope.agent_id, removal.trap_id).await {
+                            tracing::error!(%error, agent_id=%envelope.agent_id,
+                                "backend trap removal not confirmed; agent ACK will retry");
+                            continue;
+                        }
+                    }
+                    if let Err(error) = security.finish_removal(ack.acknowledged_message_id, applied) {
+                        tracing::error!(%error, "could not persist completed trap removal; agent ACK will retry");
+                        continue;
+                    }
+                }
+                drop(security);
                 let mut pending = state.pending_commands.lock().await;
                 if let Some(commands) = pending.get_mut(&envelope.agent_id) {
                     commands.retain(|command| command.message_id != ack.acknowledged_message_id);
@@ -895,6 +1048,27 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
         let mut compromise_to_kick = None;
         let disposition = match &envelope.body {
             KazikBody::Telemetry { events } => {
+                if unregistered_telemetry {
+                    match state.telemetry_store.lock().await.reject(envelope.agent_id, events) {
+                        Ok(count) => tracing::warn!(agent_id=%envelope.agent_id, count,
+                            "quarantined telemetry for unregistered trap"),
+                        Err(error) => {
+                            tracing::error!(%error, agent_id=%envelope.agent_id,
+                                "could not quarantine unregistered telemetry; leaving unacknowledged");
+                            continue;
+                        }
+                    }
+                    if let Some(incident) = events.iter().find(|event|
+                        AgentSecurityStore::response_for_event(event) == ResponseTier::QuarantineHost) {
+                        if let Err(error) = mark_agent_compromised(&state, envelope.agent_id, incident).await {
+                            tracing::error!(%error, agent_id=%envelope.agent_id,
+                                "unregistered incident quarantined but revocation failed; leaving unacknowledged");
+                            continue;
+                        }
+                        compromise_to_kick = Some(envelope.agent_id);
+                    }
+                    AckDisposition::Accepted
+                } else {
                 let stored = match state.telemetry_store.lock().await.persist(envelope.agent_id, events) {
                     Ok(stored) => stored,
                     Err(error) => {
@@ -903,7 +1077,19 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
                     }
                 };
                 tracing::info!(agent_id = %envelope.agent_id, received = events.len(), stored, "Kazik telemetry persisted");
-                if let Some(incident) = events.iter().find(|event| AgentSecurityStore::is_confirmed_escape(event)) {
+                let mut isolation_failed = false;
+                for event in events.iter().filter(|event|
+                    AgentSecurityStore::response_for_event(event) == ResponseTier::IsolateTrap) {
+                    if let Err(error) = state.agent_security.lock().await.mark_trap_isolated(envelope.agent_id, event) {
+                        tracing::error!(%error, trap_id=%event.trap_id,
+                            "could not persist isolated trap state; leaving telemetry unacknowledged");
+                        isolation_failed = true;
+                        break;
+                    }
+                }
+                if isolation_failed { continue; }
+                if let Some(incident) = events.iter().find(|event|
+                    AgentSecurityStore::response_for_event(event) == ResponseTier::QuarantineHost) {
                     if let Err(error) = mark_agent_compromised(&state, envelope.agent_id, incident).await {
                         tracing::error!(%error, agent_id = %envelope.agent_id, "could not persist compromise state; leaving incident unacknowledged");
                         continue;
@@ -911,6 +1097,7 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
                     compromise_to_kick = Some(envelope.agent_id);
                 }
                 AckDisposition::Accepted
+                }
             }
             KazikBody::Heartbeat { .. } => AckDisposition::Accepted,
             KazikBody::Register(_) | KazikBody::Command { .. } | KazikBody::Error { .. } => {
@@ -945,7 +1132,8 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
         if let Some(agent_id) = compromise_to_kick {
             // ACK the durable incident before closing the QUIC session so the agent
             // can stop retrying and execute its locally armed emergency response.
-            disconnect_compromised_agent(&state, agent_id).await;
+            let kick_state = state.clone();
+            tokio::spawn(async move { disconnect_compromised_agent(&kick_state, agent_id).await; });
         }
         if matches!(envelope.body, KazikBody::Heartbeat { .. }) {
             send_next_command(&socket, peer, &state, envelope.agent_id).await;

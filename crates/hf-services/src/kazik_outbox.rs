@@ -72,7 +72,30 @@ impl SqliteKazikOutbox {
               ON kazik_outbox(created_at_unix_ms, message_id);
             ",
         )?;
+        let has_priority = {
+            let mut statement = connection.prepare("PRAGMA table_info(kazik_outbox)")?;
+            let columns = statement.query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            columns.iter().any(|name| name == "priority")
+        };
+        if !has_priority {
+            connection.execute("ALTER TABLE kazik_outbox ADD COLUMN priority INTEGER NOT NULL DEFAULT 0", [])?;
+        }
         Ok(Self { connection })
+    }
+
+    /// Scheduling priority never changes immutable bytes or an assigned sequence.
+    pub fn prioritize(&mut self, message_id: Uuid) -> Result<(), SqliteOutboxError> {
+        self.connection.execute("UPDATE kazik_outbox SET priority=1 WHERE message_id=?1", [message_id.to_string()])?;
+        Ok(())
+    }
+
+    pub fn contains(&self, message_id: Uuid) -> Result<bool, SqliteOutboxError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM kazik_outbox WHERE message_id=?1)",
+            [message_id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?)
     }
 
     fn encode(envelope: &KazikEnvelope) -> Result<Vec<u8>, SqliteOutboxError> {
@@ -94,7 +117,7 @@ impl SqliteKazikOutbox {
         let rows = {
             let mut statement = transaction.prepare(
                 "SELECT message_id, envelope_json, sequence_no FROM kazik_outbox
-                 ORDER BY created_at_unix_ms, message_id LIMIT ?1",
+                 ORDER BY priority DESC, created_at_unix_ms, message_id LIMIT ?1",
             )?;
             statement
                 .query_map([i64::try_from(maximum).unwrap_or(i64::MAX)], |row| {
@@ -175,7 +198,7 @@ impl DurableOutbox for SqliteKazikOutbox {
     fn pending(&self, maximum: usize) -> Result<Vec<KazikEnvelope>, Self::Error> {
         let mut statement = self.connection.prepare(
             "SELECT envelope_json FROM kazik_outbox
-             ORDER BY created_at_unix_ms, message_id LIMIT ?1",
+             ORDER BY priority DESC, created_at_unix_ms, message_id LIMIT ?1",
         )?;
         let rows = statement.query_map([i64::try_from(maximum).unwrap_or(i64::MAX)], |row| {
             row.get::<_, Vec<u8>>(0)
@@ -230,6 +253,24 @@ mod tests {
                 },
             },
         )
+    }
+
+    #[test]
+    fn priority_survives_restart_without_changing_sequence() {
+        let path = std::env::temp_dir().join(format!("hf-priority-{}.sqlite", Uuid::new_v4()));
+        let mut outbox = SqliteKazikOutbox::open(&path).unwrap();
+        let old = heartbeat(); let mut alert = heartbeat(); alert.sent_at_unix_ms = 200;
+        outbox.enqueue(old.clone()).unwrap(); outbox.enqueue(alert.clone()).unwrap();
+        let sequence = outbox.ready_to_send(10).unwrap()[1].sequence;
+        outbox.prioritize(alert.message_id).unwrap(); drop(outbox);
+        let mut restored = SqliteKazikOutbox::open(&path).unwrap();
+        assert_eq!(restored.pending(1).unwrap()[0].message_id, alert.message_id);
+        let ready = restored.ready_to_send(1).unwrap();
+        assert_eq!(ready[0].envelope.message_id, alert.message_id);
+        assert_eq!(ready[0].sequence, sequence);
+        restored.acknowledge(alert.message_id).unwrap();
+        assert_eq!(restored.pending(1).unwrap()[0].message_id, old.message_id);
+        drop(restored); fs::remove_file(path).unwrap();
     }
 
     #[test]

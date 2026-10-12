@@ -70,6 +70,10 @@ telemetry. Несовместимый набор остановит устано
   only an independently confirmed host escape is marked confirmed. Owned results are available at
   `GET /api/v1/traps/{trap_id}/attack-matches`; administrators can inspect aggregated unknown
   action proposals at `GET /api/v1/knowledge/proposals` before manually curating the knowledge base.
+  Новые Low/Middle из dev-panel сначала проходят регистрацию в общих таблицах
+  `servers`/`traps` backend. Center сохраняет привязку agent/trap и отправляет
+  неизвестные события в отдельный `events.rejected.jsonl`. Старые ловушки,
+  поставленные до этой версии, требуют отдельной сверки перед обновлением Center.
 
 Данные входа и Control token: `/root/mellcore-access.txt`, права 0600.
 Секреты не коммитятся. Повторный запуск использует прежнюю БД, passwords и resource IDs.
@@ -136,7 +140,9 @@ Ubuntu/Debian bootstrap устанавливает `bpftrace` и `nftables`.
 Неожиданный бинарник внутри контейнера и совпадение одного namespace с хостом
 дают только подозрение. Для `security.escape_confirmed` агент через 250 мс
 повторно проверяет тот же PID/starttime, оба host namespaces, cgroup
-конкретного контейнера, Docker label и безопасные runtime-настройки.
+конкретного контейнера и Docker label. Init контейнера должен оставаться
+в собственных PID/mount namespaces; изменение лимита ресурсов само по себе
+не отменяет доказательство перехода другого процесса в host namespaces.
 Подтверждённый инцидент сохраняется в root-owned каталоге `security`, его
 сообщение кладётся в SQLite outbox, новые команды блокируются. Агент ждёт ACK
 Center до 15 секунд, после чего запускает `honeyforge-emergency.service`.
@@ -174,9 +180,11 @@ SSH-сессий. У обоих root filesystem read-only,
 namespaces запрещены. Low запускается от пользователя образа 65532 и имеет
 только read-only конфиг-монтирование. Middle работает с SSH host key в одном
 отдельном writable runtime-монтировании; остальные файлы контейнера read-only.
-При проверке кандидата побега агент сверяет эти ограничения с `docker inspect`,
-а также отклоняет дополнительные mounts и опубликованные порты. Этот runtime
-снимок проверяется именно при проверке кандидата, а не непрерывно.
+Агент сверяет ограничения с `docker inspect` при обновлении инвентаря
+(обычно каждые 10 секунд) и сообщает отклонения. Проверяются также CapAdd,
+доступ к устройствам, unconfined-профили, sharing namespaces и точные источники
+bind mounts. Это аудит: неожиданные настройки не исправляются автоматически.
+Подтверждение побега отдельно проверяет сохранённый cgroup и namespaces.
 
 Low разрешён только один сетевой listener TCP для SSH banner; SSH-аутентификации,
 shell и запуска команд в Low нет. Middle принимает SSH и исполняет фиксированный
@@ -190,8 +198,8 @@ shell и запуска команд в Low нет. Middle принимает SS
 
 Сетевой egress контейнеров пока не ограничен allowlist-ом: Docker-изоляция
 пространств и публикация заданного SSH-порта настроены, но исходящие соединения
-из контейнера ещё не запрещены. Политика разрешённых доменов/IP и непрерывный
-контроль изменения Docker-конфигурации остаются следующими задачами. Неожиданные
+из контейнера ещё не запрещены. Политика разрешённых доменов/IP и события ядра для файловых/сетевых операций
+остаются следующими задачами. Неожиданные
 исполняемые файлы сейчас дают событие/предупреждение, но не принудительно
 завершаются.
 
@@ -215,3 +223,8 @@ cat /root/mellcore-access.txt
 
 Firewall хостинга должен пропускать TCP 80, TCP/UDP 443 и TCP 2222.
 SSH сервера и панель ISPmanager продолжают использовать свои прежние порты.
+
+## Проверка графа и аварийной реакции
+
+См. [SECURITY-VALIDATION.md](SECURITY-VALIDATION.md): границы доказательств,
+тесты, отдельный секрет Center → backend и порядок обновления схемы PostgreSQL.

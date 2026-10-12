@@ -1,4 +1,4 @@
-use super::{PASSWORD, Session, TELEMETRY_TOKEN, login, profile, request};
+use super::{CENTER_TOKEN, PASSWORD, Session, TELEMETRY_TOKEN, login, profile, request};
 use axum::{Router, http::StatusCode};
 use honeyforge_backend::{
     api::{AppState, router_with_state},
@@ -820,6 +820,61 @@ pub async fn run(parent: &sqlx::PgPool, url: &str, config: &Config) {
             .unwrap(),
         1
     );
+    // Real SQL graph path: separate Center auth, incremental progress and replay.
+    let center = Session { token: CENTER_TOKEN.into() };
+    let center_agent_id = Uuid::new_v4();
+    // An existing user-owned trap can be attached to Center by an explicit
+    // control-plane binding; an agent-supplied trap ID alone is insufficient.
+    sqlx::query("INSERT INTO center_agent_servers(agent_id,server_id) VALUES($1,$2)")
+        .bind(center_agent_id).bind(sid2.parse::<Uuid>().unwrap()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO center_agent_traps(trap_id,agent_id,state) VALUES($1,$2,'running')")
+        .bind(middle["trap_id"].as_str().unwrap().parse::<Uuid>().unwrap())
+        .bind(center_agent_id).execute(&pool).await.unwrap();
+    let mut direct_first = event.clone();
+    direct_first["event_id"] = json!(Uuid::new_v4());
+    direct_first["occurred_at"] = json!(chrono::Utc::now());
+    let direct_first_id: Uuid = direct_first["event_id"].as_str().unwrap().parse().unwrap();
+    call(&app, "POST", "/internal/v1/telemetry/batches", Some(&telemetry),
+        json!({"schema_version":1,"batch_id":Uuid::new_v4(),"agent_id":center_agent_id,
+            "server_id":sid2,"events":[direct_first.clone()]}), 202).await;
+    let mirrored = call(&app, "POST", "/internal/v1/center/events", Some(&center),
+        json!({"agent_id":center_agent_id,"event":direct_first}), 202).await;
+    assert_eq!(mirrored["duplicate_events"], 1);
+    let normalized: i64 = sqlx::query_scalar("SELECT count(*) FROM normalized_attack_actions WHERE event_id=$1")
+        .bind(direct_first_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(normalized, 1);
+    let mut action = event.clone();
+    action["event_id"] = json!(Uuid::new_v4());
+    action["occurred_at"] = json!(chrono::Utc::now());
+    action["payload"] = json!({"command":"docker", "exit_status":0});
+    let first_input = json!({"agent_id":center_agent_id,"event":action});
+    call(&app, "POST", "/internal/v1/center/events", Some(&telemetry), first_input.clone(), 401).await;
+    assert_eq!(call(&app, "POST", "/internal/v1/center/events", Some(&center), first_input.clone(), 202)
+        .await["accepted_events"], 1);
+    assert_eq!(call(&app, "POST", "/internal/v1/center/events", Some(&center), first_input, 202)
+        .await["duplicate_events"], 1);
+    action["event_id"] = json!(Uuid::new_v4());
+    action["occurred_at"] = json!(chrono::Utc::now());
+    action["payload"] = json!({"command":"nsenter", "exit_status":1});
+    call(&app, "POST", "/internal/v1/center/events", Some(&center),
+        json!({"agent_id":center_agent_id,"event":action}), 202).await;
+    let matches = call(&app, "GET", &format!("{middle_path}/attack-matches"), Some(&a), Value::Null, 200).await;
+    assert_eq!(matches.as_array().unwrap().len(), 1);
+    assert_eq!(matches[0]["status"], "attempt");
+    assert_eq!(matches[0]["evidence_domain"], "simulated");
+    assert_eq!(matches[0]["evidence_event_ids"].as_array().unwrap().len(), 2);
+    assert!(matches[0]["similarity"].as_f64().unwrap() < 1.0);
+    // A new event repeating a matched action cannot increase node coverage.
+    action["event_id"] = json!(Uuid::new_v4());
+    action["occurred_at"] = json!(chrono::Utc::now());
+    call(&app, "POST", "/internal/v1/center/events", Some(&center),
+        json!({"agent_id":center_agent_id,"event":action}), 202).await;
+    let repeated = call(&app, "GET", &format!("{middle_path}/attack-matches"), Some(&a), Value::Null, 200).await;
+    assert_eq!(repeated[0]["similarity"], matches[0]["similarity"]);
+    action["trap_id"] = json!(Uuid::new_v4());
+    action["event_id"] = json!(Uuid::new_v4());
+    call(&app, "POST", "/internal/v1/center/events", Some(&center),
+        json!({"agent_id":center_agent_id,"event":action}), 404).await;
     sqlx::query("DELETE FROM attack_events")
         .execute(&pool)
         .await
@@ -828,7 +883,39 @@ pub async fn run(parent: &sqlx::PgPool, url: &str, config: &Config) {
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("DELETE FROM center_agent_traps WHERE agent_id=$1")
+        .bind(center_agent_id).execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM center_agent_servers WHERE agent_id=$1")
+        .bind(center_agent_id).execute(&pool).await.unwrap();
     call(&app, "DELETE", &middle_path, Some(&a), Value::Null, 204).await;
+
+    // Center creates the same canonical trap row that the user-facing API lists.
+    let dev_agent = Uuid::new_v4();
+    let dev_trap = Uuid::new_v4();
+    let registration = json!({"agent_id":dev_agent,"server_id":null,"trap_id":dev_trap,
+        "host":"192.0.2.80","ssh_port":22,"tier":"middle","host_port":2224});
+    call(&app, "POST", "/internal/v1/center/traps", Some(&telemetry), registration.clone(), 401).await;
+    let registered = call(&app, "POST", "/internal/v1/center/traps", Some(&center), registration.clone(), 201).await;
+    assert_eq!(registered["trap_id"], dev_trap.to_string());
+    let again = call(&app, "POST", "/internal/v1/center/traps", Some(&center), registration, 201).await;
+    assert_eq!(again["server_id"], registered["server_id"]);
+    assert_eq!(call(&app, "GET", &format!("/api/v1/traps/{dev_trap}"), Some(&admin), Value::Null, 200)
+        .await["server_id"], registered["server_id"]);
+    let foreign_agent = Uuid::new_v4();
+    let mut forged = event.clone();
+    forged["event_id"] = json!(Uuid::new_v4());
+    forged["trap_id"] = json!(dev_trap);
+    forged["occurred_at"] = json!(chrono::Utc::now());
+    call(&app, "POST", "/internal/v1/center/events", Some(&center),
+        json!({"agent_id":foreign_agent,"event":forged.clone()}), 404).await;
+    call(&app, "POST", "/internal/v1/center/traps/removed", Some(&telemetry),
+        json!({"agent_id":dev_agent,"trap_id":dev_trap}), 401).await;
+    call(&app, "POST", "/internal/v1/center/traps/removed", Some(&center),
+        json!({"agent_id":dev_agent,"trap_id":dev_trap}), 204).await;
+    assert_eq!(call(&app, "GET", &format!("/api/v1/traps/{dev_trap}"), Some(&admin), Value::Null, 200)
+        .await["actual_state"], "removed");
+    call(&app, "POST", "/internal/v1/center/events", Some(&center),
+        json!({"agent_id":dev_agent,"event":forged}), 404).await;
 
     // Demotion preserves reads but removes all mutation rights and revokes old JWT.
     let account_path = format!("/api/v1/users/{}", a_user["id"].as_str().unwrap());
