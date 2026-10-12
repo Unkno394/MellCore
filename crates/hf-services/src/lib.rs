@@ -1,6 +1,7 @@
 //! Infrastructure adapters. This crate may depend on sockets, processes and observability;
 //! `hf-core` never does.
 
+pub mod high_telemetry;
 pub mod kazik_outbox;
 
 use std::{

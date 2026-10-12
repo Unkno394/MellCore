@@ -9,24 +9,40 @@ use serde_json::json;
 
 use crate::telemetry_store::StoredTelemetryEvent;
 
-pub struct PostgresGraphSink { client: Client, endpoint: String, token: String }
+pub struct PostgresGraphSink {
+    client: Client,
+    endpoint: String,
+    token: String,
+}
 
 impl PostgresGraphSink {
     pub fn from_env() -> anyhow::Result<Option<Self>> {
-        let Ok(endpoint) = std::env::var("HF_CENTER_POSTGRES_TELEMETRY_URL") else { return Ok(None) };
+        let Ok(endpoint) = std::env::var("HF_CENTER_POSTGRES_TELEMETRY_URL") else {
+            return Ok(None);
+        };
         let token = std::env::var("HF_CENTER_POSTGRES_TELEMETRY_TOKEN")
             .context("HF_CENTER_POSTGRES_TELEMETRY_TOKEN is required with PostgreSQL graph URL")?;
         let url = url::Url::parse(&endpoint)?;
-        anyhow::ensure!(url.scheme() == "http" && url.host_str() == Some("127.0.0.1"), "PostgreSQL graph sink must use the local backend over loopback HTTP");
-        Ok(Some(Self { client: Client::builder().timeout(Duration::from_secs(10)).build()?, endpoint, token }))
+        anyhow::ensure!(
+            url.scheme() == "http" && url.host_str() == Some("127.0.0.1"),
+            "PostgreSQL graph sink must use the local backend over loopback HTTP"
+        );
+        Ok(Some(Self {
+            client: Client::builder().timeout(Duration::from_secs(10)).build()?,
+            endpoint,
+            token,
+        }))
     }
 
     pub async fn flush_spool(&self, spool_path: &Path) -> anyhow::Result<usize> {
         let cursor_path = spool_path.with_extension("postgres-graph.offset");
         let offset = read_offset(&cursor_path)?;
-        let mut file = File::open(spool_path).with_context(|| format!("open telemetry spool {}", spool_path.display()))?;
+        let mut file = File::open(spool_path)
+            .with_context(|| format!("open telemetry spool {}", spool_path.display()))?;
         let length = file.metadata()?.len();
-        if offset > length { bail!("PostgreSQL graph cursor is beyond telemetry spool length") }
+        if offset > length {
+            bail!("PostgreSQL graph cursor is beyond telemetry spool length")
+        }
         file.seek(SeekFrom::Start(offset))?;
         let mut reader = BufReader::new(file);
         let mut next_offset = offset;
@@ -82,7 +98,12 @@ impl PostgresGraphSink {
             next_offset += bytes as u64;
             write_offset(&cursor_path, next_offset)?;
             count += 1;
-            if count >= 100 { break; }
+            if count >= 100 {
+                break;
+            }
+        }
+        if count > 0 {
+            write_offset(&cursor_path, next_offset)?;
         }
         Ok(count)
     }

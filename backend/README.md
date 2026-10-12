@@ -54,7 +54,7 @@ Compose создаёт PostgreSQL с собственным volume, loopback-п�
 | --- | --- |
 | DATABASE_URL | postgres://honeyforge:<URL-encoded-password>@127.0.0.1:54329/honeyforge |
 | DATABASE_ALLOW_INSECURE_LOCAL | true |
-| FRONTEND_URL | http://localhost:5173 (точный origin браузера Евы) |
+| FRONTEND_URL | http://localhost:5173 (точный origin браузера) |
 | JWT_SECRET | Случайный секрет не короче 32 байт, вне репозитория |
 
 Порт Compose меняется через POSTGRES_PORT. Исключение без TLS разрешено только
@@ -189,7 +189,8 @@ ClickHouse/телеметрии; ingestion пока возвращает 404. Sw
 
 Задайте SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM и SMTP_PORT.
 SMTP_TLS_MODE=implicit с портом 465 либо starttls с портом 587; сертификат
-всегда проверяется. Домен/отправитель Леры задаются окружением, секреты вне Git.
+всегда проверяется. Домен и адрес отправителя задаются через переменные окружения,
+секреты хранятся вне Git.
 Без SMTP forgot-password и resend-verification возвращают 503 для любого адреса.
 Ответ 202 одинаков для существующих, неизвестных и неактивных аккаунтов.
 
@@ -251,16 +252,16 @@ pritvoryashka.rs и runtime.rs — адаптер Middle; infrastructure.rs — 
 - [Архитектура](docs/architecture.md).
 - [Контракт телеметрии](docs/telemetry-contract.md).
 - [Граница инфраструктуры](docs/infrastructure-contract.md).
-- [Контракт и сопоставление frontend Евы](docs/frontend-integration.md).
+- [Контракт и сопоставление frontend](docs/frontend-integration.md).
 - [Серверы и ловушки](docs/resources-api.md).
 - [kozyavka](docs/kozyavka.md).
 - [Pritvoryashka](../honeypots/pritvoryashka/README.md).
 - [OpenAPI для frontend](docs/openapi.json).
 
-Следующий этап: согласованные страницы frontend, SMTP Леры и инфраструктурный
+Следующий этап: согласованные страницы frontend, настройка SMTP и инфраструктурный
 адаптер. Регистрация ресурса и desired_state пока не выполняют удалённые команды.
 
 Low находится в [honeypots/kozyavka](../honeypots/kozyavka/README.md) и остаётся
 отдельной программой; её исходники не включены в пакет backend. Backend хранит профиль
-kozyavka и выдаёт совместимый JSON для будущего развёртывания через Леру. Dockerfile backend добавится
-на этапе контейнерного запуска. Удалённый сервер и Minecraft не затронуты.
+kozyavka и выдаёт совместимый JSON для будущего развёртывания через инфраструктурный
+адаптер. Dockerfile backend добавится на этапе контейнерного запуска.

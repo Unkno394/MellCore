@@ -12,7 +12,10 @@ host Dispatcher/NAT, guest использует isolated network.
 OpenSSH. Reset удаляет NAT-правила экземпляра, останавливает VM, удаляет overlay и seed;
 следующий запуск создаёт чистый экземпляр.
 
-cloud-init задаёт реальный OpenSSH и приманочные данные. При первом запуске Agent сам скачивает
+cloud-init настраивает уже присутствующий в trusted image OpenSSH, добавляет приманочные данные
+и офлайн устанавливает гостевой telemetry sensor из seed ISO. Во время cloud-init пакеты из
+Интернета не устанавливаются: в базовом образе должны присутствовать `python3`, `journalctl` и
+`sshd`. При первом запуске Agent сам скачивает
 официальный Ubuntu 24.04 amd64 cloud image в `/var/lib/honeyforge/images/`, сверяет SHA-256 с
 официальным `SHA256SUMS`, затем скрипт create-overlay создаёт из него QCOW2 overlay и cloud-init
 seed. Пользователь может передать путь к своему QCOW2 только как явный custom image.
@@ -32,3 +35,92 @@ seed. Пользователь может передать путь к свое�
 
 и запускается с `HF_HIGH_UBUNTU_RECIPE_ARCHIVE=/tmp/hf-high-ubuntu-ssh.tar.gz`.
 Bootstrap распаковывает его в `/usr/local/lib/honeyforge/high-ubuntu-ssh`.
+
+## High telemetry v1
+
+libvirt создаёт приватный virtio-serial channel с именем
+`org.honeyforge.telemetry.0`. В госте sensor открывает
+`/dev/virtio-ports/org.honeyforge.telemetry.0`, а `hf-agent` подключается к Unix socket
+`$HF_STATE_DIR/high/INSTANCE_UUID/telemetry.sock`. Guest отправляет ограниченные 16 KiB JSONL
+события и никогда не получает `trap_id`, `agent_id`, Kazik credentials или management-команды.
+Sensor не является полностью скрытым: root внутри скомпрометированной VM может увидеть,
+остановить или подменить его, поэтому host считает все guest-поля недоверенными.
+
+Sensor читает journal OpenSSH и `/var/log/audit/audit.log`. Он формирует `guest.boot`,
+`guest.shutdown`, `sensor.heartbeat`, SSH authentication/session, `process.exec`, ограниченный
+`process.exit`, file create/modify/delete/rename/permissions, outbound connect и sudo/su events.
+Audit records группируются по serial до `EOE`; `ses` используется как SSH/audit session context.
+До получения
+host ACK событие остаётся в ограниченном guest outbox
+`/var/lib/honeyforge-high-telemetry/outbox.jsonl`. Agent проверяет событие, назначает доверенные
+идентификаторы и sequence, коммитит его в `$HF_STATE_DIR/high-telemetry.sqlite` с WAL и
+`synchronous=FULL`, и только после этого отвечает ACK. Повтор с тем же guest event id возвращает
+тот же host event id; повтор с изменённым содержимым отклоняется.
+
+Host queue по умолчанию ограничена 100000 событиями
+(`HF_HIGH_TELEMETRY_MAX_PENDING`). При заполнении ACK не отправляется, поэтому guest продолжает
+повтор. Guest outbox ограничен 10000 событиями и 16 MiB; переполнение явно пишется в journal.
+Незавершённые audit groups также ограничены 1024; вытеснение отражается diagnostic counter/event.
+`process.exec` означает подтверждённый kernel audit syscall, а не обязательно строку, введённую в
+shell. Built-ins (`cd`, `export`, aliases) без `execve` не видны. `process.exit` отражает вызов
+`exit/exit_group`; аварийное завершение без такого syscall не гарантируется. Терминальный ввод и
+содержимое файлов не записываются. tlog не включён до появления проверенной политики redaction.
+Network audit v1 видит исход `connect(2)` и destination address, но не гарантирует source
+IP/ephemeral port, transport protocol или host firewall reject: эти поля помечаются неизвестными.
+Host-side libvirt даёт только aggregate RX/TX, а не flow records или PCAP.
+
+Host events пока не отправляются в Kazik. Store уже создаёт bounded batch, стабильный
+`message_id`, durable mapping на event IDs и готовый `KazikBody::Telemetry`. Удаление разрешено
+только методом durable-ack. Текущий `Accepted` от центра не подтверждает запись в постоянное
+хранилище, поэтому transport pump намеренно не активирован.
+
+## Lifecycle и operational state
+
+`$HF_STATE_DIR/traps/INSTANCE_UUID/high.json` хранит исходный deployment, desired state и
+последнюю lifecycle-ошибку. Deploy/repeated command сверяет реальный domain, telemetry channel,
+SSH и DNAT. Stop снимает DNAT и останавливает domain без удаления overlay. Reset удаляет runtime
+и пересоздаёт чистый overlay по manifest. Remove удаляет domain, DNAT, runtime и manifest.
+После restart agent reconciles все High manifests.
+
+Раз в 30 секунд (настраивается `HF_HIGH_OPERATIONAL_INTERVAL_SECONDS`, минимум 5) agent заменяет
+`$HF_STATE_DIR/high/INSTANCE_UUID/operational.json`. Это bounded current-state snapshot:
+domain state, CPU time и рассчитанную по delta aggregate vCPU utilization, memory, disk bytes,
+aggregate RX/TX, uptime, SSH/DNAT/QGA readiness,
+последняя lifecycle-ошибка и свежесть sensor heartbeat. Эти host-side данные продолжают
+обновляться при остановленном guest sensor, но не заменяют flow-level network telemetry.
+
+Isolated bridge разрешает гостям DHCP, блокирует guest→host INPUT и не даёт обращаться к
+management listeners. Policy повторно применяется при публикации SSH после restart; virtio
+channel bridge не использует.
+
+## Offline image
+
+Для process/file/network telemetry нужен подготовленный image с auditd. В
+`offline/README.md` описаны два воспроизводимых шага: создать versioned/checksummed deb bundle на
+Ubuntu 24.04 amd64 и внедрить его вместе с QGA в производный QCOW2 через libguestfs. Runtime
+cloud-init не вызывает apt и только устанавливает sensor/rules из seed ISO.
+
+### Проверка на отдельном Linux/KVM host
+
+Не выполняйте эти команды на production host без проверки путей и firewall. На тестовом Ubuntu
+24.04 host с KVM/libvirt:
+
+1. Установить собранный `hf-agent` и полный recipe в
+   `/usr/local/lib/honeyforge/high-ubuntu-ssh`.
+2. Убедиться, что trusted Ubuntu image содержит `python3`, systemd journal и OpenSSH server.
+   Для расширенной telemetry использовать image, подготовленный по `offline/README.md`.
+3. Запустить обычный `DeployHighUbuntu` через существующий AgentCommand flow.
+4. Проверить `virsh dumpxml hf-high-INSTANCE_UUID`: должен быть channel target
+   `org.honeyforge.telemetry.0`, а на host — `$HF_STATE_DIR/high/INSTANCE_UUID/telemetry.sock`.
+5. Вызвать успешный и неуспешный SSH login через опубликованный DNAT port.
+6. Проверить sensor через `virsh console` или offline image diagnostics:
+   `systemctl status honeyforge-high-telemetry`.
+7. Остановить `hf-agent`, повторить SSH attempt, затем запустить agent. Guest outbox должен
+   опустеть только после reconnect; число строк в SQLite не должно удвоиться.
+8. Для безопасной read-only проверки SQLite выполнить
+   `sqlite3 -readonly /var/lib/honeyforge/high-telemetry.sqlite 'select event_id,trap_id,host_sequence from high_telemetry_events order by host_sequence;'`.
+
+Локальные проверки без VM:
+
+    cargo test -p hf-services high_telemetry
+    python3 -m unittest honeypots/high-ubuntu-ssh/guest/test_high_telemetry_sensor.py honeypots/high-ubuntu-ssh/guest/test_high_telemetry_audit.py

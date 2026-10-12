@@ -29,13 +29,14 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-mod credentials;
 mod clickhouse;
+mod credentials;
 mod postgres_graph_sink;
 mod backend_registry;
 mod ingress_budget;
 mod telemetry_store;
 mod security_state;
+mod telemetry_store;
 use clickhouse::ClickHouseTelemetry;
 use postgres_graph_sink::PostgresGraphSink;
 use backend_registry::BackendRegistry;
@@ -49,10 +50,18 @@ struct Args {
     #[arg(long, env = "HF_CENTER_CREDENTIALS_FILE")]
     credentials_file: Option<PathBuf>,
     /// Durable agent compromise and target-host state.
-    #[arg(long, env = "HF_CENTER_SECURITY_FILE", default_value = "/var/lib/honeyforge/center-agent-security.json")]
+    #[arg(
+        long,
+        env = "HF_CENTER_SECURITY_FILE",
+        default_value = "/var/lib/honeyforge/center-agent-security.json"
+    )]
     security_file: PathBuf,
     /// Durable JSON Lines sink for events received through authenticated Kazik telemetry.
-    #[arg(long, env = "HF_CENTER_TELEMETRY_FILE", default_value = "/var/lib/honeyforge/telemetry/events.jsonl")]
+    #[arg(
+        long,
+        env = "HF_CENTER_TELEMETRY_FILE",
+        default_value = "/var/lib/honeyforge/telemetry/events.jsonl"
+    )]
     telemetry_file: PathBuf,
     #[arg(long, env = "HF_CENTER_LISTEN", default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
@@ -238,7 +247,8 @@ impl HysteriaStats {
             .await?
             .error_for_status()?;
         for _ in 0..3 {
-            let online: HashMap<String, u64> = self.client
+            let online: HashMap<String, u64> = self
+                .client
                 .get(format!("{}/online", self.url))
                 .header("Authorization", self.secret.as_ref())
                 .send()
@@ -340,16 +350,19 @@ async fn main() -> anyhow::Result<()> {
     };
     let control_token = args.control_token.map(Arc::<str>::from);
     let hysteria_stats = match (args.hysteria_stats_url, args.hysteria_stats_secret) {
-        (Some(url), Some(secret))
-            if url == "http://127.0.0.1:19999" && !secret.is_empty() => Some(HysteriaStats {
-            url: Arc::from(url.trim_end_matches('/')),
-            secret: Arc::from(secret),
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()?,
-        }),
+        (Some(url), Some(secret)) if url == "http://127.0.0.1:19999" && !secret.is_empty() => {
+            Some(HysteriaStats {
+                url: Arc::from(url.trim_end_matches('/')),
+                secret: Arc::from(secret),
+                client: reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()?,
+            })
+        }
         (None, None) => None,
-        _ => anyhow::bail!("HF_HYSTERIA_STATS_URL and HF_HYSTERIA_STATS_SECRET must be set together"),
+        _ => {
+            anyhow::bail!("HF_HYSTERIA_STATS_URL and HF_HYSTERIA_STATS_SECRET must be set together")
+        }
     };
     let listen = args.listen;
     let kazik_udp_listen = args.kazik_udp_listen;
@@ -398,13 +411,17 @@ async fn main() -> anyhow::Result<()> {
                 match sink.flush_spool(&spool).await {
                     Ok(0) => {}
                     Ok(events) => info!(events, "trap telemetry inserted into ClickHouse"),
-                    Err(error) => warn!(%error, "ClickHouse telemetry insert failed; durable spool retained"),
+                    Err(error) => {
+                        warn!(%error, "ClickHouse telemetry insert failed; durable spool retained")
+                    }
                 }
             }
         });
         info!("ClickHouse telemetry sink enabled");
     } else {
-        warn!("ClickHouse telemetry sink is disabled; set HF_CENTER_CLICKHOUSE_URL and credentials");
+        warn!(
+            "ClickHouse telemetry sink is disabled; set HF_CENTER_CLICKHOUSE_URL and credentials"
+        );
     }
     if let Some(sink) = postgres_graph_sink {
         let spool = telemetry_file.clone();
@@ -432,7 +449,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/agents/register", post(register))
         .route("/v1/hysteria/auth", post(hysteria_auth).layer(DefaultBodyLimit::max(4096)))
         .route("/v1/agents/{agent_id}/commands", post(queue_command))
-        .route("/v1/agents/{agent_id}/commands/{message_id}", get(command_status))
+        .route(
+            "/v1/agents/{agent_id}/commands/{message_id}",
+            get(command_status),
+        )
         .route("/v1/agents/{agent_id}/revoke", post(revoke_agent))
         .route("/v1/agents/{agent_id}/traps/register", post(register_existing_trap))
         .route("/v1/agents/compromised", get(list_compromised_agents))
@@ -467,7 +487,12 @@ async fn bootstrap(
 ) -> Result<Json<BootstrapResponse>, StatusCode> {
     validate_bootstrap_request(&request)?;
     let target = normalize_target_host(&request.host).ok_or(StatusCode::BAD_REQUEST)?;
-    if state.agent_security.lock().await.target_is_compromised(&target) {
+    if state
+        .agent_security
+        .lock()
+        .await
+        .target_is_compromised(&target)
+    {
         warn!(target_host = %target, "refused bootstrap to a host previously marked compromised");
         return Err(StatusCode::CONFLICT);
     }
@@ -548,7 +573,10 @@ async fn bootstrap(
                 enrollment_tokens.lock().await.remove(&token_for_job);
                 (
                     BootstrapJobState::Failed,
-                    Some("Установка агента завершилась ошибкой. Проверьте лог на целевом сервере.".into()),
+                    Some(
+                        "Установка агента завершилась ошибкой. Проверьте лог на целевом сервере."
+                            .into(),
+                    ),
                 )
             }
         };
@@ -631,8 +659,12 @@ fn normalize_target_host(host: &str) -> Option<String> {
     let normalized = host.trim_end_matches('.').to_ascii_lowercase();
     if normalized.is_empty()
         || normalized.len() > 253
-        || !normalized.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
-        || normalized.split('.').any(|label| label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-'))
+        || !normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+        || normalized.split('.').any(|label| {
+            label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-')
+        })
     {
         return None;
     }
@@ -701,7 +733,10 @@ async fn hysteria_auth(
     let credentials = state.agent_credentials.lock().await;
     let agent_id = credentials.authenticate(&request.auth);
     if agent_id.is_some_and(|id| security.is_compromised(&id)) {
-        return Json(HysteriaAuthResponse { ok: false, id: None });
+        return Json(HysteriaAuthResponse {
+            ok: false,
+            id: None,
+        });
     }
     Json(HysteriaAuthResponse {
         ok: agent_id.is_some(),
@@ -826,7 +861,12 @@ async fn command_status(
     headers: HeaderMap,
 ) -> Result<Json<CommandStatus>, StatusCode> {
     authorize_control(&state, &headers)?;
-    let status = state.command_statuses.lock().await.get(&message_id).cloned()
+    let status = state
+        .command_statuses
+        .lock()
+        .await
+        .get(&message_id)
+        .cloned()
         .ok_or(StatusCode::NOT_FOUND)?;
     if status.agent_id != agent_id {
         return Err(StatusCode::NOT_FOUND);
@@ -854,11 +894,20 @@ async fn revoke_agent(
 ) -> Result<Json<RevokeResponse>, StatusCode> {
     authorize_control(&state, &headers)?;
     // Persist denial before touching the live QUIC session: reconnection must already fail.
-    let revoked = state.agent_credentials.lock().await.remove(&agent_id).map_err(|error| {
-        tracing::error!(%error, %agent_id, "could not persist agent revocation");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    state.enrollment_tokens.lock().await.retain(|_, id| *id != agent_id);
+    let revoked = state
+        .agent_credentials
+        .lock()
+        .await
+        .remove(&agent_id)
+        .map_err(|error| {
+            tracing::error!(%error, %agent_id, "could not persist agent revocation");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    state
+        .enrollment_tokens
+        .lock()
+        .await
+        .retain(|_, id| *id != agent_id);
     state.pending_commands.lock().await.remove(&agent_id);
     let (transport_disconnected, detail) = match &state.hysteria_stats {
         Some(stats) => match stats.kick(agent_id).await {
@@ -871,7 +920,11 @@ async fn revoke_agent(
         None => (false, Some("Доступ отозван; Hysteria Traffic Stats API не настроен. Активная сессия может оставаться открытой.".into())),
     };
     info!(%agent_id, revoked, transport_disconnected, "agent revocation processed");
-    Ok(Json(RevokeResponse { revoked, transport_disconnected, detail }))
+    Ok(Json(RevokeResponse {
+        revoked,
+        transport_disconnected,
+        detail,
+    }))
 }
 
 async fn list_compromised_agents(
@@ -896,13 +949,25 @@ async fn mark_agent_compromised(
 ) -> anyhow::Result<()> {
     // Persist the deny-list first: even if another write fails, auth, commands and
     // telemetry reject this agent after a restart.
-    state.agent_security.lock().await.mark_compromised(agent_id, event)?;
+    state
+        .agent_security
+        .lock()
+        .await
+        .mark_compromised(agent_id, event)?;
     if let Err(error) = state.agent_credentials.lock().await.remove(&agent_id) {
         tracing::error!(%error, %agent_id, "compromise is persisted but credential-file revocation failed");
     }
-    state.enrollment_tokens.lock().await.retain(|_, id| *id != agent_id);
+    state
+        .enrollment_tokens
+        .lock()
+        .await
+        .retain(|_, id| *id != agent_id);
     state.pending_commands.lock().await.remove(&agent_id);
-    state.command_statuses.lock().await.retain(|_, status| status.agent_id != agent_id);
+    state
+        .command_statuses
+        .lock()
+        .await
+        .retain(|_, status| status.agent_id != agent_id);
     warn!(%agent_id, trap_id = %event.trap_id, "agent and target VPS marked compromised; credentials revoked and commands blocked");
     Ok(())
 }
@@ -910,16 +975,25 @@ async fn mark_agent_compromised(
 async fn disconnect_compromised_agent(state: &AppState, agent_id: Uuid) {
     let result = match &state.hysteria_stats {
         Some(stats) => stats.kick(agent_id).await,
-        None => Err(anyhow::anyhow!("Hysteria Traffic Stats API is not configured")),
+        None => Err(anyhow::anyhow!(
+            "Hysteria Traffic Stats API is not configured"
+        )),
     };
     match result {
         Ok(()) => {
-            if let Err(error) = state.agent_security.lock().await.set_transport_disconnected(agent_id, true) {
+            if let Err(error) = state
+                .agent_security
+                .lock()
+                .await
+                .set_transport_disconnected(agent_id, true)
+            {
                 tracing::error!(%error, %agent_id, "Hysteria session was closed but disconnect status could not be persisted");
             }
             info!(%agent_id, "compromised agent Hysteria session closed");
         }
-        Err(error) => warn!(%error, %agent_id, "compromised agent remains on disconnect retry list"),
+        Err(error) => {
+            warn!(%error, %agent_id, "compromised agent remains on disconnect retry list")
+        }
     }
 }
 
@@ -964,13 +1038,18 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
             tracing::debug!(%peer, "discarded malformed Kazik packet");
             continue;
         };
-        let compromised = state.agent_security.lock().await.is_compromised(&envelope.agent_id);
-        let authorized = !compromised && state
-            .agent_credentials
+        let compromised = state
+            .agent_security
             .lock()
             .await
-            .get(&envelope.agent_id)
-            .is_some_and(|credential| credential == &envelope.transport_credential);
+            .is_compromised(&envelope.agent_id);
+        let authorized = !compromised
+            && state
+                .agent_credentials
+                .lock()
+                .await
+                .get(&envelope.agent_id)
+                .is_some_and(|credential| credential == &envelope.transport_credential);
         if !authorized {
             tracing::debug!(agent_id = %envelope.agent_id, %peer, "discarded Kazik packet with invalid agent credential");
             continue;
@@ -1017,8 +1096,17 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
                 if let Some(commands) = pending.get_mut(&envelope.agent_id) {
                     commands.retain(|command| command.message_id != ack.acknowledged_message_id);
                 }
-                if let Some(status) = state.command_statuses.lock().await.get_mut(&ack.acknowledged_message_id) {
-                    status.status = if matches!(ack.disposition, AckDisposition::Rejected) { "rejected" } else { "applied" };
+                if let Some(status) = state
+                    .command_statuses
+                    .lock()
+                    .await
+                    .get_mut(&ack.acknowledged_message_id)
+                {
+                    status.status = if matches!(ack.disposition, AckDisposition::Rejected) {
+                        "rejected"
+                    } else {
+                        "applied"
+                    };
                     status.detail = ack.detail.clone();
                 }
             }
@@ -1244,9 +1332,9 @@ fn run_ssh_install(
     remote_binary
         .send_eof()
         .map_err(|error| CoreError::Transport(format!("cannot finish agent upload: {error}")))?;
-    remote_binary
-        .wait_eof()
-        .map_err(|error| CoreError::Transport(format!("agent upload did not reach EOF: {error}")))?;
+    remote_binary.wait_eof().map_err(|error| {
+        CoreError::Transport(format!("agent upload did not reach EOF: {error}"))
+    })?;
     remote_binary
         .wait_close()
         .map_err(|error| CoreError::Transport(format!("agent upload failed: {error}")))?;
@@ -1310,9 +1398,9 @@ fn run_ssh_install(
     channel
         .send_eof()
         .map_err(|error| CoreError::Transport(format!("cannot finish installer input: {error}")))?;
-    channel
-        .wait_eof()
-        .map_err(|error| CoreError::Transport(format!("remote installer did not reach EOF: {error}")))?;
+    channel.wait_eof().map_err(|error| {
+        CoreError::Transport(format!("remote installer did not reach EOF: {error}"))
+    })?;
     channel
         .wait_close()
         .map_err(|error| CoreError::Transport(format!("remote installer failed: {error}")))?;
@@ -1348,9 +1436,9 @@ fn upload_file(
     remote
         .send_eof()
         .map_err(|error| CoreError::Transport(format!("cannot finish artifact upload: {error}")))?;
-    remote
-        .wait_eof()
-        .map_err(|error| CoreError::Transport(format!("artifact upload did not reach EOF: {error}")))?;
+    remote.wait_eof().map_err(|error| {
+        CoreError::Transport(format!("artifact upload did not reach EOF: {error}"))
+    })?;
     remote
         .wait_close()
         .map_err(|error| CoreError::Transport(format!("artifact upload failed: {error}")))?;
@@ -1377,8 +1465,14 @@ mod tests {
     fn accepts_ipv4_and_raw_ipv6_with_password() {
         assert!(validate_bootstrap_request(&password_request("203.0.113.42")).is_ok());
         assert!(validate_bootstrap_request(&password_request("2001:db8::42")).is_ok());
-        assert_eq!(normalize_target_host("2001:DB8::42").as_deref(), Some("2001:db8::42"));
-        assert_eq!(normalize_target_host("VPS.Example.Test.").as_deref(), Some("vps.example.test"));
+        assert_eq!(
+            normalize_target_host("2001:DB8::42").as_deref(),
+            Some("2001:db8::42")
+        );
+        assert_eq!(
+            normalize_target_host("VPS.Example.Test.").as_deref(),
+            Some("vps.example.test")
+        );
         assert!(normalize_target_host("bad host").is_none());
     }
 

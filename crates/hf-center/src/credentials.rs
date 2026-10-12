@@ -82,7 +82,12 @@ mod tests {
         assert_eq!(restored.authenticate("wrong"), None);
         let mut restored = restored;
         assert!(restored.remove(&agent).unwrap());
-        assert_eq!(CredentialStore::open(Some(dir.join("credentials.json"))).unwrap().get(&agent), None);
+        assert_eq!(
+            CredentialStore::open(Some(dir.join("credentials.json")))
+                .unwrap()
+                .get(&agent),
+            None
+        );
         assert!(!restored.remove(&agent).unwrap());
         let mut broken = CredentialStore::open(Some(dir.join("missing/credentials.json"))).unwrap();
         assert!(broken.insert(agent, "not-persisted".into()).is_err());

@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Command,
@@ -7,8 +8,10 @@ use std::{
     time::Duration,
 };
 
-mod sandbox;
 mod emergency;
+#[cfg(unix)]
+mod high_telemetry;
+mod sandbox;
 mod security_monitor;
 mod security_policy;
 mod telemetry;
@@ -16,9 +19,9 @@ mod telemetry;
 use anyhow::Context;
 use clap::Parser;
 use hf_core::{
-    AgentCommand, AgentRegistration, CommandResult, CoreError, HysteriaConnection,
-    KozyavkaDeployment, PacketTransport, PritvoryashkaDeployment, RegisteredAgent,
-    RegistrationTransport, SharedTcpTrapKind, TcpPortGroup, TrapSpec,
+    AgentCommand, AgentRegistration, CommandResult, CoreError, HighUbuntuDeployment,
+    HysteriaConnection, KozyavkaDeployment, PacketTransport, PritvoryashkaDeployment,
+    RegisteredAgent, RegistrationTransport, SharedTcpTrapKind, TcpPortGroup, TrapSpec,
 };
 use hf_services::{
     FailoverSender, HysteriaSocks5UdpTransport,
@@ -27,9 +30,10 @@ use hf_services::{
 use kazik_protocol::{
     AckDisposition, Acknowledgement, AgentStatus, DurableOutbox, KazikBody, KazikEnvelope,
 };
-use sandbox::{LibvirtSandboxManager, UbuntuSshVm, default_recipe_dir};
+use sandbox::{HighDomainState, LibvirtSandboxManager, UbuntuSshVm, default_recipe_dir};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 #[derive(Parser)]
 struct Args {
@@ -72,6 +76,20 @@ struct Args {
     /// Center's loopback UDP Kazik receiver as reached through Hysteria.
     #[arg(long, env = "HF_KAZIK_CENTER_UDP")]
     kazik_center_udp: Option<SocketAddr>,
+    /// Upper bound for High events waiting on this host for future Kazik delivery.
+    #[arg(
+        long,
+        env = "HF_HIGH_TELEMETRY_MAX_PENDING",
+        default_value_t = hf_services::high_telemetry::DEFAULT_MAX_PENDING_HIGH_EVENTS
+    )]
+    high_telemetry_max_pending: usize,
+    /// Host-side libvirt/SSH health polling interval; values below five seconds are rejected.
+    #[arg(
+        long,
+        env = "HF_HIGH_OPERATIONAL_INTERVAL_SECONDS",
+        default_value_t = 30
+    )]
+    high_operational_interval_seconds: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -106,6 +124,24 @@ fn quarantine_result(marker: &QuarantineMarker, applied: bool) -> kazik_protocol
     event.occurred_at_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|value| value.as_millis() as i64).unwrap_or_default();
     event
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HighDesiredState {
+    Running,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HighRuntimeManifest {
+    version: u8,
+    kind: String,
+    deployment: HighUbuntuDeployment,
+    desired_state: HighDesiredState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -152,12 +188,30 @@ impl DispatcherConfig {
         anyhow::ensure!(!self.listeners.is_empty(), "Dispatcher has no listeners");
         let mut seen = std::collections::HashSet::new();
         for listener in &self.listeners {
-            anyhow::ensure!(seen.insert(listener.listen), "duplicate Dispatcher listener");
-            anyhow::ensure!(!listener.targets.is_empty(), "Dispatcher listener has no targets");
-            anyhow::ensure!(listener.targets.iter().map(|target| u32::from(target.weight)).sum::<u32>() == 100,
-                "Dispatcher target weights do not total 100");
-            anyhow::ensure!(listener.targets.iter().all(|target| target.weight > 0 && target.address.ip().is_loopback()),
-                "invalid Dispatcher target");
+            anyhow::ensure!(
+                seen.insert(listener.listen),
+                "duplicate Dispatcher listener"
+            );
+            anyhow::ensure!(
+                !listener.targets.is_empty(),
+                "Dispatcher listener has no targets"
+            );
+            anyhow::ensure!(
+                listener
+                    .targets
+                    .iter()
+                    .map(|target| u32::from(target.weight))
+                    .sum::<u32>()
+                    == 100,
+                "Dispatcher target weights do not total 100"
+            );
+            anyhow::ensure!(
+                listener
+                    .targets
+                    .iter()
+                    .all(|target| target.weight > 0 && target.address.ip().is_loopback()),
+                "invalid Dispatcher target"
+            );
         }
         let mut changed = false;
         for listener in &mut self.listeners {
@@ -173,14 +227,18 @@ impl DispatcherConfig {
         if !changed {
             return Ok(None);
         }
-        self.listeners.retain(|listener| !listener.targets.is_empty());
+        self.listeners
+            .retain(|listener| !listener.targets.is_empty());
         Ok(Some(self))
     }
 }
 
 fn normalize_dispatcher_weights(targets: &mut [DispatcherTarget]) -> anyhow::Result<()> {
     let total: u32 = targets.iter().map(|target| u32::from(target.weight)).sum();
-    anyhow::ensure!(total > 0 && targets.len() <= 100, "invalid Dispatcher target weights");
+    anyhow::ensure!(
+        total > 0 && targets.len() <= 100,
+        "invalid Dispatcher target weights"
+    );
     let mut assigned = 0_u32;
     let mut remainder = Vec::with_capacity(targets.len());
     for (index, target) in targets.iter_mut().enumerate() {
@@ -204,6 +262,232 @@ impl ComposeProjectStore {
             root: state_dir.join("traps"),
             mutation_lock: Arc::new(std::sync::Mutex::new(())),
         }
+    }
+
+    fn high_manager(&self) -> LibvirtSandboxManager {
+        let state_dir = self
+            .root
+            .parent()
+            .unwrap_or(Path::new("/var/lib/honeyforge"));
+        LibvirtSandboxManager::with_high_root(default_recipe_dir(), state_dir.join("high"))
+    }
+
+    fn high_manifest_path(&self, trap_id: uuid::Uuid) -> PathBuf {
+        self.root.join(trap_id.to_string()).join("high.json")
+    }
+
+    fn has_high_runtime(&self, trap_id: uuid::Uuid) -> bool {
+        self.root
+            .parent()
+            .unwrap_or(Path::new("/var/lib/honeyforge"))
+            .join("high")
+            .join(trap_id.to_string())
+            .is_dir()
+    }
+
+    fn load_high_manifest(
+        &self,
+        trap_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<HighRuntimeManifest>> {
+        let path = self.high_manifest_path(trap_id);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let manifest: HighRuntimeManifest = serde_json::from_slice(&fs::read(&path)?)?;
+        if manifest.version != 1
+            || manifest.kind != "high_ubuntu_ssh"
+            || manifest.deployment.trap_id != trap_id
+        {
+            anyhow::bail!("invalid High manifest {}", path.display());
+        }
+        Ok(Some(manifest))
+    }
+
+    fn save_high_manifest(&self, manifest: &HighRuntimeManifest) -> anyhow::Result<()> {
+        let path = self.high_manifest_path(manifest.deployment.trap_id);
+        fs::create_dir_all(path.parent().expect("High manifest parent"))?;
+        atomic_write(&path, &serde_json::to_vec_pretty(manifest)?)
+    }
+
+    fn high_vm(deployment: &HighUbuntuDeployment) -> UbuntuSshVm {
+        UbuntuSshVm {
+            instance_id: deployment.trap_id,
+            base_image: PathBuf::from(&deployment.base_image),
+            external_ssh_port: deployment.external_ssh_port,
+        }
+    }
+
+    fn deploy_high(&self, deployment: HighUbuntuDeployment) -> anyhow::Result<()> {
+        if deployment.trap_id.is_nil()
+            || deployment.external_ssh_port == 0
+            || deployment.base_image.trim().is_empty()
+        {
+            anyhow::bail!("invalid High Ubuntu deployment command");
+        }
+        let changed = self
+            .load_high_manifest(deployment.trap_id)?
+            .is_some_and(|current| {
+                current.deployment.base_image != deployment.base_image
+                    || current.deployment.external_ssh_port != deployment.external_ssh_port
+            });
+        let mut manifest = HighRuntimeManifest {
+            version: 1,
+            kind: "high_ubuntu_ssh".into(),
+            deployment: deployment.clone(),
+            desired_state: HighDesiredState::Running,
+            last_error: None,
+        };
+        self.save_high_manifest(&manifest)?;
+        if changed {
+            self.high_manager().reset(deployment.trap_id)?;
+        }
+        let result = self
+            .high_manager()
+            .reconcile(&Self::high_vm(&deployment), true);
+        if let Err(error) = &result {
+            manifest.last_error = Some(error.to_string());
+            self.save_high_manifest(&manifest)?;
+        }
+        result
+    }
+
+    fn reset_high(&self, trap_id: uuid::Uuid) -> anyhow::Result<()> {
+        let mut manifest = self
+            .load_high_manifest(trap_id)?
+            .ok_or_else(|| anyhow::anyhow!("High trap {trap_id} has no durable manifest"))?;
+        manifest.desired_state = HighDesiredState::Running;
+        manifest.last_error = None;
+        self.save_high_manifest(&manifest)?;
+        self.high_manager().reset(trap_id)?;
+        let result = self
+            .high_manager()
+            .reconcile(&Self::high_vm(&manifest.deployment), true);
+        if let Err(error) = &result {
+            manifest.last_error = Some(error.to_string());
+            self.save_high_manifest(&manifest)?;
+        }
+        result
+    }
+
+    fn stop_high(&self, trap_id: uuid::Uuid) -> anyhow::Result<()> {
+        let mut manifest = self
+            .load_high_manifest(trap_id)?
+            .ok_or_else(|| anyhow::anyhow!("High trap {trap_id} has no durable manifest"))?;
+        manifest.desired_state = HighDesiredState::Stopped;
+        manifest.last_error = None;
+        self.save_high_manifest(&manifest)?;
+        let result = self.high_manager().stop(trap_id);
+        if let Err(error) = &result {
+            manifest.last_error = Some(error.to_string());
+            self.save_high_manifest(&manifest)?;
+        }
+        result
+    }
+
+    fn remove_high(&self, trap_id: uuid::Uuid) -> anyhow::Result<()> {
+        self.high_manager().remove(trap_id)?;
+        let project = self.root.join(trap_id.to_string());
+        if project.exists() {
+            fs::remove_dir_all(project)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_high_manifests(&self) {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return;
+        };
+        for entry in entries.flatten().filter(|entry| entry.path().is_dir()) {
+            let Ok(trap_id) = Uuid::parse_str(&entry.file_name().to_string_lossy()) else {
+                continue;
+            };
+            let Ok(Some(mut manifest)) = self.load_high_manifest(trap_id) else {
+                continue;
+            };
+            let desired_running = manifest.desired_state == HighDesiredState::Running;
+            match self
+                .high_manager()
+                .reconcile(&Self::high_vm(&manifest.deployment), desired_running)
+            {
+                Ok(()) => {
+                    manifest.last_error = None;
+                    let _ = self.save_high_manifest(&manifest);
+                }
+                Err(error) => {
+                    tracing::error!(trap_id = %trap_id, %error, "High reconciliation failed");
+                    manifest.last_error = Some(error.to_string());
+                    let _ = self.save_high_manifest(&manifest);
+                }
+            }
+        }
+    }
+
+    fn cached_command_is_satisfied(&self, command: &AgentCommand) -> anyhow::Result<bool> {
+        match command {
+            AgentCommand::DeployHighUbuntu(deployment) => {
+                let Some(manifest) = self.load_high_manifest(deployment.trap_id)? else {
+                    return Ok(false);
+                };
+                Ok(manifest.desired_state == HighDesiredState::Running
+                    && self
+                        .high_manager()
+                        .healthy(&Self::high_vm(&manifest.deployment))?)
+            }
+            AgentCommand::ResetHighUbuntu { trap_id, .. } => {
+                let Some(manifest) = self.load_high_manifest(*trap_id)? else {
+                    return Ok(false);
+                };
+                Ok(manifest.desired_state == HighDesiredState::Running
+                    && self
+                        .high_manager()
+                        .healthy(&Self::high_vm(&manifest.deployment))?)
+            }
+            AgentCommand::StopTrap { trap_id, .. } => {
+                if let Some(manifest) = self.load_high_manifest(*trap_id)? {
+                    Ok(manifest.desired_state == HighDesiredState::Stopped
+                        && self.high_manager().domain_state(*trap_id)? == HighDomainState::Stopped
+                        && !self.high_manager().has_dnat(*trap_id))
+                } else if self.has_high_runtime(*trap_id) {
+                    Ok(
+                        self.high_manager().domain_state(*trap_id)? == HighDomainState::Stopped
+                            && !self.high_manager().has_dnat(*trap_id),
+                    )
+                } else {
+                    Ok(true)
+                }
+            }
+            AgentCommand::RemoveTrap { trap_id, .. } => {
+                if self.load_high_manifest(*trap_id)?.is_some() {
+                    Ok(false)
+                } else if self.has_high_runtime(*trap_id) {
+                    Ok(self.high_manager().domain_state(*trap_id)? == HighDomainState::Missing)
+                } else {
+                    Ok(true)
+                }
+            }
+            _ => Ok(true),
+        }
+    }
+
+    fn active_trap_count(&self) -> u32 {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter(|entry| {
+                let Ok(trap_id) = Uuid::parse_str(&entry.file_name().to_string_lossy()) else {
+                    return false;
+                };
+                match self.load_high_manifest(trap_id) {
+                    Ok(Some(_)) => self.high_manager().is_running(trap_id).unwrap_or(false),
+                    Ok(None) => entry.path().join("manifest.json").is_file(),
+                    Err(_) => false,
+                }
+            })
+            .count()
+            .min(u32::MAX as usize) as u32
     }
 
     /// Prepares one isolated Compose project. Applying it is intentionally deferred until a
@@ -258,7 +542,11 @@ impl ComposeProjectStore {
             .join("commands")
             .join(format!("{command_id}.json"));
         if completed.exists() {
-            return Ok(serde_json::from_slice(&fs::read(completed)?)?);
+            let cached = serde_json::from_slice(&fs::read(&completed)?)?;
+            if self.cached_command_is_satisfied(&command)? {
+                return Ok(cached);
+            }
+            tracing::warn!(command_id = %command_id, trap_id = %trap_id, "cached command state is absent or unhealthy; reconciling it again");
         }
         let deploying_quarantined = match &command {
             AgentCommand::DeployKozyavka(_) | AgentCommand::DeployPritvoryashka(_) =>
@@ -268,8 +556,23 @@ impl ComposeProjectStore {
             _ => false,
         };
         anyhow::ensure!(!deploying_quarantined, "trap is isolated after a security incident");
+        let high_manifest = matches!(
+            &command,
+            AgentCommand::StopTrap { .. } | AgentCommand::RemoveTrap { .. }
+        )
+        .then(|| self.load_high_manifest(trap_id))
+        .transpose()?
+        .flatten();
+        let high_runtime = high_manifest.is_none() && self.has_high_runtime(trap_id);
+        let compose_runtime = self
+            .root
+            .join(trap_id.to_string())
+            .join("compose.yaml")
+            .is_file();
         let deferred_remove = matches!(&command, AgentCommand::RemoveTrap { .. })
-            && self.root.join(trap_id.to_string()).join("compose.yaml").is_file();
+            && high_manifest.is_none()
+            && !high_runtime
+            && compose_runtime;
         let result = match command {
             AgentCommand::DeployKozyavka(deployment) => {
                 ensure_docker_runtime()?;
@@ -281,28 +584,32 @@ impl ComposeProjectStore {
             }
             AgentCommand::DeployHighUbuntu(deployment) => {
                 ensure_high_vm_runtime()?;
-                let base_image = PathBuf::from(deployment.base_image);
-                LibvirtSandboxManager::new(default_recipe_dir()).create_and_start(&UbuntuSshVm {
-                    instance_id: deployment.trap_id,
-                    base_image,
-                    external_ssh_port: deployment.external_ssh_port,
-                })
+                self.deploy_high(deployment)
             }
-            AgentCommand::ResetHighUbuntu { trap_id, .. } => {
-                LibvirtSandboxManager::new(default_recipe_dir()).reset(trap_id)
-            }
+            AgentCommand::ResetHighUbuntu { trap_id, .. } => self.reset_high(trap_id),
             AgentCommand::ReconcileTcpPortGroup(group) => {
                 ensure_docker_runtime()?;
                 self.reconcile_tcp_port_group(group, kozyavka_image, pritvoryashka_image, agent_id)
             }
-            AgentCommand::StopTrap { .. } => self.compose_down(trap_id, false),
-            AgentCommand::RemoveTrap { .. } if deferred_remove => self.prepare_remove(trap_id),
+            AgentCommand::StopTrap { .. } => {
+                if high_manifest.is_some() {
+                    self.stop_high(trap_id)
+                } else if high_runtime {
+                    self.high_manager().stop(trap_id)
+                } else {
+                    self.compose_down(trap_id, false)
+                }
+            }
             AgentCommand::RemoveTrap { .. } => {
-                let high_root = std::env::var_os("HF_HIGH_ROOT")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("/var/lib/honeyforge/high"));
-                anyhow::ensure!(high_root.join(trap_id.to_string()).is_dir(), "unknown trap {trap_id}");
-                LibvirtSandboxManager::new(default_recipe_dir()).reset(trap_id)
+                if high_manifest.is_some() {
+                    self.remove_high(trap_id)
+                } else if high_runtime {
+                    self.high_manager().remove(trap_id)
+                } else if deferred_remove {
+                    self.prepare_remove(trap_id)
+                } else {
+                    anyhow::bail!("unknown trap {trap_id}")
+                }
             }
         };
         let result = match result {
@@ -606,8 +913,12 @@ impl ComposeProjectStore {
 
     fn prepare_remove(&self, trap_id: uuid::Uuid) -> anyhow::Result<()> {
         let project_dir = self.root.join(trap_id.to_string());
-        anyhow::ensure!(project_dir.join("compose.yaml").is_file(), "unknown Compose trap {trap_id}");
-        let manifest: serde_json::Value = serde_json::from_slice(&fs::read(project_dir.join("manifest.json"))?)?;
+        anyhow::ensure!(
+            project_dir.join("compose.yaml").is_file(),
+            "unknown Compose trap {trap_id}"
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(project_dir.join("manifest.json"))?)?;
         let shared_backend = manifest["publish_address"].as_str() == Some("127.0.0.1");
         let previous_dispatcher = self.detach_dispatcher_target(trap_id, shared_backend)?;
         if let Err(error) = self.compose(&project_dir, trap_id, ["stop"]) {
@@ -701,8 +1012,10 @@ impl ComposeProjectStore {
                     let status = Command::new("systemctl")
                         .args(["is-active", "--quiet", "hf-dispatcher.service"])
                         .status()?;
-                    anyhow::ensure!(!status.success(),
-                        "Dispatcher is active without its configuration; refusing to stop a shared trap");
+                    anyhow::ensure!(
+                        !status.success(),
+                        "Dispatcher is active without its configuration; refusing to stop a shared trap"
+                    );
                 }
                 return Ok(None);
             }
@@ -715,7 +1028,10 @@ impl ComposeProjectStore {
                 // A previous attempt may have written the new config before a crash. Restart
                 // before stopping the backend so no process keeps serving stale routes.
                 run_program("systemctl", &["restart", "hf-dispatcher.service"])?;
-                run_program("systemctl", &["is-active", "--quiet", "hf-dispatcher.service"])?;
+                run_program(
+                    "systemctl",
+                    &["is-active", "--quiet", "hf-dispatcher.service"],
+                )?;
             }
             return Ok(None);
         };
@@ -725,8 +1041,12 @@ impl ComposeProjectStore {
                 .and_then(|_| fs::remove_file(path).map_err(Into::into))
         } else {
             atomic_write(path, &serde_json::to_vec_pretty(&updated)?)?;
-            run_program("systemctl", &["restart", "hf-dispatcher.service"])
-                .and_then(|_| run_program("systemctl", &["is-active", "--quiet", "hf-dispatcher.service"]))
+            run_program("systemctl", &["restart", "hf-dispatcher.service"]).and_then(|_| {
+                run_program(
+                    "systemctl",
+                    &["is-active", "--quiet", "hf-dispatcher.service"],
+                )
+            })
         };
         if let Err(error) = transition {
             if let Err(rollback) = self.restore_dispatcher(&previous) {
@@ -750,7 +1070,10 @@ impl ComposeProjectStore {
         // The caller has put final Low/Middle events into SQLite before `down` removes the
         // Docker container and the Middle runtime directory.
         self.compose_down(trap_id, true)?;
-        let completed = self.root.join("commands").join(format!("{}.json", result.command_id));
+        let completed = self
+            .root
+            .join("commands")
+            .join(format!("{}.json", result.command_id));
         fs::create_dir_all(completed.parent().expect("command parent"))?;
         atomic_write(&completed, &serde_json::to_vec(result)?)
     }
@@ -856,8 +1179,21 @@ async fn main() -> anyhow::Result<()> {
     }
     let compose_projects = ComposeProjectStore::new(&args.state_dir);
     fs::create_dir_all(&compose_projects.root)?;
+    if emergency::pending(&args.state_dir)?.is_none() {
+        let reconciliation_projects = compose_projects.clone();
+        tokio::task::spawn_blocking(move || reconciliation_projects.reconcile_high_manifests())
+            .await
+            .map_err(|error| anyhow::anyhow!("High reconciliation worker failed: {error}"))?;
+    } else {
+        tracing::warn!(
+            "High reconciliation skipped while a confirmed security incident is pending"
+        );
+    }
     if let Some(command_file) = args.command_file {
-        anyhow::ensure!(emergency::pending(&args.state_dir)?.is_none(), "confirmed security incident blocks local commands");
+        anyhow::ensure!(
+            emergency::pending(&args.state_dir)?.is_none(),
+            "confirmed security incident blocks local commands"
+        );
         let command: AgentCommand = serde_json::from_slice(&fs::read(command_file)?)?;
         let deferred_remove = compose_remove_id(&compose_projects, &command);
         let mut result = compose_projects.apply(
@@ -868,7 +1204,14 @@ async fn main() -> anyhow::Result<()> {
         )?;
         if let Some(trap_id) = deferred_remove.filter(|_| result.success) {
             let mut outbox = SqliteKazikOutbox::open(args.state_dir.join("kazik-outbox.sqlite"))?;
-            result = finalize_removed_trap(&compose_projects, &args.state_dir, &identity, &mut outbox, trap_id, result)?;
+            result = finalize_removed_trap(
+                &compose_projects,
+                &args.state_dir,
+                &identity,
+                &mut outbox,
+                trap_id,
+                result,
+            )?;
         }
         println!("{}", serde_json::to_string(&result)?);
         if !result.success {
@@ -878,6 +1221,13 @@ async fn main() -> anyhow::Result<()> {
     if args.once {
         return Ok(());
     }
+    #[cfg(unix)]
+    let _high_telemetry = high_telemetry::start(
+        &args.state_dir,
+        identity.agent_id,
+        args.high_telemetry_max_pending,
+        Duration::from_secs(args.high_operational_interval_seconds),
+    )?;
     // Initial SSH bootstrap may seed one root-owned command here. Later commands arrive through
     // Kazik and use the same idempotent `apply` implementation.
     let inbox = args.state_dir.join("inbox");
@@ -958,11 +1308,13 @@ async fn run_kazik_hysteria_loop(
         }
     }
     let mut incident_active = existing_incident.is_some();
-    let mut pending_emergency = existing_incident.filter(|incident| incident.response_armed).map(|incident| PendingEmergency {
-        message_id: incident.message_id,
-        began: std::time::Instant::now(),
-        last_attempt: None,
-    });
+    let mut pending_emergency = existing_incident
+        .filter(|incident| incident.response_armed)
+        .map(|incident| PendingEmergency {
+            message_id: incident.message_id,
+            began: std::time::Instant::now(),
+            last_attempt: None,
+        });
     let incident_flag = Arc::new(std::sync::atomic::AtomicBool::new(incident_active));
     let (security_tx, mut security_rx) = tokio::sync::mpsc::channel(256);
     tokio::spawn(security_monitor::run(projects.root.clone(), security_tx));
@@ -1253,9 +1605,7 @@ async fn run_kazik_hysteria_loop(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|duration| duration.as_millis() as i64)
                     .unwrap_or_default();
-                let active_trap_count = fs::read_dir(state_dir.join("traps"))
-                    .map(|entries| entries.flatten().count() as u32)
-                    .unwrap_or_default();
+                let active_trap_count = projects.active_trap_count();
                 outbox.enqueue(KazikEnvelope::new(
                     identity.agent_id,
                     identity.transport_credential.clone(),
@@ -1539,14 +1889,17 @@ fn install_docker_ce_with_dnf() -> anyhow::Result<()> {
 
 /// KVM/libvirt dependencies are separate from Docker because High runs a real guest VM.
 fn ensure_high_vm_runtime() -> anyhow::Result<()> {
-    let tools_ready = Command::new("virsh")
-        .arg("--version")
-        .status()
-        .is_ok_and(|status| status.success())
-        && Command::new("virt-install")
-            .arg("--version")
-            .status()
-            .is_ok_and(|status| status.success());
+    let required_tools = [
+        "virsh",
+        "virt-install",
+        "qemu-img",
+        "cloud-localds",
+        "iptables",
+        "ss",
+    ];
+    let tools_ready = required_tools
+        .iter()
+        .all(|program| Command::new(program).arg("--version").output().is_ok());
     if !tools_ready {
         match detect_platform()? {
             Platform::Debian => {
@@ -1562,6 +1915,7 @@ fn ensure_high_vm_runtime() -> anyhow::Result<()> {
                         "virtinst",
                         "cloud-image-utils",
                         "iptables",
+                        "iproute2",
                         "curl",
                     ],
                 )?;
@@ -1603,6 +1957,12 @@ fn ensure_high_vm_runtime() -> anyhow::Result<()> {
         }
     }
     anyhow::ensure!(
+        required_tools
+            .iter()
+            .all(|program| Command::new(program).arg("--version").output().is_ok()),
+        "High VM runtime installation did not provide every required tool"
+    );
+    anyhow::ensure!(
         Path::new("/dev/kvm").exists(),
         "KVM is unavailable; this VPS/provider does not permit High VM traps"
     );
@@ -1638,7 +1998,16 @@ fn run_program(program: &str, args: &[&str]) -> anyhow::Result<()> {
 fn compose_remove_id(projects: &ComposeProjectStore, command: &AgentCommand) -> Option<uuid::Uuid> {
     match command {
         AgentCommand::RemoveTrap { trap_id, .. }
-            if projects.root.join(trap_id.to_string()).join("compose.yaml").is_file() => Some(*trap_id),
+            if !projects.high_manifest_path(*trap_id).is_file()
+                && !projects.has_high_runtime(*trap_id)
+                && projects
+                    .root
+                    .join(trap_id.to_string())
+                    .join("compose.yaml")
+                    .is_file() =>
+        {
+            Some(*trap_id)
+        }
         _ => None,
     }
 }
@@ -1683,11 +2052,24 @@ fn process_inbox(
             .and_then(|bytes| Ok(serde_json::from_slice::<AgentCommand>(&bytes)?))
             .and_then(|command| {
                 let deferred_remove = compose_remove_id(projects, &command);
-                let result = projects.apply(command, kozyavka_image, pritvoryashka_image, identity.agent_id)?;
+                let result = projects.apply(
+                    command,
+                    kozyavka_image,
+                    pritvoryashka_image,
+                    identity.agent_id,
+                )?;
                 if let Some(trap_id) = deferred_remove.filter(|_| result.success) {
                     let state_dir = inbox.parent().expect("inbox parent");
-                    let mut outbox = SqliteKazikOutbox::open(state_dir.join("kazik-outbox.sqlite"))?;
-                    finalize_removed_trap(projects, state_dir, identity, &mut outbox, trap_id, result)
+                    let mut outbox =
+                        SqliteKazikOutbox::open(state_dir.join("kazik-outbox.sqlite"))?;
+                    finalize_removed_trap(
+                        projects,
+                        state_dir,
+                        identity,
+                        &mut outbox,
+                        trap_id,
+                        result,
+                    )
                 } else {
                     Ok(result)
                 }
@@ -1731,19 +2113,31 @@ fn load_identity(path: &Path) -> anyhow::Result<Option<AgentIdentity>> {
 
 fn atomic_write(path: &Path, content: &[u8]) -> anyhow::Result<()> {
     let temporary = path.with_extension("tmp");
-    fs::write(&temporary, content)?;
+    let mut file = fs::File::create(&temporary)?;
+    file.write_all(content)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
     }
+    file.sync_all()?;
+    drop(file);
     fs::rename(temporary, path)?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{DispatcherConfig, DispatcherListener, DispatcherTarget, Platform, QuarantineMarker, quarantine_result, parse_platform};
+
+    fn detach_dispatcher_target(
+        &self,
+        trap_id: uuid::Uuid,
+        shared_backend: bool,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
     use uuid::Uuid;
 
     #[test]
@@ -1824,7 +2218,14 @@ mod tests {
         assert_eq!(updated.listeners.len(), 1);
         assert_eq!(updated.listeners[0].listen, "0.0.0.0:2223".parse().unwrap());
         assert_eq!(updated.listeners[0].targets[0].trap_id, survivor.trap_id);
-        assert!(updated.without_trap(survivor.trap_id).unwrap().unwrap().listeners.is_empty());
+        assert!(
+            updated
+                .without_trap(survivor.trap_id)
+                .unwrap()
+                .unwrap()
+                .listeners
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1856,5 +2257,100 @@ mod tests {
     fn rejects_unknown_distribution() {
         assert!(parse_platform("ID=gentoo\n").is_err());
         assert!(parse_platform("NAME=missing-id\n").is_err());
+    }
+
+    #[test]
+    fn high_manifest_round_trip_preserves_reset_configuration_and_desired_state() {
+        let directory = std::env::temp_dir().join(format!("hf-high-manifest-{}", Uuid::new_v4()));
+        let store = ComposeProjectStore::new(&directory);
+        let trap_id = Uuid::new_v4();
+        let manifest = HighRuntimeManifest {
+            version: 1,
+            kind: "high_ubuntu_ssh".into(),
+            deployment: HighUbuntuDeployment {
+                command_id: Uuid::new_v4(),
+                trap_id,
+                base_image: "/images/prepared.qcow2".into(),
+                external_ssh_port: 2222,
+            },
+            desired_state: HighDesiredState::Stopped,
+            last_error: Some("test error".into()),
+        };
+        store.save_high_manifest(&manifest).unwrap();
+        let recovered = store.load_high_manifest(trap_id).unwrap().unwrap();
+        assert_eq!(
+            recovered.deployment.base_image,
+            manifest.deployment.base_image
+        );
+        assert_eq!(recovered.deployment.external_ssh_port, 2222);
+        assert_eq!(recovered.desired_state, HighDesiredState::Stopped);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compose_remove_is_deferred_for_compose_traps() {
+        let directory = std::env::temp_dir().join(format!("hf-compose-remove-{}", Uuid::new_v4()));
+        let store = ComposeProjectStore::new(&directory);
+        let trap_id = Uuid::new_v4();
+        let project = store.root.join(trap_id.to_string());
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("compose.yaml"), "services: {}\n").unwrap();
+        let command = AgentCommand::RemoveTrap {
+            command_id: Uuid::new_v4(),
+            trap_id,
+        };
+
+        assert_eq!(compose_remove_id(&store, &command), Some(trap_id));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn high_manifest_prevents_accidental_compose_deferred_removal() {
+        let directory = std::env::temp_dir().join(format!("hf-high-remove-{}", Uuid::new_v4()));
+        let store = ComposeProjectStore::new(&directory);
+        let trap_id = Uuid::new_v4();
+        let project = store.root.join(trap_id.to_string());
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("compose.yaml"), "services: {}\n").unwrap();
+        store
+            .save_high_manifest(&HighRuntimeManifest {
+                version: 1,
+                kind: "high_ubuntu_ssh".into(),
+                deployment: HighUbuntuDeployment {
+                    command_id: Uuid::new_v4(),
+                    trap_id,
+                    base_image: "/images/prepared.qcow2".into(),
+                    external_ssh_port: 2222,
+                },
+                desired_state: HighDesiredState::Running,
+                last_error: None,
+            })
+            .unwrap();
+        let command = AgentCommand::RemoveTrap {
+            command_id: Uuid::new_v4(),
+            trap_id,
+        };
+
+        assert_eq!(compose_remove_id(&store, &command), None);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_high_runtime_prevents_accidental_compose_deferred_removal() {
+        let directory =
+            std::env::temp_dir().join(format!("hf-legacy-high-remove-{}", Uuid::new_v4()));
+        let store = ComposeProjectStore::new(&directory);
+        let trap_id = Uuid::new_v4();
+        let project = store.root.join(trap_id.to_string());
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("compose.yaml"), "services: {}\n").unwrap();
+        fs::create_dir_all(directory.join("high").join(trap_id.to_string())).unwrap();
+        let command = AgentCommand::RemoveTrap {
+            command_id: Uuid::new_v4(),
+            trap_id,
+        };
+
+        assert_eq!(compose_remove_id(&store, &command), None);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

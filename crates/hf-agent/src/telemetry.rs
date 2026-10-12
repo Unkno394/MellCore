@@ -2,7 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
     net::IpAddr,
-    path::{Path, PathBuf},
+    path::Path,
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -136,7 +136,7 @@ fn collect_middle(
 }
 
 fn collect_low(
-    project: &Path,
+    _project: &Path,
     cursor_dir: &Path,
     trap_id: Uuid,
     identity: &AgentIdentity,
@@ -170,7 +170,9 @@ fn collect_low(
     let mut newest: Option<DateTime<chrono::FixedOffset>> = None;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         // Docker's --timestamps prepends an RFC3339 timestamp before the application JSON.
-        let Some(json_start) = line.find('{') else { continue };
+        let Some(json_start) = line.find('{') else {
+            continue;
+        };
         let docker_timestamp = match DateTime::parse_from_rfc3339(line[..json_start].trim()) {
             Ok(timestamp) => timestamp,
             Err(_) => continue,
@@ -366,8 +368,14 @@ mod tests {
         };
         let mut outbox = SqliteKazikOutbox::open(state_dir.join("outbox.sqlite")).unwrap();
 
-        assert_eq!(collect_new_events(&traps, &state_dir, &identity, &mut outbox).unwrap(), 1);
-        assert_eq!(collect_new_events(&traps, &state_dir, &identity, &mut outbox).unwrap(), 0);
+        assert_eq!(
+            collect_new_events(&traps, &state_dir, &identity, &mut outbox).unwrap(),
+            1
+        );
+        assert_eq!(
+            collect_new_events(&traps, &state_dir, &identity, &mut outbox).unwrap(),
+            0
+        );
         let pending = outbox.pending(10).unwrap();
         assert_eq!(pending.len(), 1);
         let KazikBody::Telemetry { events } = &pending[0].body else {

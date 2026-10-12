@@ -89,23 +89,39 @@ impl TrapTier {
         // A deleted executable has lost its on-disk identity; require review.
         let path = raw;
         match self {
-            Self::Low => matches!(path,
+            Self::Low => matches!(
+                path,
                 "/usr/local/bin/honeyforge-low"
-                | "/usr/libexec/docker-init" | "/usr/bin/docker-init" | "/sbin/docker-init"),
-            Self::Middle => matches!(path,
+                    | "/usr/libexec/docker-init"
+                    | "/usr/bin/docker-init"
+                    | "/sbin/docker-init"
+            ),
+            Self::Middle => matches!(
+                path,
                 "/usr/local/bin/docker-entrypoint"
-                | "/usr/local/bin/pritvoryashka"
-                | "/usr/libexec/docker-init" | "/usr/bin/docker-init" | "/sbin/docker-init"
-                | "/bin/sh" | "/bin/dash" | "/usr/bin/dash"
-                | "/usr/bin/mkdir" | "/bin/mkdir"
-                | "/usr/bin/ssh-keygen" | "/bin/ssh-keygen"),
+                    | "/usr/local/bin/pritvoryashka"
+                    | "/usr/libexec/docker-init"
+                    | "/usr/bin/docker-init"
+                    | "/sbin/docker-init"
+                    | "/bin/sh"
+                    | "/bin/dash"
+                    | "/usr/bin/dash"
+                    | "/usr/bin/mkdir"
+                    | "/bin/mkdir"
+                    | "/usr/bin/ssh-keygen"
+                    | "/bin/ssh-keygen"
+            ),
         }
     }
 }
 
 /// Returns policy violations in a Docker inspect response. Used before trusting a
 /// host-namespace process as an escape from a known trap.
-pub(crate) fn violations(tier: TrapTier, inspect: &Value, project_dir: &std::path::Path) -> Vec<&'static str> {
+pub(crate) fn violations(
+    tier: TrapTier,
+    inspect: &Value,
+    project_dir: &std::path::Path,
+) -> Vec<&'static str> {
     let limits = tier.limits();
     let host = &inspect["HostConfig"];
     let mounts = inspect["Mounts"].as_array();
@@ -141,34 +157,68 @@ pub(crate) fn violations(tier: TrapTier, inspect: &Value, project_dir: &std::pat
         result.push("unconfined seccomp or LSM profile is forbidden");
     }
     if tier == TrapTier::Low
-        && !matches!(inspect["Config"]["User"].as_str(), Some("65532" | "65532:65532"))
-    { result.push("Low container is not running as image UID 65532"); }
+        && !matches!(
+            inspect["Config"]["User"].as_str(),
+            Some("65532" | "65532:65532")
+        )
+    {
+        result.push("Low container is not running as image UID 65532");
+    }
     // Middle currently runs as UID 0 inside its namespaces to create/read its
     // persistent host key; CapDrop=ALL and no-new-privileges keep that distinct
     // from privileged mode or host root.
-    if host["ReadonlyRootfs"].as_bool() != Some(true) { result.push("root filesystem is writable"); }
-    if !host["CapDrop"].as_array().is_some_and(|caps| caps.iter().any(|cap| cap.as_str() == Some("ALL"))) {
+    if host["ReadonlyRootfs"].as_bool() != Some(true) {
+        result.push("root filesystem is writable");
+    }
+    if !host["CapDrop"]
+        .as_array()
+        .is_some_and(|caps| caps.iter().any(|cap| cap.as_str() == Some("ALL")))
+    {
         result.push("not all Linux capabilities are dropped");
     }
-    if !host["SecurityOpt"].as_array().is_some_and(|opts| opts.iter().any(|opt| {
-        matches!(opt.as_str(), Some("no-new-privileges") | Some("no-new-privileges:true"))
-    })) { result.push("no-new-privileges is missing"); }
-    if host["Memory"].as_u64().is_none_or(|value| value == 0 || value > limits.memory_bytes) {
+    if !host["SecurityOpt"].as_array().is_some_and(|opts| {
+        opts.iter().any(|opt| {
+            matches!(
+                opt.as_str(),
+                Some("no-new-privileges") | Some("no-new-privileges:true")
+            )
+        })
+    }) {
+        result.push("no-new-privileges is missing");
+    }
+    if host["Memory"]
+        .as_u64()
+        .is_none_or(|value| value == 0 || value > limits.memory_bytes)
+    {
         result.push("memory limit is missing or exceeds tier policy");
     }
-    if host["NanoCpus"].as_u64().is_none_or(|value| value == 0 || value > limits.nano_cpus) {
+    if host["NanoCpus"]
+        .as_u64()
+        .is_none_or(|value| value == 0 || value > limits.nano_cpus)
+    {
         result.push("CPU limit is missing or exceeds tier policy");
     }
-    if host["PidsLimit"].as_i64().is_none_or(|value| value <= 0 || value as u64 > limits.pids) {
+    if host["PidsLimit"]
+        .as_i64()
+        .is_none_or(|value| value <= 0 || value as u64 > limits.pids)
+    {
         result.push("PID limit is missing or exceeds tier policy");
     }
 
-    let has_nofile_limit = host["Ulimits"].as_array().is_some_and(|ulimits| ulimits.iter().any(|item| {
-        item["Name"].as_str() == Some("nofile")
-            && item["Soft"].as_u64().is_some_and(|value| value > 0 && value <= limits.nofile)
-            && item["Hard"].as_u64().is_some_and(|value| value > 0 && value <= limits.nofile)
-    }));
-    if !has_nofile_limit { result.push("nofile limit is missing or exceeds tier policy"); }
+    let has_nofile_limit = host["Ulimits"].as_array().is_some_and(|ulimits| {
+        ulimits.iter().any(|item| {
+            item["Name"].as_str() == Some("nofile")
+                && item["Soft"]
+                    .as_u64()
+                    .is_some_and(|value| value > 0 && value <= limits.nofile)
+                && item["Hard"]
+                    .as_u64()
+                    .is_some_and(|value| value > 0 && value <= limits.nofile)
+        })
+    });
+    if !has_nofile_limit {
+        result.push("nofile limit is missing or exceeds tier policy");
+    }
 
     match mounts {
         Some(mounts) if mounts.len() == expected_mounts.len() => {
@@ -186,7 +236,10 @@ pub(crate) fn violations(tier: TrapTier, inspect: &Value, project_dir: &std::pat
                     let propagation_ok = matches!(mount["Propagation"].as_str(), Some("rprivate" | "private"));
                     destination_ok && write_ok && source_ok && propagation_ok && mount["Type"] == "bind"
                 });
-                if !valid { result.push("mount set differs from the tier allowlist"); break; }
+                if !valid {
+                    result.push("mount set differs from the tier allowlist");
+                    break;
+                }
             }
         }
         _ => result.push("mount set differs from the tier allowlist"),
@@ -204,13 +257,19 @@ pub(crate) fn violations(tier: TrapTier, inspect: &Value, project_dir: &std::pat
     let manifest = std::fs::read(project_dir.join("manifest.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-    let expected_host_port = manifest.as_ref()
+    let expected_host_port = manifest
+        .as_ref()
         .and_then(|value| value["host_port"].as_u64())
         .map(|port| port.to_string());
-    let expected_host_ip = manifest.as_ref()
+    let expected_host_ip = manifest
+        .as_ref()
         .and_then(|value| value["publish_address"].as_str());
     if let Some(bindings) = port_bindings.as_object() {
-        if bindings.len() != 1 || expected_container_port.as_ref().is_none_or(|port| !bindings.contains_key(port)) {
+        if bindings.len() != 1
+            || expected_container_port
+                .as_ref()
+                .is_none_or(|port| !bindings.contains_key(port))
+        {
             result.push("published port set differs from the tier allowlist");
         }
         for (container_port, entries) in bindings {
@@ -218,11 +277,14 @@ pub(crate) fn violations(tier: TrapTier, inspect: &Value, project_dir: &std::pat
                 result.push("published port binding is malformed");
                 break;
             };
-            if entries.len() != 1 || entries.iter().any(|entry| {
-                Some(container_port) != expected_container_port.as_ref()
-                    || Some(entry["HostIp"].as_str().unwrap_or("")) != expected_host_ip
-                    || Some(entry["HostPort"].as_str().unwrap_or("")) != expected_host_port.as_deref()
-            }) {
+            if entries.len() != 1
+                || entries.iter().any(|entry| {
+                    Some(container_port) != expected_container_port.as_ref()
+                        || Some(entry["HostIp"].as_str().unwrap_or("")) != expected_host_ip
+                        || Some(entry["HostPort"].as_str().unwrap_or(""))
+                            != expected_host_port.as_deref()
+                })
+            {
                 result.push("published port binding is outside the tier allowlist");
                 break;
             }
@@ -288,7 +350,11 @@ mod tests {
     #[test]
     fn rejects_unbounded_and_host_network_container() {
         let inspect = json!({"HostConfig": {"NetworkMode":"host", "Memory":0, "NanoCpus":0, "PidsLimit":null}});
-        let reasons = violations(TrapTier::Low, &inspect, std::path::Path::new("/var/lib/honeyforge/traps/id"));
+        let reasons = violations(
+            TrapTier::Low,
+            &inspect,
+            std::path::Path::new("/var/lib/honeyforge/traps/id"),
+        );
         assert!(reasons.contains(&"host network namespace is enabled"));
         assert!(reasons.contains(&"memory limit is missing or exceeds tier policy"));
         assert!(reasons.contains(&"PID limit is missing or exceeds tier policy"));
@@ -299,7 +365,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("hf-policy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("config.json"), r#"{"port":2222}"#).unwrap();
-        std::fs::write(root.join("manifest.json"), r#"{"host_port":2222,"publish_address":"0.0.0.0"}"#).unwrap();
+        std::fs::write(
+            root.join("manifest.json"),
+            r#"{"host_port":2222,"publish_address":"0.0.0.0"}"#,
+        )
+        .unwrap();
         let inspect = json!({
             "Config": {"User":"65532:65532"},
             "HostConfig": {

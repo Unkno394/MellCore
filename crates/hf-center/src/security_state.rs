@@ -1,4 +1,10 @@
-use std::{collections::HashMap, fs, io::Write, os::unix::fs::{OpenOptionsExt, PermissionsExt}, path::{Path, PathBuf}};
+use std::{
+    collections::HashMap,
+    fs,
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
 use kazik_protocol::TrapEvent;
@@ -117,7 +123,9 @@ impl AgentSecurityStore {
     pub(crate) fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let state = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).context("parse Center agent security state")?,
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).context("parse Center agent security state")?
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => PersistedState::default(),
             Err(error) => return Err(error.into()),
         };
@@ -195,7 +203,10 @@ impl AgentSecurityStore {
     }
 
     pub(crate) fn target_is_compromised(&self, target: &str) -> bool {
-        self.state.compromised.values().any(|record| record.target.as_deref() == Some(target))
+        self.state
+            .compromised
+            .values()
+            .any(|record| record.target.as_deref() == Some(target))
     }
 
     pub(crate) fn compromised(&self) -> Vec<CompromisedAgent> {
@@ -210,30 +221,49 @@ impl AgentSecurityStore {
         self.persist(next)
     }
 
-    pub(crate) fn mark_compromised(&mut self, agent_id: Uuid, event: &TrapEvent) -> anyhow::Result<bool> {
+    pub(crate) fn mark_compromised(
+        &mut self,
+        agent_id: Uuid,
+        event: &TrapEvent,
+    ) -> anyhow::Result<bool> {
         if !Self::is_confirmed_escape(event) {
             anyhow::bail!("only a confirmed escape event can compromise an agent");
         }
         if self.state.compromised.contains_key(&agent_id) {
             return Ok(false);
         }
-        let target = self.state.targets.get(&agent_id).map(|target| target.address.clone());
+        let target = self
+            .state
+            .targets
+            .get(&agent_id)
+            .map(|target| target.address.clone());
         let mut next = clone_state(&self.state)?;
-        next.compromised.insert(agent_id, CompromisedAgent {
+        next.compromised.insert(
             agent_id,
-            target,
-            trap_id: event.trap_id,
-            event_id: event.event_id,
-            detected_at_unix_ms: event.occurred_at_unix_ms,
-            transport_disconnected: false,
-        });
+            CompromisedAgent {
+                agent_id,
+                target,
+                trap_id: event.trap_id,
+                event_id: event.event_id,
+                detected_at_unix_ms: event.occurred_at_unix_ms,
+                transport_disconnected: false,
+            },
+        );
         self.persist(next)?;
         Ok(true)
     }
 
-    pub(crate) fn set_transport_disconnected(&mut self, agent_id: Uuid, disconnected: bool) -> anyhow::Result<()> {
-        let Some(current) = self.state.compromised.get(&agent_id) else { return Ok(()) };
-        if current.transport_disconnected == disconnected { return Ok(()) }
+    pub(crate) fn set_transport_disconnected(
+        &mut self,
+        agent_id: Uuid,
+        disconnected: bool,
+    ) -> anyhow::Result<()> {
+        let Some(current) = self.state.compromised.get(&agent_id) else {
+            return Ok(());
+        };
+        if current.transport_disconnected == disconnected {
+            return Ok(());
+        }
         let mut next = clone_state(&self.state)?;
         if let Some(record) = next.compromised.get_mut(&agent_id) {
             record.transport_disconnected = disconnected;
@@ -254,7 +284,9 @@ impl AgentSecurityStore {
         file.sync_all()?;
         fs::rename(&temporary, &self.path)?;
         fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
-        if let Some(parent) = self.path.parent() { fs::File::open(parent)?.sync_all()?; }
+        if let Some(parent) = self.path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
         self.state = next;
         Ok(())
     }

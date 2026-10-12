@@ -6,7 +6,11 @@ use std::{collections::HashSet, fs, path::{Path, PathBuf}, process::Stdio, time:
 use anyhow::{Context, Result};
 use kazik_protocol::TrapEvent;
 use serde_json::json;
-use tokio::{io::{AsyncBufReadExt, BufReader}, process::Command, sync::mpsc};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::Command,
+    sync::mpsc,
+};
 use uuid::Uuid;
 
 use crate::security_policy::{self, ActionDecision, ObservedAction, Operation, TrapTier};
@@ -211,12 +215,19 @@ fn format_connect_destination(family_raw: u16, port_raw: u16, address_raw: [u32;
 }
 
 fn parent_pid(status: &str) -> Option<u32> {
-    status.lines().find_map(|line| line.strip_prefix("PPid:")?.trim().parse().ok())
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:")?.trim().parse().ok())
 }
 
 fn start_ticks(stat: &str) -> Option<u64> {
     // comm is inside parentheses and may contain spaces or closing parentheses.
-    stat.rsplit_once(") ")?.1.split_whitespace().nth(19)?.parse().ok()
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }
 
 fn needs_escape_confirmation(location: &Location, host_pid_ns: bool, host_mnt_ns: bool) -> bool {
@@ -261,9 +272,15 @@ async fn docker_containers(trap_root: &Path) -> Result<Vec<Container>> {
     anyhow::ensure!(output.status.success(), "docker ps failed: {}", String::from_utf8_lossy(&output.stderr));
     let mut containers = Vec::new();
     for line in String::from_utf8(output.stdout)?.lines() {
-        let Some((container_id, project)) = line.split_once(' ') else { continue };
-        let Some(id) = project.strip_prefix("hf-") else { continue };
-        let Ok(trap_id) = Uuid::parse_str(id) else { continue };
+        let Some((container_id, project)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some(id) = project.strip_prefix("hf-") else {
+            continue;
+        };
+        let Ok(trap_id) = Uuid::parse_str(id) else {
+            continue;
+        };
         if container_id.len() != 64 || !container_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             continue;
         }
@@ -273,7 +290,9 @@ async fn docker_containers(trap_root: &Path) -> Result<Vec<Container>> {
                 Some(TrapTier::Low)
             } else if project_dir.join("pritvoryashka.json").is_file() {
                 Some(TrapTier::Middle)
-            } else { None };
+            } else {
+                None
+            };
             if let Some(kind) = kind {
                 let inspect = docker_output(&["inspect", container_id]).await;
                 let details = match inspect {
@@ -342,17 +361,22 @@ fn process_event(pid: u32, containers: &[Container]) -> Result<Option<SecurityOb
     let (trap_id, kind, host_exec_from_trap) = match &location {
         Location::Trap(trap_id, kind) => (*trap_id, *kind, false),
         Location::Host => {
-            let Some(parent) = parent else { return Ok(None) };
+            let Some(parent) = parent else {
+                return Ok(None);
+            };
             let parent_cgroup = match fs::read_to_string(format!("/proc/{parent}/cgroup")) {
                 Ok(value) => value,
                 Err(_) => return Ok(None),
             };
-            let Location::Trap(trap_id, kind) = classify(&parent_cgroup, containers) else { return Ok(None) };
+            let Location::Trap(trap_id, kind) = classify(&parent_cgroup, containers) else {
+                return Ok(None);
+            };
             (trap_id, kind, true)
         }
         Location::Unknown => return Ok(None),
     };
-    let policy_violations = containers.iter()
+    let policy_violations = containers
+        .iter()
         .find(|container| container.trap_id == trap_id)
         .map(|container| container.policy_violations.clone())
         .unwrap_or_default();
@@ -363,7 +387,9 @@ fn process_event(pid: u32, containers: &[Container]) -> Result<Option<SecurityOb
     let pid_ns = fs::read_link(format!("{proc}/ns/pid"))?;
     let mnt_ns = fs::read_link(format!("{proc}/ns/mnt"))?;
     let shared_host_namespace = pid_ns == host_pid_ns || mnt_ns == host_mnt_ns;
-    let exe = fs::read_link(format!("{proc}/exe"))?.to_string_lossy().into_owned();
+    let exe = fs::read_link(format!("{proc}/exe"))?
+        .to_string_lossy()
+        .into_owned();
     let end = fs::read_to_string(format!("{proc}/stat"))?;
     if start.is_none() || start != start_ticks(&end) {
         return Ok(None);
@@ -391,7 +417,8 @@ fn process_event(pid: u32, containers: &[Container]) -> Result<Option<SecurityOb
         "security.process_exec"
     };
     let occurred_at_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
     let event = TrapEvent {
         event_id: Uuid::new_v4(),
         trap_id,
@@ -413,7 +440,10 @@ fn process_event(pid: u32, containers: &[Container]) -> Result<Option<SecurityOb
 /// A second observation plus Docker's runtime configuration is required before an
 /// emergency decision. Executing an unexpected binary inside its own namespaces
 /// remains suspicious, but is not considered an escape.
-pub(crate) async fn confirm_escape(candidate: &EscapeCandidate, trap_root: &Path) -> Result<Option<TrapEvent>> {
+pub(crate) async fn confirm_escape(
+    candidate: &EscapeCandidate,
+    trap_root: &Path,
+) -> Result<Option<TrapEvent>> {
     tokio::time::sleep(Duration::from_millis(250)).await;
     let project = trap_root.join(candidate.trap_id.to_string());
     if !project.join("compose.yaml").is_file()
@@ -423,19 +453,25 @@ pub(crate) async fn confirm_escape(candidate: &EscapeCandidate, trap_root: &Path
     let mut inspect = Command::new("docker");
     inspect.args(["inspect", &candidate.container_id]).kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(3), inspect.output())
-        .await.context("Docker inspect timed out")??;
+        .await
+        .context("Docker inspect timed out")??;
     anyhow::ensure!(output.status.success(), "Docker inspect failed");
     let details: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    let Some(container) = details.as_array().and_then(|items| items.first()) else { return Ok(None) };
+    let Some(container) = details.as_array().and_then(|items| items.first()) else {
+        return Ok(None);
+    };
     let expected_project = format!("hf-{}", candidate.trap_id.simple());
-    if container["Config"]["Labels"]["com.docker.compose.project"].as_str() != Some(expected_project.as_str())
+    if container["Config"]["Labels"]["com.docker.compose.project"].as_str()
+        != Some(expected_project.as_str())
         || container["State"]["Running"].as_bool() != Some(true)
         || container["HostConfig"]["Privileged"].as_bool() != Some(false)
         || container["HostConfig"]["PidMode"].as_str() == Some("host")
     {
         return Ok(None);
     }
-    let Some(container_pid) = container["State"]["Pid"].as_u64() else { return Ok(None) };
+    let Some(container_pid) = container["State"]["Pid"].as_u64() else {
+        return Ok(None);
+    };
     if container_pid == 0 {
         return Ok(None);
     }
@@ -469,7 +505,8 @@ pub(crate) async fn confirm_escape(candidate: &EscapeCandidate, trap_root: &Path
         return Ok(None);
     }
     let occurred_at_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
     Ok(Some(TrapEvent {
         event_id: Uuid::new_v4(),
         trap_id: candidate.trap_id,
@@ -494,7 +531,11 @@ pub(crate) async fn confirm_escape(candidate: &EscapeCandidate, trap_root: &Path
 }
 
 fn container_kind(project: &Path) -> TrapTier {
-    if project.join("pritvoryashka.json").is_file() { TrapTier::Middle } else { TrapTier::Low }
+    if project.join("pritvoryashka.json").is_file() {
+        TrapTier::Middle
+    } else {
+        TrapTier::Low
+    }
 }
 
 /// Optional monitor: failure never prevents command or telemetry delivery.
@@ -530,7 +571,9 @@ pub async fn run(trap_root: PathBuf, tx: mpsc::Sender<SecurityObservation>) {
                 continue;
             }
         };
-        let Some(stdout) = child.stdout.take() else { continue };
+        let Some(stdout) = child.stdout.take() else {
+            continue;
+        };
         let mut lines = BufReader::new(stdout).lines();
         let mut refresh = tokio::time::interval(Duration::from_secs(10));
         loop {
@@ -620,7 +663,10 @@ mod tests {
         assert_eq!(parse_exec_pid("Attaching 1 probe"), None);
         assert_eq!(parse_exec_pid("HF_EXEC no-pid"), None);
         assert_eq!(parent_pid("Name:\ttest\nPPid:\t42\n"), Some(42));
-        assert_eq!(start_ticks("12 (a b) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 42"), Some(42));
+        assert_eq!(
+            start_ticks("12 (a b) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 42"),
+            Some(42)
+        );
     }
 
     #[test]

@@ -1,7 +1,13 @@
 //! Root-owned, normally dormant response path. Only a separately confirmed
 //! escape may create its marker; the service itself checks marker ownership.
 
-use std::{fs, io::Write, os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt}, path::Path, process::Command};
+use std::{
+    fs,
+    io::Write,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    path::Path,
+    process::Command,
+};
 
 use anyhow::{Context, Result};
 use kazik_protocol::TrapEvent;
@@ -33,21 +39,34 @@ pub(crate) fn install(state_dir: &Path) -> Result<()> {
         return Ok(());
     }
     if state_dir != Path::new(DEFAULT_STATE) || fs::metadata("/proc/self")?.uid() != 0 {
-        anyhow::ensure!(!armed(), "armed emergency response requires root and the default state directory");
-        tracing::warn!("emergency service requires root and the default state directory; response remains disabled");
+        anyhow::ensure!(
+            !armed(),
+            "armed emergency response requires root and the default state directory"
+        );
+        tracing::warn!(
+            "emergency service requires root and the default state directory; response remains disabled"
+        );
         return Ok(());
     }
     if armed() {
         for program in ["nft", "bpftrace"] {
-            let status = Command::new(program).arg("--version").status()
+            let status = Command::new(program)
+                .arg("--version")
+                .status()
                 .with_context(|| format!("armed emergency response requires {program}"))?;
-            anyhow::ensure!(status.success(), "armed emergency response requires working {program}");
+            anyhow::ensure!(
+                status.success(),
+                "armed emergency response requires working {program}"
+            );
         }
     }
     fs::create_dir_all("/usr/local/libexec")?;
     let script = Path::new(SCRIPT);
     if let Ok(existing) = fs::read_to_string(script) {
-        anyhow::ensure!(existing.starts_with("#!/bin/sh\n# Managed by HoneyForge\n"), "refusing to replace an unmanaged emergency script");
+        anyhow::ensure!(
+            existing.starts_with("#!/bin/sh\n# Managed by HoneyForge\n"),
+            "refusing to replace an unmanaged emergency script"
+        );
     }
     if fs::read(script).ok().as_deref() != Some(include_str!("emergency.sh").as_bytes()) {
         crate::atomic_write(script, include_bytes!("emergency.sh"))?;
@@ -55,7 +74,10 @@ pub(crate) fn install(state_dir: &Path) -> Result<()> {
     }
     let unit = Path::new(UNIT);
     if let Ok(existing) = fs::read_to_string(unit) {
-        anyhow::ensure!(existing.starts_with("# Managed by HoneyForge\n"), "refusing to replace an unmanaged emergency service");
+        anyhow::ensure!(
+            existing.starts_with("# Managed by HoneyForge\n"),
+            "refusing to replace an unmanaged emergency service"
+        );
     }
     if fs::read(unit).ok().as_deref() != Some(UNIT_CONTENT.as_bytes()) {
         crate::atomic_write(unit, UNIT_CONTENT.as_bytes())?;
@@ -165,13 +187,25 @@ fn parse_marker(content: &str) -> Result<PendingIncident> {
 }
 
 pub(crate) fn start(state_dir: &Path) -> Result<()> {
-    anyhow::ensure!(armed(), "emergency response is not armed (HF_EMERGENCY_ARMED=1)");
-    anyhow::ensure!(state_dir == Path::new(DEFAULT_STATE), "emergency response requires default state directory");
-    anyhow::ensure!(pending(state_dir)?.is_some_and(|pending| pending.response_armed), "incident was not armed when recorded");
+    anyhow::ensure!(
+        armed(),
+        "emergency response is not armed (HF_EMERGENCY_ARMED=1)"
+    );
+    anyhow::ensure!(
+        state_dir == Path::new(DEFAULT_STATE),
+        "emergency response requires default state directory"
+    );
+    anyhow::ensure!(
+        pending(state_dir)?.is_some_and(|pending| pending.response_armed),
+        "incident was not armed when recorded"
+    );
     let status = Command::new("systemctl")
         .args(["start", "--no-block", "honeyforge-emergency.service"])
         .status()?;
-    anyhow::ensure!(status.success(), "systemctl could not start emergency service");
+    anyhow::ensure!(
+        status.success(),
+        "systemctl could not start emergency service"
+    );
     Ok(())
 }
 
@@ -203,7 +237,10 @@ mod tests {
         let parsed = parse_marker(&fs::read_to_string(marker(&dir)).unwrap()).unwrap();
         assert_eq!(parsed.message_id, message_id);
         assert_eq!(parsed.response_armed, armed());
-        assert_eq!(fs::metadata(marker(&dir)).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(marker(&dir)).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(record(&dir, &event, Uuid::new_v4()).is_err());
         fs::remove_dir_all(dir).unwrap();
     }

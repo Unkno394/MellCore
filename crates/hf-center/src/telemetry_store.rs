@@ -33,9 +33,12 @@ impl TelemetryStore {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
+            let create_parent = !parent.exists();
             fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
             #[cfg(unix)]
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+            if create_parent {
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+            }
         }
         let mut seen = HashSet::new();
         if let Ok(file) = File::open(&path) {
