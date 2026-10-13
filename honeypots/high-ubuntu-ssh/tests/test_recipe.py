@@ -304,6 +304,17 @@ for chain, rules in state.get("iptables:nat", {}).items():
             "exit 0\n",
         )
         executable(self.bin / "ss", "#!/bin/sh\nexit 0\n")
+        executable(
+            self.bin / "ip",
+            "#!/bin/sh\n"
+            "if [ \"$1 $2 $3 $4\" = '-4 route show default' ]; then\n"
+            "  printf 'default via 203.0.113.1 dev %s proto dhcp\\n' \"${FAKE_DEFAULT_INTERFACE:-eth0}\"\n"
+            "elif [ \"$1 $2 $3\" = '-o link show' ] && [ \"$4\" = dev ]; then\n"
+            "  [ \"$5\" != missing0 ]\n"
+            "else\n"
+            "  exit 1\n"
+            "fi\n",
+        )
         executable(self.bin / "sysctl", "#!/bin/sh\nexit 0\n")
         executable(self.bin / "virt-install", "#!/bin/sh\nexit 1\n")
         self.environment = dict(os.environ)
@@ -342,13 +353,47 @@ for chain, rules in state.get("iptables:nat", {}).items():
 
         ipv4_filter = published["iptables:filter"]
         self.assertEqual(ipv4_filter["INPUT"][0], ["-i", "virbr-hfhigh", "-j", "HF_HIGH_INPUT"])
-        self.assertEqual(ipv4_filter["HF_HIGH_INPUT"][-1], ["-j", "DROP"])
+        self.assertEqual(
+            ipv4_filter["HF_HIGH_INPUT"],
+            [
+                ["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+                ["-p", "udp", "--sport", "68", "--dport", "67", "-j", "ACCEPT"],
+                ["-j", "DROP"],
+            ],
+        )
         self.assertEqual(ipv4_filter["HF_HIGH_FORWARD"][-1], ["-j", "DROP"])
         self.assertIn(["-i", "virbr-hfhigh", "-j", "HF_HIGH_FORWARD"], ipv4_filter["FORWARD"][:2])
         self.assertIn(["-o", "virbr-hfhigh", "-j", "HF_HIGH_FORWARD"], ipv4_filter["FORWARD"][:2])
         dnat = published["iptables:nat"]["HF_HIGH_DNAT"][0]
-        self.assertEqual(dnat[:7], ["!", "-i", "virbr-hfhigh", "-m", "addrtype", "--dst-type", "LOCAL"])
-        self.assertEqual(published["ip6tables:filter"]["HF_HIGH_INPUT6"], [["-j", "DROP"]])
+        self.assertEqual(
+            dnat[:6], ["-i", "eth0", "-m", "addrtype", "--dst-type", "LOCAL"]
+        )
+        self.assertNotIn("!", dnat)
+        self.assertNotIn("docker0", json.dumps(published["iptables:nat"]))
+        self.assertIn(
+            [
+                "-i", "eth0", "-o", "virbr-hfhigh", "-p", "tcp",
+                "-d", "192.168.250.100", "--dport", "22", "-m", "conntrack",
+                "--ctstate", "NEW,ESTABLISHED", "-j", "ACCEPT",
+            ],
+            ipv4_filter["HF_HIGH_FORWARD"],
+        )
+        self.assertIn(
+            [
+                "-i", "virbr-hfhigh", "-o", "eth0", "-p", "tcp",
+                "-s", "192.168.250.100", "--sport", "22", "-m", "conntrack",
+                "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT",
+            ],
+            ipv4_filter["HF_HIGH_FORWARD"],
+        )
+        self.assertEqual(
+            published["ip6tables:filter"]["HF_HIGH_INPUT6"],
+            [
+                ["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+                ["-j", "DROP"],
+            ],
+        )
+        self.assertEqual((instance / "publish-interface").read_text().strip(), "eth0")
         self.run_script("check-dnat.sh", trap_id)
 
         self.environment["FAKE_GUEST_IP"] = "192.168.250.101"
@@ -362,6 +407,68 @@ for chain, rules in state.get("iptables:nat", {}).items():
         unpublished = json.loads(self.state.read_text())
         self.assertEqual(unpublished["iptables:nat"]["HF_HIGH_DNAT"], [])
         self.assertEqual(unpublished["iptables:filter"]["HF_HIGH_FORWARD"], [["-j", "DROP"]])
+
+    def test_publication_moves_atomically_to_an_explicit_interface(self):
+        self.run_script("create-network.sh")
+        trap_id = "11111111-2222-4333-8444-555555555555"
+        instance = self.root / "high" / trap_id
+        instance.mkdir(parents=True)
+        (instance / "external-ssh-port").write_text("22022\n", encoding="ascii")
+
+        self.run_script("publish-ssh.sh", trap_id, "22022")
+        self.environment["HF_HIGH_PUBLISH_INTERFACE"] = "ens19"
+        self.run_script("publish-ssh.sh", trap_id, "22022")
+        moved = json.loads(self.state.read_text())
+
+        rules = json.dumps(moved)
+        self.assertNotIn('"eth0"', rules)
+        self.assertIn('"ens19"', rules)
+        self.assertEqual((instance / "publish-interface").read_text().strip(), "ens19")
+        self.run_script("check-dnat.sh", trap_id)
+
+    def test_health_check_rejects_duplicate_dnat_on_an_unwanted_interface(self):
+        self.run_script("create-network.sh")
+        trap_id = "11111111-2222-4333-8444-555555555555"
+        instance = self.root / "high" / trap_id
+        instance.mkdir(parents=True)
+        (instance / "external-ssh-port").write_text("22022\n", encoding="ascii")
+        self.run_script("publish-ssh.sh", trap_id, "22022")
+
+        state = json.loads(self.state.read_text())
+        state["iptables:nat"]["HF_HIGH_DNAT"].append(
+            [
+                "-i", "docker0", "-m", "addrtype", "--dst-type", "LOCAL",
+                "-p", "tcp", "--dport", "22022", "-j", "DNAT",
+                "--to-destination", "192.168.250.100:22",
+            ]
+        )
+        self.state.write_text(json.dumps(state), encoding="utf-8")
+
+        result = self.run_script("check-dnat.sh", trap_id, check=False)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_publication_rejects_ambiguous_or_unsafe_interfaces(self):
+        executable(
+            self.bin / "ip",
+            "#!/bin/sh\n"
+            "if [ \"$1 $2 $3 $4\" = '-4 route show default' ]; then\n"
+            "  printf 'default via 203.0.113.1 dev eth0\\n'\n"
+            "  printf 'default via 198.51.100.1 dev ens19\\n'\n"
+            "elif [ \"$1 $2 $3\" = '-o link show' ] && [ \"$4\" = dev ]; then exit 0\n"
+            "else exit 1; fi\n",
+        )
+        result = self.run_script(
+            "publish-ssh.sh", "11111111-2222-4333-8444-555555555555", "22022", check=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("set HF_HIGH_PUBLISH_INTERFACE", result.stderr)
+
+        self.environment["HF_HIGH_PUBLISH_INTERFACE"] = "lo"
+        result = self.run_script(
+            "publish-ssh.sh", "11111111-2222-4333-8444-555555555555", "22022", check=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("isolated or loopback", result.stderr)
 
     def test_management_ssh_port_is_never_published(self):
         result = self.run_script(
@@ -381,6 +488,22 @@ for chain, rules in state.get("iptables:nat", {}).items():
         self.run_script("check-dnat.sh", trap_id)
         published = json.loads(self.state.read_text())
         self.assertIn("192.168.250.100:3389", json.dumps(published["iptables:nat"]))
+        self.assertIn(
+            [
+                "-i", "eth0", "-o", "virbr-hfhigh", "-p", "tcp",
+                "-d", "192.168.250.100", "--dport", "3389", "-m", "conntrack",
+                "--ctstate", "NEW,ESTABLISHED", "-j", "ACCEPT",
+            ],
+            published["iptables:filter"]["HF_HIGH_FORWARD"],
+        )
+        self.assertIn(
+            [
+                "-i", "virbr-hfhigh", "-o", "eth0", "-p", "tcp",
+                "-s", "192.168.250.100", "--sport", "3389", "-m", "conntrack",
+                "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT",
+            ],
+            published["iptables:filter"]["HF_HIGH_FORWARD"],
+        )
         self.assertEqual((instance / "guest-service-port").read_text().strip(), "3389")
 
         self.run_script("unpublish-ssh.sh", trap_id)

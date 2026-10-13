@@ -29,6 +29,7 @@ if is_protected_tcp_port "$external_port"; then
 fi
 # Re-assert the isolated network and guest-to-host firewall policy after host/agent restarts.
 sh "$script_dir/create-network.sh"
+publish_interface=$(resolve_high_publish_interface)
 # A host listener means this port is already occupied by SSH, the agent, or another service.
 # Do not steal it with a NAT rule.
 if ss -H -ltn "( sport = :$external_port )" 2>/dev/null | grep -q .; then
@@ -71,6 +72,13 @@ if [ -r "$root_dir/$instance_id/guest-ip" ]; then
     sh "$script_dir/unpublish-ssh.sh" "$instance_id"
   fi
 fi
+if [ -r "$root_dir/$instance_id/publish-interface" ]; then
+  previous_publish_interface=$(cat "$root_dir/$instance_id/publish-interface")
+  validate_publish_interface_name "$previous_publish_interface"
+  if [ "$previous_publish_interface" != "$publish_interface" ]; then
+    sh "$script_dir/unpublish-ssh.sh" "$instance_id"
+  fi
+fi
 
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
@@ -78,16 +86,22 @@ sysctl -w net.ipv4.ip_forward=1 >/dev/null
 delete_all nat PREROUTING -p tcp --dport "$external_port" -j DNAT --to-destination "$guest_ip:$guest_port"
 delete_all filter FORWARD -p tcp -d "$guest_ip" --dport "$guest_port" -j ACCEPT
 delete_all filter FORWARD -p tcp -s "$guest_ip" --sport "$guest_port" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+# Remove the wildcard-interface rules emitted by older recipe versions before installing the
+# interface-scoped policy.
 delete_all nat "$HF_HIGH_DNAT_CHAIN" ! -i "$bridge" -m addrtype --dst-type LOCAL -p tcp --dport "$external_port" -j DNAT --to-destination "$guest_ip:$guest_port"
 delete_all filter "$HF_HIGH_FORWARD_CHAIN" ! -i "$bridge" -o "$bridge" -p tcp -d "$guest_ip" --dport "$guest_port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
 delete_all filter "$HF_HIGH_FORWARD_CHAIN" -i "$bridge" ! -o "$bridge" -p tcp -s "$guest_ip" --sport "$guest_port" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+delete_all nat "$HF_HIGH_DNAT_CHAIN" -i "$publish_interface" -m addrtype --dst-type LOCAL -p tcp --dport "$external_port" -j DNAT --to-destination "$guest_ip:$guest_port"
+delete_all filter "$HF_HIGH_FORWARD_CHAIN" -i "$publish_interface" -o "$bridge" -p tcp -d "$guest_ip" --dport "$guest_port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
+delete_all filter "$HF_HIGH_FORWARD_CHAIN" -i "$bridge" -o "$publish_interface" -p tcp -s "$guest_ip" --sport "$guest_port" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 if nat_port_is_claimed_elsewhere "$external_port"; then
   echo "external SSH port already has a host NAT/redirect rule: $external_port" >&2
   exit 1
 fi
 
-ipt -t nat -I "$HF_HIGH_DNAT_CHAIN" 1 ! -i "$bridge" -m addrtype --dst-type LOCAL -p tcp --dport "$external_port" -j DNAT --to-destination "$guest_ip:$guest_port"
-ipt -I "$HF_HIGH_FORWARD_CHAIN" 1 ! -i "$bridge" -o "$bridge" -p tcp -d "$guest_ip" --dport "$guest_port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
-ipt -I "$HF_HIGH_FORWARD_CHAIN" 1 -i "$bridge" ! -o "$bridge" -p tcp -s "$guest_ip" --sport "$guest_port" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+ipt -t nat -I "$HF_HIGH_DNAT_CHAIN" 1 -i "$publish_interface" -m addrtype --dst-type LOCAL -p tcp --dport "$external_port" -j DNAT --to-destination "$guest_ip:$guest_port"
+ipt -I "$HF_HIGH_FORWARD_CHAIN" 1 -i "$publish_interface" -o "$bridge" -p tcp -d "$guest_ip" --dport "$guest_port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
+ipt -I "$HF_HIGH_FORWARD_CHAIN" 1 -i "$bridge" -o "$publish_interface" -p tcp -s "$guest_ip" --sport "$guest_port" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 printf '%s\n' "$guest_ip" > "$root_dir/$instance_id/guest-ip"
 printf '%s\n' "$guest_port" > "$root_dir/$instance_id/guest-service-port"
+printf '%s\n' "$publish_interface" > "$root_dir/$instance_id/publish-interface"
