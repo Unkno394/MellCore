@@ -4,7 +4,7 @@ users:
     groups: [adm, systemd-journal]
     shell: /bin/bash
     lock_passwd: false
-    plain_text_passwd: change-me-per-instance
+    passwd: '@@ANALYST_PASSWORD_HASH@@'
 ssh_pwauth: true
 disable_root: false
 write_files:
@@ -12,22 +12,22 @@ write_files:
     owner: root:root
     permissions: '0755'
     encoding: b64
-    content: SENSOR_B64
+    content: '@@SENSOR_B64@@'
   - path: /etc/systemd/system/honeyforge-high-telemetry.service
     owner: root:root
     permissions: '0644'
     encoding: b64
-    content: SENSOR_SERVICE_B64
+    content: '@@SENSOR_SERVICE_B64@@'
   - path: /usr/local/lib/honeyforge/high_telemetry_audit.py
     owner: root:root
     permissions: '0644'
     encoding: b64
-    content: AUDIT_SENSOR_B64
+    content: '@@AUDIT_SENSOR_B64@@'
   - path: /etc/audit/rules.d/90-honeyforge.rules
     owner: root:root
     permissions: '0600'
     encoding: b64
-    content: AUDIT_RULES_B64
+    content: '@@AUDIT_RULES_B64@@'
   - path: /etc/ssh/sshd_config.d/90-honeyforge.conf
     permissions: '0644'
     content: |

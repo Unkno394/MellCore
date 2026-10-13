@@ -196,7 +196,7 @@ impl GuestHighEvent {
         }
         if !matches!(
             self.event_origin.as_str(),
-            "kernel_audit" | "systemd_journal" | "sensor" | "host" | "unknown"
+            "kernel_audit" | "systemd_journal" | "sensor" | "unknown"
         ) {
             return Err(HighTelemetryError::InvalidEvent(
                 "unsupported event_origin".into(),
@@ -432,6 +432,8 @@ impl HighTelemetryStore {
                 "event_origin": guest.event_origin,
                 "event_confidence": guest.event_confidence,
                 "destination_ip": guest.destination_ip,
+                "provenance": "untrusted_guest_report",
+                "guest_fields_authenticated": false,
                 "source_ordering": "guest_sequence_only",
                 "cross_source_ordering": "not_guaranteed",
             }),
@@ -780,6 +782,12 @@ mod tests {
             parse_guest_high_event(&vec![b'x'; MAX_HIGH_TELEMETRY_FRAME_BYTES + 1]),
             Err(HighTelemetryError::FrameTooLarge)
         ));
+        let mut forged_host_origin = event(Uuid::new_v4());
+        forged_host_origin.event_origin = "host".into();
+        assert!(matches!(
+            forged_host_origin.validate(),
+            Err(HighTelemetryError::InvalidEvent(_))
+        ));
     }
 
     #[test]
@@ -800,6 +808,8 @@ mod tests {
         assert_eq!(first.event.event_id, retry.event.event_id);
         assert_eq!(first.host_sequence, retry.host_sequence);
         assert_eq!(store.pending_count().unwrap(), 1);
+        assert_eq!(first.event.metadata["provenance"], "untrusted_guest_report");
+        assert_eq!(first.event.metadata["guest_fields_authenticated"], false);
         drop(store);
         fs::remove_dir_all(directory).unwrap();
     }

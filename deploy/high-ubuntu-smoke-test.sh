@@ -33,6 +33,7 @@ sh "$recipe/scripts/publish-ssh.sh" "$instance_id" "$external_port"
 
 vm_name="hf-high-$instance_id"
 guest_ip=$(virsh domifaddr "$vm_name" --source lease | awk '/ipv4/ {print $4}' | cut -d/ -f1 | head -n1)
+password_file="/var/lib/honeyforge/high/$instance_id/ssh-password"
 echo
 echo "VM is running: $vm_name"
 echo "Guest address: $guest_ip"
@@ -59,7 +60,9 @@ From ANOTHER machine, test the external NAT path:
 
   ssh -p $external_port analyst@THIS_VPS_PUBLIC_IP
 
-Current test profile password: change-me-per-instance
+Read this instance's root-only test password on the KVM host:
+
+  sudo cat $password_file
 
 Destroy this exact test VM afterwards:
 

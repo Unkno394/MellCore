@@ -3,23 +3,59 @@ set -eu
 base_image=${1:?path to verified Ubuntu cloud base image is required}
 instance_dir=${2:?instance directory is required}
 instance_id=${3:?instance id is required}
+script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+. "$script_dir/firewall-common.sh"
+validate_instance_id "$instance_id"
 command -v qemu-img >/dev/null
 command -v cloud-localds >/dev/null
 command -v base64 >/dev/null
+command -v openssl >/dev/null
+command -v python3 >/dev/null
 [ -r "$base_image" ]
 mkdir -p "$instance_dir"
-qemu-img create -f qcow2 -F qcow2 -b "$base_image" "$instance_dir/disk.qcow2" 20G
 recipe_dir=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+
+# Fail before creating VM artifacts if either embedded Python module is syntactically invalid.
+python3 - "$recipe_dir/guest/high_telemetry_sensor.py" "$recipe_dir/guest/high_telemetry_audit.py" <<'PY'
+import pathlib
+import sys
+
+for filename in sys.argv[1:]:
+    source = pathlib.Path(filename).read_bytes()
+    compile(source, filename, "exec")
+PY
+
 sensor_b64=$(base64 < "$recipe_dir/guest/high_telemetry_sensor.py" | tr -d '\n')
 service_b64=$(base64 < "$recipe_dir/guest/high-telemetry.service" | tr -d '\n')
 audit_sensor_b64=$(base64 < "$recipe_dir/guest/high_telemetry_audit.py" | tr -d '\n')
 audit_rules_b64=$(base64 < "$recipe_dir/guest/90-honeyforge.rules" | tr -d '\n')
-sed "s/INSTANCE_ID/$instance_id/g" "$recipe_dir/cloud-init/meta-data" > "$instance_dir/meta-data"
+
+password_file="$instance_dir/ssh-password"
+if [ -r "$password_file" ]; then
+  analyst_password=$(cat "$password_file")
+else
+  analyst_password=$(openssl rand -base64 24 | tr -d '\n')
+  umask 077
+  printf '%s\n' "$analyst_password" > "$password_file"
+fi
+[ -n "$analyst_password" ] || { echo 'generated SSH password is empty' >&2; exit 1; }
+password_hash=$(printf '%s' "$analyst_password" | openssl passwd -6 -stdin)
+
+# Markers are deliberately delimited and non-overlapping. In particular, SENSOR_B64 must never
+# match inside AUDIT_SENSOR_B64 (the previous placeholders did and corrupted the audit module).
+sed "s|@@INSTANCE_ID@@|$instance_id|g" "$recipe_dir/cloud-init/meta-data" > "$instance_dir/meta-data"
 sed \
-  -e "s|SENSOR_B64|$sensor_b64|g" \
-  -e "s|SENSOR_SERVICE_B64|$service_b64|g" \
-  -e "s|AUDIT_SENSOR_B64|$audit_sensor_b64|g" \
-  -e "s|AUDIT_RULES_B64|$audit_rules_b64|g" \
+  -e "s|@@AUDIT_SENSOR_B64@@|$audit_sensor_b64|g" \
+  -e "s|@@SENSOR_SERVICE_B64@@|$service_b64|g" \
+  -e "s|@@AUDIT_RULES_B64@@|$audit_rules_b64|g" \
+  -e "s|@@SENSOR_B64@@|$sensor_b64|g" \
+  -e "s|@@ANALYST_PASSWORD_HASH@@|$password_hash|g" \
   "$recipe_dir/cloud-init/user-data" > "$instance_dir/user-data"
+if grep -q '@@[A-Z0-9_][A-Z0-9_]*@@' "$instance_dir/meta-data" "$instance_dir/user-data"; then
+  echo 'unresolved cloud-init template marker' >&2
+  exit 1
+fi
+
+qemu-img create -f qcow2 -F qcow2 -b "$base_image" "$instance_dir/disk.qcow2" 20G
 cloud-localds --network-config="$recipe_dir/cloud-init/network-config" "$instance_dir/seed.iso" "$instance_dir/user-data" "$instance_dir/meta-data"
-chmod 0600 "$instance_dir/disk.qcow2" "$instance_dir/seed.iso" "$instance_dir/user-data"
+chmod 0600 "$instance_dir/disk.qcow2" "$instance_dir/seed.iso" "$instance_dir/user-data" "$password_file"

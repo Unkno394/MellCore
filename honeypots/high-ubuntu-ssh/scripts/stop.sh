@@ -3,7 +3,10 @@ set -eu
 
 instance_id=${1:?instance UUID}
 vm_name="hf-high-$instance_id"
-sh "$(dirname "$0")/unpublish-ssh.sh" "$instance_id"
+script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+. "$script_dir/firewall-common.sh"
+validate_instance_id "$instance_id"
+sh "$script_dir/unpublish-ssh.sh" "$instance_id"
 
 if ! virsh dominfo "$vm_name" >/dev/null 2>&1; then
   exit 0

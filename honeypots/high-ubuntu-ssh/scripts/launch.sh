@@ -7,16 +7,33 @@ ssh_port=${3:?external SSH port}
 root_dir=${HF_HIGH_ROOT:-/var/lib/honeyforge/high}
 instance_dir="$root_dir/$instance_id"
 vm_name="hf-high-$instance_id"
+script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+. "$script_dir/firewall-common.sh"
+validate_instance_id "$instance_id"
 
 command -v virsh >/dev/null
 command -v virt-install >/dev/null
-"$(dirname "$0")/create-network.sh"
+sh "$script_dir/create-network.sh"
 
 if virsh dominfo "$vm_name" >/dev/null 2>&1; then
   echo "VM already exists: $vm_name" >&2
   exit 1
 fi
-"$(dirname "$0")/create-overlay.sh" "$base_image" "$instance_dir" "$instance_id"
+
+cleanup_needed=1
+cleanup_failed_launch() {
+  status=$?
+  if [ "$cleanup_needed" -eq 1 ]; then
+    virsh destroy "$vm_name" >/dev/null 2>&1 || true
+    virsh undefine "$vm_name" --nvram >/dev/null 2>&1 || true
+    rm -rf "$instance_dir"
+  fi
+  trap - EXIT
+  exit "$status"
+}
+trap cleanup_failed_launch EXIT INT TERM
+
+sh "$script_dir/create-overlay.sh" "$base_image" "$instance_dir" "$instance_id"
 
 virt-install \
   --name "$vm_name" \
@@ -35,3 +52,5 @@ virt-install \
 # The host firewall/NAT adapter must publish ssh_port to this VM only after it receives an IP.
 # Keeping it outside the guest ensures the guest cannot alter host exposure.
 printf '%s\n' "$ssh_port" > "$instance_dir/external-ssh-port"
+cleanup_needed=0
+trap - EXIT INT TERM
