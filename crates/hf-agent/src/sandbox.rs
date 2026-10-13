@@ -57,6 +57,9 @@ impl LibvirtSandboxManager {
         }
         for script in [
             "launch.sh",
+            "create-overlay.sh",
+            "create-network.sh",
+            "firewall-common.sh",
             "publish-ssh.sh",
             "unpublish-ssh.sh",
             "check-dnat.sh",
@@ -139,8 +142,8 @@ impl LibvirtSandboxManager {
         if !desired_running {
             return self.stop(vm.instance_id);
         }
-        let has_channel = self.domain_has_telemetry_channel(vm.instance_id)?;
-        let action = reconcile_action(self.domain_state(vm.instance_id)?, has_channel);
+        let matches_profile = self.domain_matches_security_profile(vm.instance_id)?;
+        let action = reconcile_action(self.domain_state(vm.instance_id)?, matches_profile);
         match action {
             ReconcileAction::Create => self.create_and_start(vm),
             ReconcileAction::Recreate => {
@@ -162,7 +165,7 @@ impl LibvirtSandboxManager {
     pub fn healthy(&self, vm: &UbuntuSshVm) -> anyhow::Result<bool> {
         Ok(high_running_health(
             self.domain_state(vm.instance_id)?,
-            self.domain_has_telemetry_channel(vm.instance_id)?,
+            self.domain_matches_security_profile(vm.instance_id)?,
             self.has_dnat(vm.instance_id),
             self.ssh_ready(vm.instance_id),
         ))
@@ -268,7 +271,7 @@ impl LibvirtSandboxManager {
         TcpStream::connect_timeout(&SocketAddr::new(ip, 22), Duration::from_secs(2)).is_ok()
     }
 
-    fn domain_has_telemetry_channel(&self, instance_id: Uuid) -> anyhow::Result<bool> {
+    fn domain_matches_security_profile(&self, instance_id: Uuid) -> anyhow::Result<bool> {
         let name = format!("hf-high-{instance_id}");
         let output = Command::new("virsh")
             .env("LC_ALL", "C")
@@ -277,7 +280,14 @@ impl LibvirtSandboxManager {
         if !output.status.success() {
             return Ok(false);
         }
-        Ok(String::from_utf8_lossy(&output.stdout).contains("org.honeyforge.telemetry.0"))
+        let telemetry_socket = self
+            .high_root
+            .join(instance_id.to_string())
+            .join("telemetry.sock");
+        Ok(domain_xml_matches_security_profile(
+            &String::from_utf8_lossy(&output.stdout),
+            &telemetry_socket,
+        ))
     }
 
     fn virsh(&self, arguments: &[&str]) -> anyhow::Result<()> {
@@ -309,8 +319,8 @@ impl LibvirtSandboxManager {
     }
 }
 
-fn reconcile_action(state: HighDomainState, has_channel: bool) -> ReconcileAction {
-    if state != HighDomainState::Missing && !has_channel {
+fn reconcile_action(state: HighDomainState, matches_profile: bool) -> ReconcileAction {
+    if state != HighDomainState::Missing && !matches_profile {
         return ReconcileAction::Recreate;
     }
     match state {
@@ -322,13 +332,22 @@ fn reconcile_action(state: HighDomainState, has_channel: bool) -> ReconcileActio
     }
 }
 
+fn domain_xml_matches_security_profile(xml: &str, telemetry_socket: &Path) -> bool {
+    let expected_socket = format!("path='{}'", telemetry_socket.display());
+    xml.matches("<interface type=").count() == 1
+        && xml.contains("<interface type='network'>")
+        && xml.contains("<source network='hf-high-isolated'")
+        && xml.contains("name='org.honeyforge.telemetry.0'")
+        && xml.contains(&expected_socket)
+}
+
 fn high_running_health(
     state: HighDomainState,
-    has_channel: bool,
+    matches_security_profile: bool,
     has_dnat: bool,
     ssh_ready: bool,
 ) -> bool {
-    state == HighDomainState::Running && has_channel && has_dnat && ssh_ready
+    state == HighDomainState::Running && matches_security_profile && has_dnat && ssh_ready
 }
 
 pub fn default_recipe_dir() -> &'static Path {
@@ -375,6 +394,27 @@ mod tests {
             reconcile_action(HighDomainState::Running, false),
             ReconcileAction::Recreate
         );
+    }
+
+    #[test]
+    fn existing_domain_must_keep_isolated_network_and_exact_telemetry_socket() {
+        let socket = Path::new("/var/lib/honeyforge/high/id/telemetry.sock");
+        let valid = "<domain><devices><interface type='network'><source network='hf-high-isolated'/></interface><channel type='unix'><source mode='bind' path='/var/lib/honeyforge/high/id/telemetry.sock'/><target type='virtio' name='org.honeyforge.telemetry.0'/></channel></devices></domain>";
+        assert!(domain_xml_matches_security_profile(valid, socket));
+        assert!(!domain_xml_matches_security_profile(
+            &valid.replace("hf-high-isolated", "default"),
+            socket
+        ));
+        assert!(!domain_xml_matches_security_profile(
+            &valid.replace("telemetry.sock", "spoof.sock"),
+            socket
+        ));
+        let second_interface =
+            valid.replace("</interface>", "</interface><interface type='bridge'/>");
+        assert!(!domain_xml_matches_security_profile(
+            &second_interface,
+            socket
+        ));
     }
 
     #[test]

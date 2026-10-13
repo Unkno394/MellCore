@@ -26,12 +26,10 @@ use hf_core::{
 };
 use hf_services::{
     FailoverSender, HysteriaSocks5UdpTransport,
-    high_telemetry::HighTelemetryStore,
     kazik_outbox::{SqliteKazikOutbox, send_pending_once},
 };
 use kazik_protocol::{
     AckDisposition, Acknowledgement, AgentStatus, DurableOutbox, KazikBody, KazikEnvelope,
-    MAX_TELEMETRY_BATCH_EVENTS,
 };
 use sandbox::{HighDomainState, LibvirtSandboxManager, UbuntuSshVm, default_recipe_dir};
 use serde::{Deserialize, Serialize};
@@ -136,6 +134,7 @@ fn quarantine_result(marker: &QuarantineMarker, applied: bool) -> kazik_protocol
 enum HighDesiredState {
     Running,
     Stopped,
+    Removing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -501,7 +500,11 @@ impl ComposeProjectStore {
         };
         self.save_high_manifest(&manifest)?;
         if changed {
-            self.high_manager().reset(deployment.trap_id)?;
+            if let Err(error) = self.high_manager().reset(deployment.trap_id) {
+                manifest.last_error = Some(error.to_string());
+                self.save_high_manifest(&manifest)?;
+                return Err(error);
+            }
         }
         let result = self
             .high_manager()
@@ -520,7 +523,11 @@ impl ComposeProjectStore {
         manifest.desired_state = HighDesiredState::Running;
         manifest.last_error = None;
         self.save_high_manifest(&manifest)?;
-        self.high_manager().reset(trap_id)?;
+        if let Err(error) = self.high_manager().reset(trap_id) {
+            manifest.last_error = Some(error.to_string());
+            self.save_high_manifest(&manifest)?;
+            return Err(error);
+        }
         let result = self
             .high_manager()
             .reconcile(&Self::high_vm(&manifest.deployment), true);
@@ -547,15 +554,39 @@ impl ComposeProjectStore {
     }
 
     fn remove_high(&self, trap_id: uuid::Uuid) -> anyhow::Result<()> {
-        self.high_manager().remove(trap_id)?;
+        let mut manifest = self
+            .load_high_manifest(trap_id)?
+            .ok_or_else(|| anyhow::anyhow!("High trap {trap_id} has no durable manifest"))?;
+        // Persist the destructive intent before teardown. If the process dies after libvirt
+        // removal but before manifest deletion, startup reconciliation must finish removal rather
+        // than recreate a trap whose old desired state was still `running`.
+        manifest.desired_state = HighDesiredState::Removing;
+        manifest.last_error = None;
+        self.save_high_manifest(&manifest)?;
+        if let Err(error) = self.high_manager().remove(trap_id) {
+            manifest.last_error = Some(error.to_string());
+            self.save_high_manifest(&manifest)?;
+            return Err(error);
+        }
         let project = self.root.join(trap_id.to_string());
         if project.exists() {
-            fs::remove_dir_all(project)?;
+            if let Err(error) = fs::remove_dir_all(project) {
+                manifest.last_error = Some(error.to_string());
+                self.save_high_manifest(&manifest)?;
+                return Err(error.into());
+            }
         }
         Ok(())
     }
 
     fn reconcile_high_manifests(&self) {
+        let _mutation = match self.mutation_lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::error!("High reconciliation lock is poisoned");
+                return;
+            }
+        };
         let Ok(entries) = fs::read_dir(&self.root) else {
             return;
         };
@@ -566,6 +597,21 @@ impl ComposeProjectStore {
             let Ok(Some(mut manifest)) = self.load_high_manifest(trap_id) else {
                 continue;
             };
+            if manifest.desired_state == HighDesiredState::Removing {
+                match self
+                    .high_manager()
+                    .remove(trap_id)
+                    .and_then(|()| fs::remove_dir_all(entry.path()).map_err(anyhow::Error::from))
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        tracing::error!(trap_id = %trap_id, %error, "High removal reconciliation failed");
+                        manifest.last_error = Some(error.to_string());
+                        let _ = self.save_high_manifest(&manifest);
+                    }
+                }
+                continue;
+            }
             let desired_running = manifest.desired_state == HighDesiredState::Running;
             match self
                 .high_manager()
@@ -1522,10 +1568,31 @@ async fn main() -> anyhow::Result<()> {
         args.high_telemetry_max_pending,
         Duration::from_secs(args.high_operational_interval_seconds),
     )?;
-    let high_kazik_store = HighTelemetryStore::open(
-        args.state_dir.join("high-telemetry.sqlite"),
-        args.high_telemetry_max_pending,
-    )?;
+    let reconciliation_projects = compose_projects.clone();
+    let reconciliation_state_dir = args.state_dir.clone();
+    let reconciliation_interval = Duration::from_secs(args.high_operational_interval_seconds);
+    let _high_reconciliation = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(reconciliation_interval).await;
+            match emergency::pending(&reconciliation_state_dir) {
+                Ok(None) => {
+                    let projects = reconciliation_projects.clone();
+                    if let Err(error) =
+                        tokio::task::spawn_blocking(move || projects.reconcile_high_manifests())
+                            .await
+                    {
+                        tracing::error!(%error, "periodic High reconciliation worker failed");
+                    }
+                }
+                Ok(Some(_)) => tracing::warn!(
+                    "periodic High reconciliation skipped during a confirmed security incident"
+                ),
+                Err(error) => {
+                    tracing::error!(%error, "cannot inspect emergency state before High reconciliation")
+                }
+            }
+        }
+    });
     // Initial SSH bootstrap may seed one root-owned command here. Later commands arrive through
     // Kazik and use the same idempotent `apply` implementation.
     let inbox = args.state_dir.join("inbox");
@@ -1548,7 +1615,6 @@ async fn main() -> anyhow::Result<()> {
             identity,
             socks,
             center_udp,
-            high_kazik_store,
         )
         .await;
     }
@@ -1575,7 +1641,6 @@ async fn run_kazik_hysteria_loop(
     identity: AgentIdentity,
     socks: SocketAddr,
     center_udp: SocketAddr,
-    mut high_telemetry_store: HighTelemetryStore,
 ) -> anyhow::Result<()> {
     let mut transport: Option<Arc<HysteriaSocks5UdpTransport>> = None;
     let mut sender: Option<FailoverSender> = None;
@@ -1894,30 +1959,9 @@ async fn run_kazik_hysteria_loop(
                     Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "trap telemetry collection failed"),
                 }
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_millis() as i64;
-                let json_budget = telemetry::event_json_budget(&identity, now)?;
-                match high_telemetry_store.prepare_kazik_batch(
-                    MAX_TELEMETRY_BATCH_EVENTS,
-                    json_budget,
-                    now,
-                ) {
-                    Ok(Some(batch)) => {
-                        let envelope = batch.kazik_envelope(
-                            identity.agent_id,
-                            identity.transport_credential.clone(),
-                        );
-                        match telemetry::ensure_packet_size(&envelope)
-                            .and_then(|_| outbox.enqueue(envelope).map_err(Into::into))
-                        {
-                            Ok(()) => queued = true,
-                            Err(error) => tracing::warn!(%error, "High telemetry remains in its durable SQLite queue"),
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => tracing::warn!(%error, "High telemetry batching failed"),
-                }
+                // High guest telemetry intentionally remains only in high-telemetry.sqlite.
+                // The current Center `Accepted` ACK confirms protocol acceptance, not durable
+                // storage, so it is not safe to enqueue or delete High source batches yet.
                 if queued {
                     if let Some(sender) = sender.as_ref() {
                         if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
@@ -1970,11 +2014,6 @@ async fn run_kazik_hysteria_loop(
                                         emergency::record_alert_ack(state_dir, ack.acknowledged_message_id)?;
                                         missing_alert = None;
                                     }
-                                    // Clear the High source batch first. If the process stops
-                                    // before the common outbox row is removed, the harmless
-                                    // replay is still deduplicated by Center event_id.
-                                    high_telemetry_store
-                                        .acknowledge_durable_kazik_batch(ack.acknowledged_message_id)?;
                                     outbox.acknowledge(ack.acknowledged_message_id)?;
                                     if pending_emergency.as_ref().is_some_and(|pending| pending.message_id == ack.acknowledged_message_id) {
                                         match emergency::start(state_dir) {
@@ -2652,6 +2691,31 @@ mod tests {
         );
         assert_eq!(recovered.deployment.external_ssh_port, 2222);
         assert_eq!(recovered.desired_state, HighDesiredState::Stopped);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn high_removal_intent_is_durable_across_restart() {
+        let directory = std::env::temp_dir().join(format!("hf-high-removing-{}", Uuid::new_v4()));
+        let store = ComposeProjectStore::new(&directory);
+        let trap_id = Uuid::new_v4();
+        let manifest = HighRuntimeManifest {
+            version: 1,
+            kind: "high_ubuntu_ssh".into(),
+            deployment: HighUbuntuDeployment {
+                command_id: Uuid::new_v4(),
+                trap_id,
+                base_image: "/images/prepared.qcow2".into(),
+                external_ssh_port: 22022,
+            },
+            desired_state: HighDesiredState::Removing,
+            last_error: None,
+        };
+        store.save_high_manifest(&manifest).unwrap();
+
+        let recovered = store.load_high_manifest(trap_id).unwrap().unwrap();
+        assert_eq!(recovered.desired_state, HighDesiredState::Removing);
+        assert_ne!(recovered.desired_state, HighDesiredState::Running);
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -1,0 +1,285 @@
+import base64
+import json
+import os
+import stat
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+RECIPE = Path(__file__).resolve().parents[1]
+SCRIPTS = RECIPE / "scripts"
+
+
+def executable(path, body):
+    path.write_text(body, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def embedded_files(user_data):
+    result = {}
+    current = None
+    for line in user_data.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- path: "):
+            current = stripped.removeprefix("- path: ")
+        elif current and stripped.startswith("content: "):
+            encoded = stripped.removeprefix("content: ").strip("'")
+            result[current] = base64.b64decode(encoded)
+            current = None
+    return result
+
+
+class CloudInitGenerationTests(unittest.TestCase):
+    def test_generated_cloud_init_contains_exact_valid_guest_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            executable(
+                fake_bin / "qemu-img",
+                "#!/bin/sh\n: > \"$8\"\n",
+            )
+            executable(
+                fake_bin / "cloud-localds",
+                "#!/bin/sh\nshift\n: > \"$1\"\n",
+            )
+            base_image = root / "base.qcow2"
+            base_image.write_bytes(b"test base")
+            instance = root / "instance"
+            instance_id = "11111111-2222-4333-8444-555555555555"
+            environment = dict(os.environ)
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+            subprocess.run(
+                ["sh", str(SCRIPTS / "create-overlay.sh"), str(base_image), str(instance), instance_id],
+                check=True,
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+
+            user_data = (instance / "user-data").read_text(encoding="utf-8")
+            self.assertNotIn("@@", user_data)
+            self.assertNotIn("plain_text_passwd", user_data)
+            password = (instance / "ssh-password").read_text(encoding="utf-8").strip()
+            self.assertGreaterEqual(len(password), 24)
+            self.assertNotIn(password, user_data)
+            self.assertIn("passwd: '$6$", user_data)
+            self.assertEqual(stat.S_IMODE((instance / "ssh-password").stat().st_mode), 0o600)
+            self.assertIn(f"instance-id: hf-high-{instance_id}", (instance / "meta-data").read_text())
+
+            files = embedded_files(user_data)
+            expected = {
+                "/usr/local/lib/honeyforge/high-telemetry-sensor": RECIPE / "guest/high_telemetry_sensor.py",
+                "/usr/local/lib/honeyforge/high_telemetry_audit.py": RECIPE / "guest/high_telemetry_audit.py",
+                "/etc/systemd/system/honeyforge-high-telemetry.service": RECIPE / "guest/high-telemetry.service",
+                "/etc/audit/rules.d/90-honeyforge.rules": RECIPE / "guest/90-honeyforge.rules",
+            }
+            self.assertTrue(set(expected).issubset(files))
+            for destination, source in expected.items():
+                self.assertEqual(files[destination], source.read_bytes())
+            compile(files["/usr/local/lib/honeyforge/high-telemetry-sensor"], "sensor", "exec")
+            compile(files["/usr/local/lib/honeyforge/high_telemetry_audit.py"], "audit", "exec")
+            unit = files["/etc/systemd/system/honeyforge-high-telemetry.service"].decode()
+            self.assertIn("ExecStart=/usr/local/lib/honeyforge/high-telemetry-sensor", unit)
+            self.assertIn("ProtectSystem=strict", unit)
+            self.assertIn("UMask=0077", unit)
+
+    def test_high_kazik_pump_remains_disabled_until_durable_ack_exists(self):
+        agent_main = (RECIPE.parents[1] / "crates/hf-agent/src/main.rs").read_text(encoding="utf-8")
+        self.assertNotIn("high_telemetry_store.prepare_kazik_batch", agent_main)
+        self.assertNotIn("high_telemetry_store.acknowledge_durable_kazik_batch", agent_main)
+
+
+class FirewallPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.state = self.root / "iptables.json"
+        fake_iptables = r'''#!/usr/bin/env python3
+import json, os, sys
+path = os.environ["FAKE_IPTABLES_STATE"]
+family = os.path.basename(sys.argv[0])
+args = sys.argv[1:]
+if args[:2] == ["-w", "5"]: args = args[2:]
+table = "filter"
+if args[:1] == ["-t"]:
+    table, args = args[1], args[2:]
+operation, chain, rest = args[0], args[1], args[2:]
+try: state = json.load(open(path))
+except FileNotFoundError: state = {}
+key = family + ":" + table
+chains = state.setdefault(key, {name: [] for name in ["INPUT", "OUTPUT", "FORWARD", "PREROUTING", "POSTROUTING"]})
+status = 0
+if operation == "-N":
+    if chain in chains: status = 1
+    else: chains[chain] = []
+elif operation == "-L": status = 0 if chain in chains else 1
+elif operation == "-F":
+    if chain not in chains: status = 1
+    else: chains[chain] = []
+elif operation == "-C": status = 0 if rest in chains.get(chain, []) else 1
+elif operation == "-A": chains.setdefault(chain, []).append(rest)
+elif operation == "-I":
+    position = int(rest.pop(0)) if rest and rest[0].isdigit() else 1
+    chains.setdefault(chain, []).insert(position - 1, rest)
+elif operation == "-D":
+    try: chains[chain].remove(rest)
+    except (KeyError, ValueError): status = 1
+else: status = 2
+with open(path, "w") as handle: json.dump(state, handle, sort_keys=True)
+sys.exit(status)
+'''
+        executable(self.bin / "iptables", fake_iptables)
+        os.symlink(self.bin / "iptables", self.bin / "ip6tables")
+        executable(
+            self.bin / "iptables-save",
+            r'''#!/usr/bin/env python3
+import json, os
+try: state = json.load(open(os.environ["FAKE_IPTABLES_STATE"]))
+except FileNotFoundError: state = {}
+for chain, rules in state.get("iptables:nat", {}).items():
+    for rule in rules: print("-A", chain, *rule)
+''',
+        )
+        executable(
+            self.bin / "virsh",
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  domifaddr) printf ' vnet0 52:54:00:00:00:01 ipv4 %s/24\\n' \"${FAKE_GUEST_IP:-192.168.250.100}\";;\n"
+            "  dominfo) if [ -n \"${FAKE_DOMAIN_EXISTS:-}\" ]; then exit 0; else exit 1; fi;;\n"
+            "  net-info) printf 'Active:         yes\\n';;\n"
+            "  net-dumpxml) if [ -n \"${FAKE_BAD_NETWORK:-}\" ]; then printf \"<network><name>hf-high-isolated</name><forward mode='nat'/><bridge name='virbr0'/></network>\\n\"; else printf \"<network><name>hf-high-isolated</name><forward mode='none'/><bridge name='virbr-hfhigh'/><ip address='192.168.250.1' netmask='255.255.255.0'><dhcp><range start='192.168.250.100' end='192.168.250.200'/></dhcp></ip></network>\\n\"; fi;;\n"
+            "esac\n"
+            "exit 0\n",
+        )
+        executable(self.bin / "ss", "#!/bin/sh\nexit 0\n")
+        executable(self.bin / "sysctl", "#!/bin/sh\nexit 0\n")
+        executable(self.bin / "virt-install", "#!/bin/sh\nexit 1\n")
+        self.environment = dict(os.environ)
+        self.environment.update(
+            PATH=f"{self.bin}:{self.environment['PATH']}",
+            FAKE_IPTABLES_STATE=str(self.state),
+            HF_HIGH_ROOT=str(self.root / "high"),
+        )
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def run_script(self, name, *arguments, check=True):
+        return subprocess.run(
+            ["sh", str(SCRIPTS / name), *map(str, arguments)],
+            env=self.environment,
+            check=check,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_firewall_policy_is_early_complete_and_idempotent(self):
+        self.run_script("create-network.sh")
+        first = json.loads(self.state.read_text())
+        self.run_script("create-network.sh")
+        self.assertEqual(first, json.loads(self.state.read_text()))
+
+        trap_id = "11111111-2222-4333-8444-555555555555"
+        instance = self.root / "high" / trap_id
+        instance.mkdir(parents=True)
+        (instance / "external-ssh-port").write_text("22022\n", encoding="ascii")
+        self.run_script("publish-ssh.sh", trap_id, "22022")
+        published = json.loads(self.state.read_text())
+        self.run_script("publish-ssh.sh", trap_id, "22022")
+        self.assertEqual(published, json.loads(self.state.read_text()))
+
+        ipv4_filter = published["iptables:filter"]
+        self.assertEqual(ipv4_filter["INPUT"][0], ["-i", "virbr-hfhigh", "-j", "HF_HIGH_INPUT"])
+        self.assertEqual(ipv4_filter["HF_HIGH_INPUT"][-1], ["-j", "DROP"])
+        self.assertEqual(ipv4_filter["HF_HIGH_FORWARD"][-1], ["-j", "DROP"])
+        self.assertIn(["-i", "virbr-hfhigh", "-j", "HF_HIGH_FORWARD"], ipv4_filter["FORWARD"][:2])
+        self.assertIn(["-o", "virbr-hfhigh", "-j", "HF_HIGH_FORWARD"], ipv4_filter["FORWARD"][:2])
+        dnat = published["iptables:nat"]["HF_HIGH_DNAT"][0]
+        self.assertEqual(dnat[:7], ["!", "-i", "virbr-hfhigh", "-m", "addrtype", "--dst-type", "LOCAL"])
+        self.assertEqual(published["ip6tables:filter"]["HF_HIGH_INPUT6"], [["-j", "DROP"]])
+        self.run_script("check-dnat.sh", trap_id)
+
+        self.environment["FAKE_GUEST_IP"] = "192.168.250.101"
+        self.run_script("publish-ssh.sh", trap_id, "22022")
+        moved = json.loads(self.state.read_text())
+        self.assertNotIn("192.168.250.100:22", json.dumps(moved["iptables:nat"]))
+        self.assertIn("192.168.250.101:22", json.dumps(moved["iptables:nat"]))
+        self.assertEqual((instance / "guest-ip").read_text().strip(), "192.168.250.101")
+
+        self.run_script("unpublish-ssh.sh", trap_id)
+        unpublished = json.loads(self.state.read_text())
+        self.assertEqual(unpublished["iptables:nat"]["HF_HIGH_DNAT"], [])
+        self.assertEqual(unpublished["iptables:filter"]["HF_HIGH_FORWARD"], [["-j", "DROP"]])
+
+    def test_management_ssh_port_is_never_published(self):
+        result = self.run_script(
+            "publish-ssh.sh", "11111111-2222-4333-8444-555555555555", "2222", check=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reserved for host management", result.stderr)
+
+    def test_mismatched_existing_libvirt_network_is_rejected(self):
+        self.environment["FAKE_BAD_NETWORK"] = "1"
+        result = self.run_script("create-network.sh", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match the fail-closed profile", result.stderr)
+
+    def test_existing_docker_or_high_dnat_port_is_not_stolen(self):
+        self.run_script("create-network.sh")
+        state = json.loads(self.state.read_text())
+        state["iptables:nat"]["DOCKER"] = [
+            ["-p", "tcp", "--dport", "22022", "-j", "DNAT", "--to-destination", "172.17.0.2:22"]
+        ]
+        self.state.write_text(json.dumps(state), encoding="utf-8")
+        result = self.run_script(
+            "publish-ssh.sh", "11111111-2222-4333-8444-555555555555", "22022", check=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("host NAT/redirect rule", result.stderr)
+
+    def test_guest_address_outside_isolated_dhcp_range_is_rejected(self):
+        self.environment["FAKE_GUEST_IP"] = "192.168.1.25"
+        result = self.run_script(
+            "publish-ssh.sh", "11111111-2222-4333-8444-555555555555", "22022", check=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("outside the High DHCP range", result.stderr)
+
+    def test_destructive_lifecycle_scripts_reject_non_uuid_paths(self):
+        result = self.run_script("reset.sh", "../../not-an-instance", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid High instance UUID", result.stderr)
+
+    def test_launch_never_cleans_an_existing_domain_and_cleans_failed_new_artifacts(self):
+        trap_id = "11111111-2222-4333-8444-555555555555"
+        instance = self.root / "high" / trap_id
+        instance.mkdir(parents=True)
+        marker = instance / "preserve"
+        marker.write_text("existing", encoding="ascii")
+        base = self.root / "base.qcow2"
+        base.write_bytes(b"base")
+
+        self.environment["FAKE_DOMAIN_EXISTS"] = "1"
+        result = self.run_script("launch.sh", base, trap_id, "22022", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(marker.exists())
+
+        del self.environment["FAKE_DOMAIN_EXISTS"]
+        executable(self.bin / "qemu-img", "#!/bin/sh\nexit 1\n")
+        result = self.run_script("launch.sh", base, trap_id, "22022", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(instance.exists())
+
+    def test_shell_scripts_are_syntactically_valid(self):
+        for script in SCRIPTS.glob("*.sh"):
+            subprocess.run(["sh", "-n", str(script)], check=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

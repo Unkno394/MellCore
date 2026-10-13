@@ -69,6 +69,11 @@ Network audit v1 видит исход `connect(2)` и destination address, но
 IP/ephemeral port, transport protocol или host firewall reject: эти поля помечаются неизвестными.
 Host-side libvirt даёт только aggregate RX/TX, а не flow records или PCAP.
 
+Все поля события, пришедшие из VM, помечаются `provenance=untrusted_guest_report`; guest не может
+заявить `event_origin=host`. Это защищает host identity/order/deduplication, но не делает sensor
+доверенным после получения root внутри VM: такой атакующий всё ещё может скрыть или сфабриковать
+guest-наблюдения.
+
 Host events пока не отправляются в Kazik. Store уже создаёт bounded batch, стабильный
 `message_id`, durable mapping на event IDs и готовый `KazikBody::Telemetry`. Удаление разрешено
 только методом durable-ack. Текущий `Accepted` от центра не подтверждает запись в постоянное
@@ -80,7 +85,9 @@ Host events пока не отправляются в Kazik. Store уже соз
 последнюю lifecycle-ошибку. Deploy/repeated command сверяет реальный domain, telemetry channel,
 SSH и DNAT. Stop снимает DNAT и останавливает domain без удаления overlay. Reset удаляет runtime
 и пересоздаёт чистый overlay по manifest. Remove удаляет domain, DNAT, runtime и manifest.
-После restart agent reconciles все High manifests.
+После restart и затем с operational interval agent reconciles все High manifests. Это повторно
+устанавливает policy после перезагрузки UFW/Docker/libvirt и завершает прерванный Remove без
+воскрешения VM.
 
 Раз в 30 секунд (настраивается `HF_HIGH_OPERATIONAL_INTERVAL_SECONDS`, минимум 5) agent заменяет
 `$HF_STATE_DIR/high/INSTANCE_UUID/operational.json`. Это bounded current-state snapshot:
@@ -89,9 +96,16 @@ aggregate RX/TX, uptime, SSH/DNAT/QGA readiness,
 последняя lifecycle-ошибка и свежесть sensor heartbeat. Эти host-side данные продолжают
 обновляться при остановленном guest sensor, но не заменяют flow-level network telemetry.
 
-Isolated bridge разрешает гостям DHCP, блокирует guest→host INPUT и не даёт обращаться к
-management listeners. Policy повторно применяется при публикации SSH после restart; virtio
-channel bridge не использует.
+Isolated bridge разрешает гостям только DHCP к host, блокирует guest→host INPUT, IPv6 и любой
+guest-initiated FORWARD к LAN/management сетям. Входящий DNAT разрешает только SSH конкретной VM,
+не применяется к пакетам с High bridge и не может занять management SSH port 2222. Выделенные
+цепочки вставляются перед UFW/Docker/libvirt policy и идемпотентно переустанавливаются при
+публикации SSH после restart; virtio channel bridge не использует.
+
+Пароль `analyst` генерируется отдельно для каждого overlay. В seed хранится только SHA-512 hash,
+а исходный пароль доступен root на KVM host в
+`$HF_STATE_DIR/high/INSTANCE_UUID/ssh-password` с mode 0600. Не копируйте его в логи и после
+контролируемого теста выполняйте Reset/Remove для удаления overlay и password file.
 
 ## Offline image
 
@@ -123,4 +137,6 @@ cloud-init не вызывает apt и только устанавливает 
 Локальные проверки без VM:
 
     cargo test -p hf-services high_telemetry
+    cargo test -p hf-agent
+    python3 -m unittest honeypots/high-ubuntu-ssh/tests/test_recipe.py
     python3 -m unittest honeypots/high-ubuntu-ssh/guest/test_high_telemetry_sensor.py honeypots/high-ubuntu-ssh/guest/test_high_telemetry_audit.py

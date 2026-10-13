@@ -293,20 +293,6 @@ pub(crate) fn ensure_packet_size(envelope: &KazikEnvelope) -> anyhow::Result<()>
     Ok(())
 }
 
-pub(crate) fn event_json_budget(
-    identity: &AgentIdentity,
-    sent_at_unix_ms: i64,
-) -> anyhow::Result<usize> {
-    let empty = telemetry_envelope(identity, sent_at_unix_ms, Vec::new());
-    let empty_packet_bytes = empty.encode_hfsp(0, 0)?.len();
-    anyhow::ensure!(
-        empty_packet_bytes >= 2 && empty_packet_bytes < MAX_TELEMETRY_PACKET_BYTES,
-        "agent identity leaves no room for Kazik telemetry"
-    );
-    // The empty JSON array already contributes two bytes to the encoded envelope.
-    Ok(MAX_TELEMETRY_PACKET_BYTES - (empty_packet_bytes - 2))
-}
-
 fn plan_batches(
     events: Vec<TrapEvent>,
     identity: &AgentIdentity,

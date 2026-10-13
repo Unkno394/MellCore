@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import os
 import tempfile
 import unittest
 import uuid
@@ -83,6 +85,37 @@ class GuestTelemetrySensorTests(unittest.TestCase):
                 self.assertEqual(outbox.peek()["event_type"], "sensor.diagnostic")
         finally:
             sensor.MAX_OUTBOX_EVENTS = original_limit
+
+    def test_persisted_outbox_byte_limit_is_enforced(self):
+        original_limit = sensor.MAX_OUTBOX_BYTES
+        sensor.MAX_OUTBOX_BYTES = 32
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / sensor.OUTBOX.name
+                path.write_bytes(b"x" * 33)
+                with self.assertRaisesRegex(RuntimeError, "persisted byte limit"):
+                    sensor.DurableGuestOutbox(directory)
+        finally:
+            sensor.MAX_OUTBOX_BYTES = original_limit
+
+    def test_ack_schema_rejects_spoofed_or_incomplete_ack(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(
+                write_fd,
+                json.dumps(
+                    {
+                        "version": 1,
+                        "acknowledged_guest_event_id": str(uuid.uuid4()),
+                    }
+                ).encode("utf-8")
+                + b"\n",
+            )
+            with self.assertRaisesRegex(RuntimeError, "invalid schema"):
+                sensor._read_ack(read_fd)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
 
 
 if __name__ == "__main__":

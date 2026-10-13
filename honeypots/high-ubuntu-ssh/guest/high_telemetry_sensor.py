@@ -70,9 +70,11 @@ def _atomic_text(path, text):
     _fsync_directory(path.parent)
 
 
-def _load_json_lines(path):
+def _load_json_lines(path, maximum_bytes=None):
     if not path.exists():
         return []
+    if maximum_bytes is not None and path.stat().st_size > maximum_bytes:
+        raise RuntimeError(f"{path} exceeds its persisted byte limit")
     records = []
     with open(path, "rb") as handle:
         for number, line in enumerate(handle, 1):
@@ -94,8 +96,10 @@ class DurableGuestOutbox:
         self.sequence_path = self.state_dir / SEQUENCE.name
         self.diagnostics_path = self.state_dir / DIAGNOSTICS.name
         self.lock = threading.RLock()
-        self.outbox = _load_json_lines(self.outbox_path)
+        self.outbox = _load_json_lines(self.outbox_path, MAX_OUTBOX_BYTES)
         known = _load_json_lines(self.known_path)
+        if len(known) > MAX_KNOWN_EVENTS:
+            raise RuntimeError("persisted known-event index exceeds configured event limit")
         self.known = {record["guest_event_id"]: record for record in known}
         if len(self.outbox) > MAX_OUTBOX_EVENTS:
             raise RuntimeError("persisted guest outbox exceeds configured event limit")
@@ -403,7 +407,30 @@ def _read_ack(device_fd):
             break
     if b"\n" not in data or len(data) > MAX_FRAME_BYTES + 1:
         raise RuntimeError("missing or oversized host acknowledgement")
-    return json.loads(bytes(data).split(b"\n", 1)[0])
+    acknowledgement = json.loads(bytes(data).split(b"\n", 1)[0])
+    if not isinstance(acknowledgement, dict) or set(acknowledgement) != {
+        "version",
+        "acknowledged_guest_event_id",
+        "event_id",
+        "host_sequence",
+        "duplicate",
+    }:
+        raise RuntimeError("host acknowledgement has an invalid schema")
+    if type(acknowledgement["version"]) is not int or acknowledgement["version"] != VERSION:
+        raise RuntimeError("host acknowledgement has an invalid version")
+    try:
+        uuid.UUID(acknowledgement["acknowledged_guest_event_id"])
+        uuid.UUID(acknowledgement["event_id"])
+    except (ValueError, TypeError, AttributeError) as error:
+        raise RuntimeError("host acknowledgement has an invalid UUID") from error
+    if (
+        not isinstance(acknowledgement["host_sequence"], int)
+        or isinstance(acknowledgement["host_sequence"], bool)
+        or acknowledgement["host_sequence"] < 1
+        or not isinstance(acknowledgement["duplicate"], bool)
+    ):
+        raise RuntimeError("host acknowledgement has invalid persistence fields")
+    return acknowledgement
 
 
 def _write_all(device_fd, data):
