@@ -121,7 +121,7 @@ pub async fn list(
     let pool = state.pool()?;
     crate::resources::traps::get(pool, &principal, trap_id).await?;
     let stored: Vec<StoredAttackEvent> = sqlx::query_as(
-        "SELECT ae.agent_id,ae.server_id,ae.event_id,ae.trap_id,ae.session_id,ae.sequence_no,ae.event_type,ae.occurred_at,ae.received_at,ae.expires_at,ae.source_ip,ae.source_port,ae.destination_port,ae.protocol,ae.service_type,ae.payload,ae.metadata FROM attack_events ae WHERE ae.trap_id=$1 AND ($2::uuid IS NULL OR ae.event_id>$2) ORDER BY ae.event_id LIMIT $3",
+        "SELECT ae.agent_id,ae.server_id,ae.event_id,ae.trap_id,ae.session_id,ae.sequence_no,ae.event_type,ae.occurred_at,ae.received_at,ae.expires_at,ae.source_ip,ae.source_port,ae.destination_port,ae.protocol,ae.service_type,ae.payload,ae.metadata FROM attack_events ae WHERE ae.trap_id=$1 AND ($2::uuid IS NULL OR (ae.occurred_at,ae.event_id) < (SELECT cursor.occurred_at,cursor.event_id FROM attack_events cursor WHERE cursor.trap_id=$1 AND cursor.event_id=$2)) ORDER BY ae.occurred_at DESC,ae.event_id DESC LIMIT $3",
     )
     .bind(trap_id)
     .bind(query.after)

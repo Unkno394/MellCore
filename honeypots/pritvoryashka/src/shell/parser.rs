@@ -54,7 +54,19 @@ pub fn parse(input: &str, max_bytes: usize) -> Result<Vec<String>, ParseError> {
                         has_word = false;
                     }
                 }
-                '|' | '&' | ';' | '<' | '>' | '`' => {
+                '>' => {
+                    if has_word {
+                        words.push(std::mem::take(&mut current));
+                        has_word = false;
+                    }
+                    if chars.peek() == Some(&'>') {
+                        chars.next();
+                        words.push(">>".into());
+                    } else {
+                        words.push(">".into());
+                    }
+                }
+                '|' | '&' | ';' | '<' | '`' => {
                     return Err(ParseError::UnsupportedSyntax);
                 }
                 '$' if chars.peek() == Some(&'(') => {

@@ -68,7 +68,7 @@ pub(crate) struct ResourceLimits {
 impl TrapTier {
     pub(crate) fn limits(self) -> ResourceLimits {
         match self {
-            // One SSH banner listener; no shell or child processes are expected.
+            // One low-interaction SSH listener; no shell or child processes are expected.
             Self::Low => ResourceLimits {
                 memory_bytes: 128 * 1024 * 1024,
                 nano_cpus: 500_000_000,
@@ -126,14 +126,83 @@ pub(crate) fn violations(
     let host = &inspect["HostConfig"];
     let mounts = inspect["Mounts"].as_array();
     let expected_project = project_dir.to_string_lossy();
-    let expected_mounts: &[(&str, bool)] = match tier {
-        TrapTier::Low => &[("/etc/honeyforge/config.json", false)],
-        TrapTier::Middle => &[
-            ("/etc/honeyforge/pritvoryashka.json", false),
-            ("/var/lib/pritvoryashka", true),
-        ],
-    };
+    let shared_identity_declared = std::fs::read(project_dir.join("manifest.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|manifest| manifest["shared_ssh_identity"].as_bool() == Some(true));
+    let shared_identity_path = std::fs::read(project_dir.join("manifest.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|manifest| manifest["ssh_identity_path"].as_str().map(std::path::PathBuf::from));
+    let identity_root = project_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap_or(std::path::Path::new("/var/lib/honeyforge"))
+        .join("ssh-identities");
+    let shared_identity_path = shared_identity_path.filter(|path| {
+        path.starts_with(&identity_root)
+            && path
+                .file_name()
+                .is_some_and(|name| name.to_str() == Some("host_ed25519"))
+            && std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.file_type().is_file())
+    });
+    let low_uses_persistent_host_key = tier == TrapTier::Low
+        && std::fs::read(project_dir.join("config.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|config| config["host_key_path"].as_str().map(str::to_owned))
+            .is_some_and(|path| !path.is_empty());
     let mut result = Vec::new();
+    if shared_identity_declared && shared_identity_path.is_none() {
+        result.push("shared SSH identity path is invalid");
+    }
+    let mut expected_mounts: Vec<(String, bool, String)> = Vec::new();
+    match tier {
+        TrapTier::Low => {
+            expected_mounts.push((
+                "/etc/honeyforge/config.json".into(),
+                false,
+                format!("{expected_project}/config.json"),
+            ));
+            if let Some(identity) = &shared_identity_path {
+                expected_mounts.push((
+                    "/var/lib/honeyforge-low".into(),
+                    false,
+                    identity
+                        .parent()
+                        .unwrap_or(std::path::Path::new(""))
+                        .display()
+                        .to_string(),
+                ));
+            } else if low_uses_persistent_host_key {
+                expected_mounts.push((
+                    "/var/lib/honeyforge-low".into(),
+                    true,
+                    format!("{expected_project}/runtime"),
+                ));
+            }
+        }
+        TrapTier::Middle => {
+            expected_mounts.push((
+                "/etc/honeyforge/pritvoryashka.json".into(),
+                false,
+                format!("{expected_project}/pritvoryashka.json"),
+            ));
+            expected_mounts.push((
+                "/var/lib/pritvoryashka".into(),
+                true,
+                format!("{expected_project}/runtime"),
+            ));
+            if let Some(identity) = &shared_identity_path {
+                expected_mounts.push((
+                    "/var/lib/pritvoryashka/host_ed25519".into(),
+                    false,
+                    identity.display().to_string(),
+                ));
+            }
+        }
+    }
 
     if host["Privileged"].as_bool() != Some(false) { result.push("privileged mode is enabled"); }
     if host["PidMode"].as_str() == Some("host") { result.push("host PID namespace is enabled"); }
@@ -222,17 +291,12 @@ pub(crate) fn violations(
 
     match mounts {
         Some(mounts) if mounts.len() == expected_mounts.len() => {
-            for (destination, writable) in expected_mounts {
+            for (destination, writable, expected_source) in &expected_mounts {
                 let valid = mounts.iter().any(|mount| {
                     let source = mount["Source"].as_str().unwrap_or("");
-                    let destination_ok = mount["Destination"].as_str() == Some(*destination);
+                    let destination_ok = mount["Destination"].as_str() == Some(destination.as_str());
                     let write_ok = mount["RW"].as_bool() == Some(*writable);
-                    let filename = match *destination {
-                        "/etc/honeyforge/config.json" => "config.json",
-                        "/etc/honeyforge/pritvoryashka.json" => "pritvoryashka.json",
-                        _ => "runtime",
-                    };
-                    let source_ok = source == format!("{expected_project}/{filename}");
+                    let source_ok = source == expected_source.as_str();
                     let propagation_ok = matches!(mount["Propagation"].as_str(), Some("rprivate" | "private"));
                     destination_ok && write_ok && source_ok && propagation_ok && mount["Type"] == "bind"
                 });
@@ -364,7 +428,12 @@ mod tests {
     fn accepts_a_low_container_that_matches_its_resource_and_mount_policy() {
         let root = std::env::temp_dir().join(format!("hf-policy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("config.json"), r#"{"port":2222}"#).unwrap();
+        std::fs::create_dir(root.join("runtime")).unwrap();
+        std::fs::write(
+            root.join("config.json"),
+            r#"{"port":2222,"host_key_path":"/var/lib/honeyforge-low/host_ed25519"}"#,
+        )
+        .unwrap();
         std::fs::write(
             root.join("manifest.json"),
             r#"{"host_port":2222,"publish_address":"0.0.0.0"}"#,
@@ -379,7 +448,10 @@ mod tests {
                 "Ulimits":[{"Name":"nofile","Soft":256,"Hard":256}],
                 "PortBindings":{"2222/tcp":[{"HostIp":"0.0.0.0","HostPort":"2222"}]}
             },
-            "Mounts":[{"Type":"bind","Propagation":"rprivate","Source":root.join("config.json").to_string_lossy(),"Destination":"/etc/honeyforge/config.json","RW":false}]
+            "Mounts":[
+                {"Type":"bind","Propagation":"rprivate","Source":root.join("config.json").to_string_lossy(),"Destination":"/etc/honeyforge/config.json","RW":false},
+                {"Type":"bind","Propagation":"rprivate","Source":root.join("runtime").to_string_lossy(),"Destination":"/var/lib/honeyforge-low","RW":true}
+            ]
         });
         assert!(violations(TrapTier::Low, &inspect, &root).is_empty());
         let mut hostile = inspect.clone();

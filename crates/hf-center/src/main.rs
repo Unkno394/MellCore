@@ -31,6 +31,8 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+const AGENT_HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 mod clickhouse;
 mod credentials;
 mod postgres_graph_sink;
@@ -112,6 +114,8 @@ struct AppState {
     enrollment_tokens: Arc<Mutex<HashMap<String, Uuid>>>,
     bootstrap_jobs: Arc<Mutex<HashMap<Uuid, BootstrapJob>>>,
     agent_credentials: Arc<Mutex<CredentialStore>>,
+    agent_heartbeats: Arc<Mutex<HashMap<Uuid, std::time::Instant>>>,
+    agent_capabilities: Arc<Mutex<HashMap<Uuid, Vec<String>>>>,
     agent_security: Arc<Mutex<AgentSecurityStore>>,
     bootstrapper: Arc<dyn RemoteBootstrap>,
     public_center_url: Arc<str>,
@@ -181,6 +185,7 @@ struct BootstrapJobStatus {
     status: BootstrapJobState,
     message: Option<String>,
     registered: bool,
+    connected: bool,
 }
 
 /// Request body Hysteria sends to `auth.type: http`. The remote address and rate are
@@ -273,6 +278,14 @@ struct RevokeResponse {
     detail: Option<String>,
 }
 
+#[derive(Serialize)]
+struct AgentPresence {
+    registered: bool,
+    connected: bool,
+    can_reboot: bool,
+    can_uninstall: bool,
+}
+
 fn default_ssh_port() -> u16 {
     22
 }
@@ -285,6 +298,28 @@ struct SshBootstrapper {
     dispatcher_binary: Option<PathBuf>,
     high_ubuntu_recipe_archive: Option<PathBuf>,
     hysteria_binary: Option<PathBuf>,
+}
+
+const EXISTING_AGENT_ERROR: &str = "existing HoneyForge agent identity on target";
+
+fn bootstrap_failure_message(error: &CoreError) -> &'static str {
+    match error {
+        CoreError::Transport(detail) if detail == EXISTING_AGENT_ERROR =>
+            "На сервере уже установлен агент. Используйте существующий сервер в панели или удалите старого агента перед новой установкой.",
+        CoreError::Transport(detail)
+            if detail.starts_with("SSH password authentication failed:")
+                || detail.starts_with("SSH public-key authentication failed:")
+                || detail == "SSH authentication was rejected" =>
+            "SSH-сервер отклонил вход. Проверьте имя пользователя и пароль SSH или приватный ключ; для защищённого ключа укажите его пароль.",
+        CoreError::Transport(detail) if detail.starts_with("SSH TCP connection failed:") =>
+            "Не удалось подключиться к SSH. Проверьте IP-адрес или домен, SSH-порт, сетевой доступ и правила firewall.",
+        CoreError::Transport(detail) if detail.starts_with("SSH handshake failed:") =>
+            "На указанном адресе и порту не удалось установить SSH-соединение. Проверьте адрес и SSH-порт.",
+        CoreError::Transport(detail) if detail.starts_with("remote installer returned exit status") =>
+            "SSH-доступ подтверждён, но установка агента завершилась ошибкой. На целевом сервере проверьте /tmp/hf-agent-bootstrap.log; на сервере MellCore — journalctl -u hf-center -n 100 --no-pager.",
+        _ =>
+            "Не удалось завершить установку агента. Проверьте SSH-доступ; если данные верны, посмотрите journalctl -u hf-center -n 100 --no-pager и /tmp/hf-agent-bootstrap.log на целевом сервере.",
+    }
 }
 
 #[async_trait::async_trait]
@@ -375,6 +410,8 @@ async fn main() -> anyhow::Result<()> {
         enrollment_tokens: Arc::default(),
         bootstrap_jobs: Arc::default(),
         agent_credentials: Arc::new(Mutex::new(CredentialStore::open(args.credentials_file)?)),
+        agent_heartbeats: Arc::default(),
+        agent_capabilities: Arc::default(),
         agent_security: Arc::new(Mutex::new(AgentSecurityStore::open(&args.security_file)?)),
         bootstrapper: Arc::new(SshBootstrapper {
             agent_binary: args.agent_binary,
@@ -454,6 +491,7 @@ async fn main() -> anyhow::Result<()> {
             get(command_status),
         )
         .route("/v1/agents/{agent_id}/revoke", post(revoke_agent))
+        .route("/v1/agents/{agent_id}/presence", get(agent_presence))
         .route("/v1/agents/{agent_id}/traps/register", post(register_existing_trap))
         .route("/v1/agents/compromised", get(list_compromised_agents))
         .route("/v1/traps/isolated", get(list_isolated_traps))
@@ -569,13 +607,7 @@ async fn bootstrap(
             Err(error) => {
                 warn!(%error, %job_id, "bootstrap failed");
                 enrollment_tokens.lock().await.remove(&token_for_job);
-                (
-                    BootstrapJobState::Failed,
-                    Some(
-                        "Установка агента завершилась ошибкой. Проверьте лог на целевом сервере."
-                            .into(),
-                    ),
-                )
+                (BootstrapJobState::Failed, Some(bootstrap_failure_message(&error).into()))
             }
         };
         if let Some(job) = jobs.lock().await.get_mut(&job_id) {
@@ -611,11 +643,18 @@ async fn bootstrap_status(
         .await
         .get(&job.agent_id)
         .is_some();
+    let connected = if state.hysteria_connection.is_none() {
+        registered
+    } else {
+        state.agent_heartbeats.lock().await.get(&job.agent_id)
+            .is_some_and(|last_seen| last_seen.elapsed() < AGENT_HEARTBEAT_TIMEOUT)
+    };
     Ok(Json(BootstrapJobStatus {
         agent_id: job.agent_id,
         status: job.status,
         message: job.message,
         registered,
+        connected,
     }))
 }
 
@@ -903,12 +942,18 @@ async fn revoke_agent(
             tracing::error!(%error, %agent_id, "could not persist agent revocation");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    state.agent_security.lock().await.remove_agent(agent_id).map_err(|error| {
+        tracing::error!(%error, %agent_id, "could not remove revoked agent state");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     state
         .enrollment_tokens
         .lock()
         .await
         .retain(|_, id| *id != agent_id);
     state.pending_commands.lock().await.remove(&agent_id);
+    state.agent_heartbeats.lock().await.remove(&agent_id);
+    state.agent_capabilities.lock().await.remove(&agent_id);
     let (transport_disconnected, detail) = match &state.hysteria_stats {
         Some(stats) => match stats.kick(agent_id).await {
             Ok(()) => (true, None),
@@ -924,6 +969,24 @@ async fn revoke_agent(
         revoked,
         transport_disconnected,
         detail,
+    }))
+}
+
+async fn agent_presence(
+    State(state): State<AppState>,
+    RoutePath(agent_id): RoutePath<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<AgentPresence>, StatusCode> {
+    authorize_control(&state, &headers)?;
+    let registered = state.agent_credentials.lock().await.get(&agent_id).is_some();
+    let connected = registered && (state.hysteria_connection.is_none()
+        || state.agent_heartbeats.lock().await.get(&agent_id)
+            .is_some_and(|seen| seen.elapsed() < AGENT_HEARTBEAT_TIMEOUT));
+    let capabilities = state.agent_capabilities.lock().await.get(&agent_id).cloned().unwrap_or_default();
+    Ok(Json(AgentPresence {
+        registered, connected,
+        can_reboot: connected && capabilities.iter().any(|item| item == "reboot_system"),
+        can_uninstall: connected && capabilities.iter().any(|item| item == "uninstall_agent"),
     }))
 }
 
@@ -1056,6 +1119,12 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
         }
         if !budget.allow(envelope.agent_id, length, std::time::Instant::now()) {
             continue; // No ACK: retry after the budget resets.
+        }
+        if let KazikBody::Heartbeat { status } = &envelope.body {
+            state.agent_heartbeats.lock().await
+                .insert(envelope.agent_id, std::time::Instant::now());
+            state.agent_capabilities.lock().await
+                .insert(envelope.agent_id, status.capabilities.clone());
         }
         let mut unregistered_telemetry = false;
         if let KazikBody::Telemetry { events } = &envelope.body {
@@ -1262,13 +1331,9 @@ async fn send_next_command(
 }
 
 fn render_install_script(token: &str, center_url: &str) -> String {
-    let mut script = format!(
-        "#!/bin/sh\nset -eu\nif [ \"$(id -u)\" -eq 0 ]; then SUDO=''; else SUDO='sudo -n'; fi\nensure_docker() {{\n  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then return; fi\n  [ -r /etc/os-release ] || {{ echo 'Cannot identify Linux distribution' >&2; exit 1; }}\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        echo 'Regional Ubuntu mirror configured; switching to archive.ubuntu.com before package update' >&2\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 bpftrace nftables\n      $SUDO systemctl enable --now docker\n      ;;\n    fedora)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    rhel|centos|rocky|almalinux)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    arch|manjaro)\n      $SUDO pacman -Sy --noconfirm docker docker-compose\n      $SUDO systemctl enable --now docker\n      ;;\n    alpine)\n      $SUDO apk add docker docker-cli-compose\n      $SUDO rc-update add docker default\n      $SUDO service docker start\n      ;;\n    *) echo \"Unsupported Linux distribution: $ID\" >&2; exit 1 ;;\n  esac\n  docker compose version >/dev/null\n}}\nif ! command -v bpftrace >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1; then\n  if [ ! -r /etc/os-release ]; then echo 'Cannot identify Linux distribution' >&2; exit 1; fi\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y bpftrace nftables\n      ;;\n    *) echo 'Install bpftrace and nftables for HoneyForge security monitoring' >&2 ;;\n  esac\nfi\n$SUDO install -d -m 0700 /etc/honeyforge\n$SUDO install -m 0755 /tmp/hf-agent-bootstrap /usr/local/bin/hf-agent\nif [ -f /tmp/hf-kozyavka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-kozyavka-image.tar\n  rm -f /tmp/hf-kozyavka-image.tar\nfi\nprintf '%s' '{token}' | $SUDO tee /etc/honeyforge/enrollment-token >/dev/null\nif command -v systemctl >/dev/null 2>&1; then\n  $SUDO tee /etc/systemd/system/hf-agent.service >/dev/null <<'UNIT'\n[Unit]\nDescription=HoneyForge agent\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nEnvironment=HF_CENTER_URL={center_url}\nEnvironment=HF_KOZYAVKA_IMAGE=honeyforge-low:local\nExecStart=/usr/local/bin/hf-agent\nRestart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\nUNIT\n  $SUDO systemctl daemon-reload\n  $SUDO systemctl enable --now hf-agent.service\nelif command -v rc-update >/dev/null 2>&1; then\n  $SUDO tee /etc/init.d/hf-agent >/dev/null <<'OPENRC'\n#!/sbin/openrc-run\nname=\"HoneyForge agent\"\ncommand=\"/usr/local/bin/hf-agent\"\ncommand_background=\"yes\"\npidfile=\"/run/hf-agent.pid\"\nexport HF_CENTER_URL={center_url}\nexport HF_KOZYAVKA_IMAGE=honeyforge-low:local\nOPENRC\n  $SUDO chmod 0755 /etc/init.d/hf-agent\n  $SUDO rc-update add hf-agent default\n  $SUDO rc-service hf-agent start\nelse\n  echo 'Unsupported init system: systemd or OpenRC is required' >&2\n  exit 1\nfi\nrm -f /tmp/hf-agent-bootstrap\n"
+    let script = format!(
+        "#!/bin/sh\nset -eu\nif [ \"$(id -u)\" -eq 0 ]; then SUDO=''; else SUDO='sudo -n'; fi\nif [ -f /var/lib/honeyforge/identity.json ]; then echo 'Existing HoneyForge agent identity on host; remove the old agent before enrollment' >&2; exit 42; fi\nensure_docker() {{\n  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then return; fi\n  [ -r /etc/os-release ] || {{ echo 'Cannot identify Linux distribution' >&2; exit 1; }}\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        echo 'Regional Ubuntu mirror configured; switching to archive.ubuntu.com before package update' >&2\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 bpftrace nftables\n      $SUDO systemctl enable --now docker\n      ;;\n    fedora)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    rhel|centos|rocky|almalinux)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    arch|manjaro)\n      $SUDO pacman -Sy --noconfirm docker docker-compose\n      $SUDO systemctl enable --now docker\n      ;;\n    alpine)\n      $SUDO apk add docker docker-cli-compose\n      $SUDO rc-update add docker default\n      $SUDO service docker start\n      ;;\n    *) echo \"Unsupported Linux distribution: $ID\" >&2; exit 1 ;;\n  esac\n  docker compose version >/dev/null\n}}\nif ! command -v bpftrace >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1; then\n  if [ ! -r /etc/os-release ]; then echo 'Cannot identify Linux distribution' >&2; exit 1; fi\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y bpftrace nftables\n      ;;\n    *) echo 'Install bpftrace and nftables for HoneyForge security monitoring' >&2 ;;\n  esac\nfi\n$SUDO install -d -m 0700 /etc/honeyforge\n$SUDO install -m 0755 /tmp/hf-agent-bootstrap /usr/local/bin/hf-agent\nif [ -f /tmp/hf-kozyavka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-kozyavka-image.tar\n  rm -f /tmp/hf-kozyavka-image.tar\nfi\nprintf '%s' '{token}' | $SUDO tee /etc/honeyforge/enrollment-token >/dev/null\nif [ -f /tmp/hf-high-ubuntu-ssh.tar.gz ]; then\n  $SUDO install -d -m 0755 /usr/local/lib/honeyforge\n  $SUDO tar -xzf /tmp/hf-high-ubuntu-ssh.tar.gz -C /usr/local/lib/honeyforge\n  $SUDO chmod -R a-w /usr/local/lib/honeyforge/high-ubuntu-ssh/cloud-init\n  $SUDO find /usr/local/lib/honeyforge/high-ubuntu-ssh/scripts -type f -exec chmod 0755 {{}} \\;\n  rm -f /tmp/hf-high-ubuntu-ssh.tar.gz\nfi\nif [ -f /tmp/hf-initial-command.json ]; then\n  $SUDO install -d -m 0700 /var/lib/honeyforge/inbox\n  $SUDO install -m 0600 /tmp/hf-initial-command.json /var/lib/honeyforge/inbox/initial-high.json\n  rm -f /tmp/hf-initial-command.json\nfi\nif [ -f /tmp/hf-dispatcher-bootstrap ]; then\n  if ! command -v systemctl >/dev/null 2>&1; then echo 'Shared TCP ports require systemd' >&2; exit 1; fi\n  $SUDO install -m 0755 /tmp/hf-dispatcher-bootstrap /usr/local/bin/hf-dispatcher\n  $SUDO tee /etc/systemd/system/hf-dispatcher.service >/dev/null <<'DISPATCHER_UNIT'\n[Unit]\nDescription=HoneyForge TCP dispatcher\nAfter=network-online.target docker.service\nWants=network-online.target\n[Service]\nType=simple\nExecStart=/usr/local/bin/hf-dispatcher --config /etc/honeyforge/dispatcher.json\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\nDISPATCHER_UNIT\n  $SUDO systemctl daemon-reload\n  rm -f /tmp/hf-dispatcher-bootstrap\nfi\nif [ -f /tmp/hysteria-bootstrap ]; then\n  $SUDO install -m 0755 /tmp/hysteria-bootstrap /usr/local/bin/hysteria\n  rm -f /tmp/hysteria-bootstrap\nfi\nif [ -f /tmp/hf-pritvoryashka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-pritvoryashka-image.tar\n  rm -f /tmp/hf-pritvoryashka-image.tar\nfi\nif command -v systemctl >/dev/null 2>&1; then\n  $SUDO tee /etc/systemd/system/hf-agent.service >/dev/null <<'UNIT'\n[Unit]\nDescription=HoneyForge agent\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nEnvironment=HF_CENTER_URL={center_url}\nEnvironment=HF_KOZYAVKA_IMAGE=honeyforge-low:local\nExecStart=/usr/local/bin/hf-agent\nRestart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\nUNIT\n  $SUDO systemctl daemon-reload\n  $SUDO systemctl enable --now hf-agent.service\nelif command -v rc-update >/dev/null 2>&1; then\n  $SUDO tee /etc/init.d/hf-agent >/dev/null <<'OPENRC'\n#!/sbin/openrc-run\nname=\"HoneyForge agent\"\ncommand=\"/usr/local/bin/hf-agent\"\ncommand_background=\"yes\"\npidfile=\"/run/hf-agent.pid\"\nexport HF_CENTER_URL={center_url}\nexport HF_KOZYAVKA_IMAGE=honeyforge-low:local\nOPENRC\n  $SUDO chmod 0755 /etc/init.d/hf-agent\n  $SUDO rc-update add hf-agent default\n  $SUDO rc-service hf-agent start\nelse\n  echo 'Unsupported init system: systemd or OpenRC is required' >&2\n  exit 1\nfi\nrm -f /tmp/hf-agent-bootstrap\n"
     );
-    script.push_str(
-        "\nif [ -f /tmp/hf-high-ubuntu-ssh.tar.gz ]; then\n  $SUDO install -d -m 0755 /usr/local/lib/honeyforge\n  $SUDO tar -xzf /tmp/hf-high-ubuntu-ssh.tar.gz -C /usr/local/lib/honeyforge\n  $SUDO chmod -R a-w /usr/local/lib/honeyforge/high-ubuntu-ssh/cloud-init\n  $SUDO find /usr/local/lib/honeyforge/high-ubuntu-ssh/scripts -type f -exec chmod 0755 {} \\;\n  rm -f /tmp/hf-high-ubuntu-ssh.tar.gz\nfi\nif [ -f /tmp/hf-initial-command.json ]; then\n  $SUDO install -d -m 0700 /var/lib/honeyforge/inbox\n  $SUDO install -m 0600 /tmp/hf-initial-command.json /var/lib/honeyforge/inbox/initial-high.json\n  rm -f /tmp/hf-initial-command.json\nfi\n",
-    );
-    script.push_str("\nif [ -f /tmp/hf-dispatcher-bootstrap ]; then\n  if ! command -v systemctl >/dev/null 2>&1; then echo 'Shared TCP ports require systemd' >&2; exit 1; fi\n  $SUDO install -m 0755 /tmp/hf-dispatcher-bootstrap /usr/local/bin/hf-dispatcher\n  $SUDO tee /etc/systemd/system/hf-dispatcher.service >/dev/null <<'DISPATCHER_UNIT'\n[Unit]\nDescription=HoneyForge TCP dispatcher\nAfter=network-online.target docker.service\nWants=network-online.target\n[Service]\nType=simple\nExecStart=/usr/local/bin/hf-dispatcher --config /etc/honeyforge/dispatcher.json\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\nDISPATCHER_UNIT\n  $SUDO systemctl daemon-reload\n  rm -f /tmp/hf-dispatcher-bootstrap\nfi\nif [ -f /tmp/hysteria-bootstrap ]; then\n  $SUDO install -m 0755 /tmp/hysteria-bootstrap /usr/local/bin/hysteria\n  rm -f /tmp/hysteria-bootstrap\nfi\nif [ -f /tmp/hf-pritvoryashka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-pritvoryashka-image.tar\n  rm -f /tmp/hf-pritvoryashka-image.tar\nfi\n");
     script
 }
 
@@ -1317,6 +1382,22 @@ fn run_ssh_install(
         ));
     }
     info!(host = %target.host, user = %target.user, "SSH authentication succeeded");
+    let mut preflight = session.channel_session()
+        .map_err(|error| CoreError::Transport(format!("cannot open SSH preflight channel: {error}")))?;
+    preflight.exec("sh -c 'if [ \"$(id -u)\" -eq 0 ]; then [ ! -f /var/lib/honeyforge/identity.json ] || exit 42; elif sudo -n test -f /var/lib/honeyforge/identity.json; then exit 42; fi'")
+        .map_err(|error| CoreError::Transport(format!("cannot check remote agent identity: {error}")))?;
+    preflight.wait_eof()
+        .map_err(|error| CoreError::Transport(format!("remote identity check did not reach EOF: {error}")))?;
+    preflight.wait_close()
+        .map_err(|error| CoreError::Transport(format!("remote identity check failed: {error}")))?;
+    let preflight_status = preflight.exit_status()
+        .map_err(|error| CoreError::Transport(format!("cannot read remote identity check status: {error}")))?;
+    if preflight_status == 42 {
+        return Err(CoreError::Transport(EXISTING_AGENT_ERROR.into()));
+    }
+    if preflight_status != 0 {
+        return Err(CoreError::Transport("remote identity check returned an unexpected status".into()));
+    }
     let metadata = std::fs::metadata(&agent_binary)
         .map_err(|error| CoreError::Transport(format!("cannot read agent artifact: {error}")))?;
     let mut local_binary = std::fs::File::open(&agent_binary)
@@ -1407,10 +1488,12 @@ fn run_ssh_install(
     channel
         .wait_close()
         .map_err(|error| CoreError::Transport(format!("remote installer failed: {error}")))?;
-    if channel.exit_status().unwrap_or(-1) != 0 {
-        return Err(CoreError::Transport(
-            "remote installer returned non-zero exit status".into(),
-        ));
+    match channel.exit_status().unwrap_or(-1) {
+        0 => {}
+        42 => return Err(CoreError::Transport(EXISTING_AGENT_ERROR.into())),
+        status => return Err(CoreError::Transport(format!(
+            "remote installer returned exit status {status}; see /tmp/hf-agent-bootstrap.log on target"
+        ))),
     }
     info!(host = %target.host, "remote hf-agent service installed and started");
     Ok(())

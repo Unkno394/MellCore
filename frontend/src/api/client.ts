@@ -119,16 +119,38 @@ function safelyParseJson(text: string): unknown {
 
 export function apiErrorMessage(error: unknown): string {
   if (!(error instanceof ApiError)) return 'Неожиданная ошибка приложения.'
-  const knownMessages: Record<string, string> = {
-    unauthorized: 'Неверные учётные данные или срок действия сеанса истёк.',
-    forbidden: 'Доступ запрещён.',
-    not_found: 'Запрошенные данные не найдены.',
-    email_not_verified: 'Подтвердите адрес электронной почты перед входом.',
-    mail_unavailable: 'Отправка писем сейчас недоступна.',
-    database_unavailable: 'База данных сейчас недоступна.',
-    rate_limited: 'Слишком много запросов. Повторите попытку позже.',
-    internal_error: 'Внутренняя ошибка сервера.',
+  const requestId = error.requestId ? ` ID запроса: ${error.requestId}.` : ''
+  const logHint = 'Если ошибка повторится, проверьте журналы Центра: journalctl -u honeyforge-backend -u hf-center -n 100 --no-pager.'
+
+  switch (error.code) {
+    case 'validation_error':
+      return `Введены некорректные данные. Проверьте поля формы: ${error.message}`
+    case 'unauthorized':
+      return 'Неверные учётные данные или срок действия сеанса истёк.'
+    case 'forbidden':
+      return 'У вашей учётной записи нет доступа к этому действию.'
+    case 'not_found':
+      return 'Запрошенные данные не найдены. Обновите страницу и попробуйте снова.'
+    case 'email_not_verified':
+      return 'Подтвердите адрес электронной почты перед входом.'
+    case 'conflict':
+      return `Операцию нельзя выполнить в текущем состоянии: ${error.message}`
+    case 'mail_unavailable':
+      return `Не удалось отправить письмо. Проверьте настройки SMTP. ${logHint}${requestId}`
+    case 'database_unavailable':
+      return `MellCore не получил ответ от базы данных или Центра. Повторите попытку. ${logHint}${requestId}`
+    case 'rate_limited':
+      return 'Слишком много запросов. Подождите немного и повторите попытку.'
+    case 'internal_error':
+      return `Внутренняя ошибка MellCore. ${logHint}${requestId}`
+    case 'network_error':
+      return `Не удалось подключиться к API MellCore. Проверьте соединение с панелью. ${logHint}`
+    case 'request_timeout':
+      return `API MellCore не ответил вовремя. Повторите попытку. ${logHint}`
+    case 'request_cancelled':
+      return 'Запрос отменён.'
+    default:
+      if (error.status >= 500) return `API MellCore вернул ошибку (${error.status}). ${logHint}${requestId}`
+      return `${error.message}${requestId}`
   }
-  const suffix = error.requestId ? ` ID запроса: ${error.requestId}` : ''
-  return `${knownMessages[error.code] ?? error.message}${suffix}`
 }

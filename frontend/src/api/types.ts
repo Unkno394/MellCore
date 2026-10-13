@@ -1,5 +1,5 @@
 export type Role = 'admin' | 'viewer' | 'user'
-export type TrapLevel = 'low' | 'medium'
+export type TrapLevel = 'low' | 'medium' | 'high'
 export type ServerStatus = 'unknown' | 'online' | 'offline' | 'error'
 export type TrapDesiredState = 'running' | 'stopped'
 export type TrapAction = 'start' | 'stop' | 'restart' | 'remove'
@@ -80,6 +80,9 @@ export type Server = ServerInput & {
   updated_at: string
 }
 
+export type ServerPresence = { registered: boolean; connected: boolean; can_reboot: boolean; can_uninstall: boolean }
+export type DeleteServerResult = { remote_cleanup: 'scheduled' | 'unreachable' | 'unsupported' | 'not_installed' }
+
 export type BootstrapServerInput = {
   server: ServerInput
   ssh_password: string | null
@@ -93,6 +96,13 @@ export type BootstrapProgress = {
   status: 'running' | 'succeeded' | 'failed'
   registered: boolean
   message: string | null
+}
+
+export type ServerActionProgress = {
+  action_id: string
+  action: 'reboot'
+  status: 'queued' | 'succeeded' | 'failed'
+  detail: string | null
 }
 
 export type PortBinding = {

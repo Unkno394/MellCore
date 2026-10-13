@@ -5,9 +5,8 @@ import type { PageName } from './Sidebar'
 type Props = { currentPage: PageName; user: User; onLogout: () => void }
 
 const labels: Record<PageName, string> = {
-  Dashboard: 'Обзор', Honeypots: 'Ловушки', Profiles: 'Профили',
-  ConnectServer: 'Добавить сервер', CreateHoneypot: 'Добавить ловушку',
-  LiveFeed: 'Атаки', Settings: 'Настройки',
+  Dashboard: 'Обзор', Infrastructure: 'Инфраструктура', Profiles: 'Профили',
+  LiveFeed: 'События', Settings: 'Настройки',
 }
 
 export default function Topbar({ currentPage, user, onLogout }: Props) {

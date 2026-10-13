@@ -48,6 +48,7 @@ impl Shell {
     pub fn new(hostname: &str, max_input_bytes: usize, now: DateTime<Utc>) -> Self {
         let mut fs = VirtualFileSystem::linux(hostname, now);
         let virtual_server = VirtualServer::new(&mut fs, now);
+        let started_at = virtual_server.booted_at();
         let history = VirtualServer::initial_history();
         virtual_server.sync_history(&mut fs, &history, now);
         Self {
@@ -59,7 +60,7 @@ impl Shell {
             deception: DeceptionEngine::default(),
             virtual_server,
             max_input_bytes,
-            started_at: now,
+            started_at,
         }
     }
 
@@ -106,9 +107,19 @@ impl Shell {
             self.virtual_server
                 .sync_history(&mut self.fs, &self.history, now);
         }
-        let words = match parser::parse(line, self.max_input_bytes) {
+        let mut words = match parser::parse(line, self.max_input_bytes) {
             Ok(words) => words,
             Err(error) => return failure(format!("bash: {error}\n")),
+        };
+        let redirect = match words.iter().position(|word| word == ">" || word == ">>") {
+            Some(index) if index + 2 == words.len() && index > 0 => {
+                let append = words[index] == ">>";
+                let target = words.pop().expect("validated redirect target");
+                words.pop();
+                Some((append, target))
+            }
+            Some(_) => return failure("bash: syntax error near unexpected token `newline'\n"),
+            None => None,
         };
         let Some((command, args)) = words.split_first() else {
             return ShellOutput::default();
@@ -128,6 +139,7 @@ impl Shell {
                 "echo" => success(format!("{}\n", self.expand_environment(args).join(" "))),
                 "whoami" => success(format!("{}\n", self.user)),
                 "id" => success("uid=1000(admin) gid=1000(admin) groups=1000(admin),27(sudo)\n"),
+                "sudo" => self.sudo(args),
                 "uname" => self.uname(args),
                 "hostname" => success(format!("{}\n", self.hostname)),
                 "date" => success(format!("{}\n", now.format("%a %b %e %T UTC %Y"))),
@@ -151,6 +163,31 @@ impl Shell {
                 _ => failure(format!("bash: {command}: command not found\n")),
             }
         };
+        if let Some((append, raw_path)) = redirect {
+            let path = match self.path(&raw_path) {
+                Ok(path) => path,
+                Err(error) => return fs_failure("bash", &raw_path, error),
+            };
+            let mut contents = if append {
+                match self.fs.read(&path) {
+                    Ok(previous) => previous.to_vec(),
+                    Err(FsError::NotFound) => Vec::new(),
+                    Err(error) => return fs_failure("bash", &raw_path, error),
+                }
+            } else {
+                Vec::new()
+            };
+            contents.extend_from_slice(result.output.as_bytes());
+            if let Err(error) = self.fs.write(&path, contents, now) {
+                return fs_failure("bash", &raw_path, error);
+            }
+            result.output.clear();
+            result.fs_actions.push(FsAction {
+                kind: FsActionKind::Modified,
+                operation: if append { "append" } else { "redirect" },
+                path,
+            });
+        }
         for action in &result.fs_actions {
             self.deception.record_object(&action.path);
         }
@@ -227,7 +264,10 @@ impl Shell {
     fn ls(&self, args: &[String]) -> ShellOutput {
         let long = args
             .iter()
-            .any(|arg| arg == "-l" || arg == "-la" || arg == "-al");
+            .any(|arg| arg.starts_with('-') && arg.contains('l'));
+        let all = args
+            .iter()
+            .any(|arg| arg.starts_with('-') && arg.contains('a'));
         let raw = args
             .iter()
             .find(|arg| !arg.starts_with('-'))
@@ -243,16 +283,40 @@ impl Shell {
         let output = if node.is_dir() {
             match self.fs.list(&path) {
                 Ok(entries) if long => {
-                    entries
+                    let entries = entries
                         .into_iter()
-                        .map(|(name, node)| long_entry(&name, node))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                        + "\n"
+                        .filter(|(name, _)| all || !name.starts_with('.'))
+                        .collect::<Vec<_>>();
+                    let blocks = entries
+                        .iter()
+                        .map(|(_, node)| node.len().div_ceil(1024))
+                        .sum::<usize>()
+                        + if all { 8 } else { 0 };
+                    let mut lines = vec![format!("total {}", blocks)];
+                    if all {
+                        lines.push(long_entry(".", node));
+                        let parent = if path == "/" {
+                            "/"
+                        } else {
+                            path.rsplit_once('/').map_or("/", |(parent, _)| {
+                                if parent.is_empty() { "/" } else { parent }
+                            })
+                        };
+                        if let Ok(parent_node) = self.fs.node(parent) {
+                            lines.push(long_entry("..", parent_node));
+                        }
+                    }
+                    lines.extend(
+                        entries
+                            .into_iter()
+                            .map(|(name, node)| long_entry(&name, node)),
+                    );
+                    lines.join("\n") + "\n"
                 }
                 Ok(entries) => {
                     entries
                         .into_iter()
+                        .filter(|(name, _)| all || !name.starts_with('.'))
                         .map(|(name, _)| name)
                         .collect::<Vec<_>>()
                         .join("  ")
@@ -300,11 +364,29 @@ impl Shell {
         }
     }
 
+    fn sudo(&self, args: &[String]) -> ShellOutput {
+        if args == ["-l"] {
+            success(
+                "Matching Defaults entries for admin on this host:\n    env_reset, mail_badpass\n\nUser admin may run the following commands on this host:\n    (ALL : ALL) ALL\n",
+            )
+        } else {
+            failure("sudo: a password is required\n")
+        }
+    }
+
     fn uptime(&self, now: DateTime<Utc>) -> ShellOutput {
-        let minutes = (now - self.started_at).num_minutes().max(0);
+        let duration = (now - self.started_at).to_std().unwrap_or_default();
+        let days = duration.as_secs() / 86_400;
+        let hours = duration.as_secs() / 3_600 % 24;
+        let minutes = duration.as_secs() / 60 % 60;
+        let uptime = if days > 0 {
+            format!("{days} days, {hours}:{minutes:02}")
+        } else {
+            format!("{hours}:{minutes:02}")
+        };
         success(format!(
-            " 12:41:08 up {} min,  1 user,  load average: 0.08, 0.04, 0.01\n",
-            minutes
+            " {} up {uptime},  1 user,  load average: 0.08, 0.04, 0.01\n",
+            now.format("%H:%M:%S")
         ))
     }
 

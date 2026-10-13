@@ -34,6 +34,10 @@ if [[ $managed_install == false ]]; then
         exit 1
     fi
 fi
+# Validate that the archived Middle binary can start against the libc in its
+# own runtime image before replacing services or installing host binaries.
+docker load --input "$artifact_dir/middle.tar" >/dev/null
+bash "$repo/deploy/vps/check-middle-image.sh" honeyforge-pritvoryashka:local
 if ! docker compose version >/dev/null 2>&1 || ! docker buildx version >/dev/null 2>&1; then
     install -d -m 0755 /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/mellcore-docker.asc
@@ -77,7 +81,6 @@ install -m 0600 "$artifact_dir/low.tar" /opt/mellcore/artifacts/low.tar
 install -m 0600 "$artifact_dir/middle.tar" /opt/mellcore/artifacts/middle.tar
 install -m 0644 "$artifact_dir/hf-high-ubuntu-ssh.tar.gz" /opt/mellcore/artifacts/hf-high-ubuntu-ssh.tar.gz
 docker load --input /opt/mellcore/artifacts/low.tar
-docker load --input /opt/mellcore/artifacts/middle.tar
 sha256sum /opt/mellcore/artifacts/bin/* /opt/mellcore/artifacts/*.tar* > /opt/mellcore/artifacts/SHA256SUMS
 chmod 0600 /opt/mellcore/artifacts/SHA256SUMS
 for binary in hf-center hf-agent hf-dispatcher honeyforge-backend; do

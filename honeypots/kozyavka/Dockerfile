@@ -4,6 +4,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release --locked
 
+FROM scratch AS binary-artifact
+COPY --from=builder /app/target/release/honeyforge-low /honeyforge-low
+
 FROM debian:bookworm-slim
 COPY --from=builder /app/target/release/honeyforge-low /usr/local/bin/honeyforge-low
 COPY config/docker.json /etc/honeyforge/config.json

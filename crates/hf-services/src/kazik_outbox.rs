@@ -4,9 +4,12 @@
 //! matching `message_id`; a failed transport leaves the original bytes available
 //! for retry. Inbound commands deliberately do not use this database.
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::{SystemTime, UNIX_EPOCH}};
 
-use kazik_protocol::{DurableOutbox, KazikEnvelope};
+use kazik_protocol::{
+    DurableOutbox, KazikBody, KazikEnvelope, MAX_TELEMETRY_BATCH_EVENTS,
+    MAX_TELEMETRY_BATCH_WAIT, MAX_TELEMETRY_PACKET_BYTES,
+};
 use rusqlite::{Connection, params};
 use thiserror::Error;
 use uuid::Uuid;
@@ -61,7 +64,9 @@ impl SqliteKazikOutbox {
                 message_id TEXT PRIMARY KEY NOT NULL,
                 envelope_json BLOB NOT NULL,
                 created_at_unix_ms INTEGER NOT NULL,
-                sequence_no INTEGER
+                sequence_no INTEGER,
+                batchable INTEGER NOT NULL DEFAULT 0,
+                batched_by TEXT
             );
             CREATE TABLE IF NOT EXISTS kazik_outbox_state (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -81,6 +86,21 @@ impl SqliteKazikOutbox {
         if !has_priority {
             connection.execute("ALTER TABLE kazik_outbox ADD COLUMN priority INTEGER NOT NULL DEFAULT 0", [])?;
         }
+        let columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(kazik_outbox)")?;
+            statement.query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if !columns.iter().any(|name| name == "batchable") {
+            connection.execute("ALTER TABLE kazik_outbox ADD COLUMN batchable INTEGER NOT NULL DEFAULT 0", [])?;
+        }
+        if !columns.iter().any(|name| name == "batched_by") {
+            connection.execute("ALTER TABLE kazik_outbox ADD COLUMN batched_by TEXT", [])?;
+        }
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS kazik_outbox_batchable_idx
+             ON kazik_outbox(batchable, batched_by, created_at_unix_ms)", [],
+        )?;
         Ok(Self { connection })
     }
 
@@ -90,12 +110,143 @@ impl SqliteKazikOutbox {
         Ok(())
     }
 
+    /// Only the latest heartbeat matters for presence. Replace an unacknowledged
+    /// one atomically so a long disconnection cannot fill the delivery window.
+    pub fn enqueue_heartbeat(&mut self, envelope: KazikEnvelope) -> Result<(), SqliteOutboxError> {
+        let bytes = Self::encode(&envelope)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM kazik_outbox WHERE priority=2", [])?;
+        transaction.execute(
+            "INSERT INTO kazik_outbox (message_id, envelope_json, created_at_unix_ms, priority)
+             VALUES (?1, ?2, ?3, 2)",
+            params![envelope.message_id.to_string(), bytes, envelope.sent_at_unix_ms],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn contains(&self, message_id: Uuid) -> Result<bool, SqliteOutboxError> {
         Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM kazik_outbox WHERE message_id=?1)",
             [message_id.to_string()],
             |row| row.get::<_, bool>(0),
         )?)
+    }
+
+    /// Queues ordinary telemetry for a durable aggregate. Its source row remains in SQLite
+    /// until the aggregate envelope receives a semantic ACK.
+    pub fn enqueue_batchable_telemetry(
+        &mut self,
+        envelope: KazikEnvelope,
+    ) -> Result<(), SqliteOutboxError> {
+        self.enqueue_with_batching(envelope, true)
+    }
+
+    fn enqueue_with_batching(
+        &mut self,
+        envelope: KazikEnvelope,
+        batchable: bool,
+    ) -> Result<(), SqliteOutboxError> {
+        let bytes = Self::encode(&envelope)?;
+        let inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO kazik_outbox
+             (message_id, envelope_json, created_at_unix_ms, batchable)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![envelope.message_id.to_string(), &bytes, envelope.sent_at_unix_ms, batchable],
+        )?;
+        if inserted == 1 { return Ok(()); }
+        let existing: Vec<u8> = self.connection.query_row(
+            "SELECT envelope_json FROM kazik_outbox WHERE message_id=?1",
+            [envelope.message_id.to_string()], |row| row.get(0),
+        )?;
+        if existing == bytes { Ok(()) }
+        else { Err(SqliteOutboxError::ConflictingMessage(envelope.message_id)) }
+    }
+
+    /// Joins queued ordinary telemetry into a stable outbox envelope once it reaches the
+    /// event limit or its oldest member has waited long enough. Both the batch and its source
+    /// mapping are committed together, so a restart retries identical bytes and ACK removes
+    /// every source row atomically.
+    fn prepare_telemetry_batch(&mut self) -> Result<(), SqliteOutboxError> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)
+            .map_err(|error| SqliteOutboxError::Serialization(error.to_string()))?
+            .as_millis() as i64;
+        let transaction = self.connection.transaction()?;
+        let rows = {
+            let mut statement = transaction.prepare(
+                "SELECT message_id,envelope_json,created_at_unix_ms FROM kazik_outbox
+                 WHERE batchable=1 AND batched_by IS NULL AND priority=0
+                 ORDER BY created_at_unix_ms,rowid LIMIT 128",
+            )?;
+            statement.query_map([], |row| Ok((
+                row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?,
+            )))?.collect::<Result<Vec<_>, _>>()?
+        };
+        if rows.is_empty() { transaction.commit()?; return Ok(()); }
+        let timed_out = now.saturating_sub(rows[0].2) >= MAX_TELEMETRY_BATCH_WAIT.as_millis() as i64;
+        let mut selected_ids = Vec::new();
+        let mut selected_events = Vec::new();
+        let mut identity: Option<(uuid::Uuid, String)> = None;
+        let mut due_to_size = false;
+        for (message_id, bytes, _) in &rows {
+            let source = Self::decode(bytes)?;
+            let KazikBody::Telemetry { events } = source.body else { continue; };
+            if events.is_empty() { continue; }
+            if identity.as_ref().is_some_and(|(agent, credential)|
+                *agent != source.agent_id || credential != &source.transport_credential)
+            {
+                break;
+            }
+            let mut candidate_events = selected_events.clone();
+            candidate_events.extend(events.iter().cloned());
+            if candidate_events.len() > MAX_TELEMETRY_BATCH_EVENTS {
+                due_to_size = true;
+                break;
+            }
+            let candidate = KazikEnvelope::new(
+                source.agent_id, source.transport_credential.clone(), now,
+                KazikBody::Telemetry { events: candidate_events.clone() },
+            );
+            let packet_size = candidate.encode_hfsp(0, 0)
+                .map_err(|error| SqliteOutboxError::Serialization(error.to_string()))?.len();
+            if packet_size > MAX_TELEMETRY_PACKET_BYTES {
+                due_to_size = true;
+                break;
+            }
+            identity.get_or_insert_with(|| (source.agent_id, source.transport_credential.clone()));
+            selected_ids.push(message_id.clone());
+            selected_events = candidate_events;
+            if selected_events.len() == MAX_TELEMETRY_BATCH_EVENTS { break; }
+        }
+        let due = timed_out || due_to_size || selected_events.len() >= MAX_TELEMETRY_BATCH_EVENTS;
+        if !due || selected_ids.is_empty() {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let (agent_id, credential) = identity.expect("selected telemetry has an identity");
+        let batch = KazikEnvelope::new(
+            agent_id, credential, now, KazikBody::Telemetry { events: selected_events },
+        );
+        let packet = batch.encode_hfsp(0, 0)
+            .map_err(|error| SqliteOutboxError::Serialization(error.to_string()))?;
+        if packet.len() > MAX_TELEMETRY_PACKET_BYTES {
+            return Err(SqliteOutboxError::Serialization("telemetry batch exceeds packet limit".into()));
+        }
+        let batch_id = batch.message_id;
+        let encoded = Self::encode(&batch)?;
+        transaction.execute(
+            "INSERT INTO kazik_outbox(message_id,envelope_json,created_at_unix_ms,batchable)
+             VALUES(?1,?2,?3,0)",
+            params![batch_id.to_string(), encoded, now],
+        )?;
+        for source_id in selected_ids {
+            transaction.execute(
+                "UPDATE kazik_outbox SET batched_by=?1 WHERE message_id=?2 AND batched_by IS NULL",
+                params![batch_id.to_string(), source_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     fn encode(envelope: &KazikEnvelope) -> Result<Vec<u8>, SqliteOutboxError> {
@@ -117,6 +268,7 @@ impl SqliteKazikOutbox {
         let rows = {
             let mut statement = transaction.prepare(
                 "SELECT message_id, envelope_json, sequence_no FROM kazik_outbox
+                 WHERE batched_by IS NULL AND (batchable=0 OR priority>0)
                  ORDER BY priority DESC, created_at_unix_ms, rowid LIMIT ?1",
             )?;
             statement
@@ -170,34 +322,13 @@ impl DurableOutbox for SqliteKazikOutbox {
     type Error = SqliteOutboxError;
 
     fn enqueue(&mut self, envelope: KazikEnvelope) -> Result<(), Self::Error> {
-        let bytes = Self::encode(&envelope)?;
-        let inserted = self.connection.execute(
-            "INSERT OR IGNORE INTO kazik_outbox (message_id, envelope_json, created_at_unix_ms)
-             VALUES (?1, ?2, ?3)",
-            params![
-                envelope.message_id.to_string(),
-                &bytes,
-                envelope.sent_at_unix_ms
-            ],
-        )?;
-        if inserted == 1 {
-            return Ok(());
-        }
-        let existing: Vec<u8> = self.connection.query_row(
-            "SELECT envelope_json FROM kazik_outbox WHERE message_id = ?1",
-            [envelope.message_id.to_string()],
-            |row| row.get(0),
-        )?;
-        if existing == bytes {
-            Ok(())
-        } else {
-            Err(SqliteOutboxError::ConflictingMessage(envelope.message_id))
-        }
+        self.enqueue_with_batching(envelope, false)
     }
 
     fn pending(&self, maximum: usize) -> Result<Vec<KazikEnvelope>, Self::Error> {
         let mut statement = self.connection.prepare(
             "SELECT envelope_json FROM kazik_outbox
+             WHERE batched_by IS NULL
              ORDER BY priority DESC, created_at_unix_ms, rowid LIMIT ?1",
         )?;
         let rows = statement.query_map([i64::try_from(maximum).unwrap_or(i64::MAX)], |row| {
@@ -207,10 +338,10 @@ impl DurableOutbox for SqliteKazikOutbox {
     }
 
     fn acknowledge(&mut self, message_id: Uuid) -> Result<(), Self::Error> {
-        self.connection.execute(
-            "DELETE FROM kazik_outbox WHERE message_id = ?1",
-            [message_id.to_string()],
-        )?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM kazik_outbox WHERE batched_by=?1", [message_id.to_string()])?;
+        transaction.execute("DELETE FROM kazik_outbox WHERE message_id=?1", [message_id.to_string()])?;
+        transaction.commit()?;
         Ok(())
     }
 }
@@ -222,6 +353,7 @@ pub async fn send_pending_once(
     sender: &FailoverSender,
     maximum: usize,
 ) -> Result<usize, DeliveryPumpError> {
+    outbox.prepare_telemetry_batch()?;
     let queued = outbox.ready_to_send(maximum)?;
     for item in &queued {
         let packet = item
@@ -250,6 +382,7 @@ mod tests {
                 status: AgentStatus {
                     hostname: "test-vps".into(),
                     active_trap_count: 2,
+                    capabilities: vec![],
                 },
             },
         )

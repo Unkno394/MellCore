@@ -1,5 +1,52 @@
 # MellCore на текущем VPS
 
+## Полная пересборка артефактов
+
+На Center из репозитория выполните:
+
+```sh
+bash /root/MellCore/deploy/vps/build-all-artifacts.sh
+```
+
+Чтобы собрать только исполняемые файлы Low и Middle из builder stages их multi-stage
+Dockerfile, без frontend, host-бинарников и runtime-образов:
+
+```sh
+bash /root/MellCore/deploy/vps/build-honeypot-binaries.sh
+```
+
+Middle компилируется внутри Rust Bookworm stage, а скрипт экспортирует только
+`pritvoryashka` и `honeyforge-low` в `/root/mellcore-honeypot-binaries-*`.
+
+Чтобы применить эти готовые бинарники на агенте без повторной компиляции Rust,
+передайте туда `hf-agent`, `honeyforge-low`, `pritvoryashka`,
+`honeypots/pritvoryashka/docker-entrypoint.sh` и `update-honeypot-binaries-on-agent.sh`.
+На агенте выполните от root:
+
+```sh
+bash /tmp/hf-honeypot-update/update-honeypot-binaries-on-agent.sh /tmp/hf-honeypot-update
+```
+
+Скрипт проверит запуск нового `hf-agent`, упакует honeypot-бинарники в runtime-образы с тегами `honeyforge-low:local` и
+`honeyforge-pritvoryashka:local`, проверит Middle на GLIBC Bookworm и пользователя Low
+`65532:65532`, сохранит прежние образы под rollback-тегами и пересоздаст найденные
+Low/Middle контейнеры через Compose. Затем заменит `hf-agent` атомарно и перезапустит его.
+После пересоздания он выведет `docker ps`, свежие логи ловушек и состояние с журналом агента.
+
+Если нужно пересобрать все компоненты, кроме Middle, передайте текущий архив Middle:
+
+```sh
+bash /root/MellCore/deploy/vps/build-all-artifacts.sh --skip-middle \
+    /root/mellcore-upload-20261011-210018/middle.tar
+```
+
+Скрипт создаст новый `/root/mellcore-upload-ГГГГММДД-ЧЧММСС` с бинарниками
+Center, Agent, Dispatcher и Backend, Low/Middle Docker-образами, High recipe,
+frontend архивом и `SHA256SUMS`. Сервисы не перезапускаются и домен автоматически
+не обновляется. С `--skip-middle` старый `middle.tar` копируется в новый каталог без
+пересборки. Для этой сборки тесты не запускаются; Rust release binaries собираются
+в Docker на Debian Bookworm, а frontend — через `npm ci && npm run build`.
+
 Запуск из SSH root:
 
 ```sh
@@ -8,15 +55,36 @@ bash /root/MellCore/deploy/vps/install.sh /root/mellcore-upload-20261011-210018
 
 Скрипт рассчитан на Ubuntu 24.04, существующий Docker и nginx, работающую Hysteria 2
 и её сертификат для `yourpasswordforemail.ru` в `/var/lib/hysteria/acme`.
-Если загруженные host-бинарники устарели, обновите только их из текущих исходников:
+Если загруженные host-бинарники устарели, пересоберите их из текущих исходников:
 
 ```sh
 bash /root/MellCore/deploy/vps/rebuild-host-binaries.sh /root/mellcore-upload-20261011-210018
 ```
 
-Скрипт использует Docker с Rust 1.95 и не трогает сервисы VPS. Старые бинарники
-сохраняются в `/root/mellcore-artifact-backups/`. Образы `low.tar` и `middle.tar`
-остаются из загруженного комплекта.
+Для ошибки `GLIBC_2.38` пересоберите только Middle image:
+
+```sh
+bash /root/MellCore/deploy/vps/rebuild-middle-image.sh
+```
+
+Скрипт использует Docker с Rust 1.95 и собирает только Middle, не хостовые бинарники,
+frontend или Low. Он создаёт новый каталог `/root/mellcore-middle-*`, проверяет запуск
+бинарника в runtime-образе, сохраняет старый архив и обновляет
+`/opt/mellcore/artifacts/middle.tar`, если MellCore уже установлен. Сервисы не перезапускаются.
+
+Образ Middle хранится локально на каждом агенте. Передайте архив из каталога, напечатанного
+скриптом, и оба helper-скрипта на сервер агента, затем выполните там от root:
+
+```sh
+scp /root/mellcore-middle-<timestamp>/middle.tar \
+    /root/MellCore/deploy/vps/check-middle-image.sh \
+    /root/MellCore/deploy/vps/update-middle-on-agent.sh root@AGENT_HOST:/tmp/
+ssh root@AGENT_HOST 'bash /tmp/update-middle-on-agent.sh /tmp/middle.tar'
+```
+
+Скрипт проверяет запуск бинарника с libc внутри образа, сохраняет прежний Docker image
+под rollback-тегом и пересоздаёт только Middle контейнеры. Runtime volume с SSH host key
+и телеметрией сохраняется.
 
 Чтобы добавить ClickHouse к уже работающему VPS отдельно от полного установщика,
 запустите `bash /root/MellCore/deploy/vps/install-clickhouse.sh`. Скрипт создаёт пароль
@@ -31,6 +99,11 @@ PostgreSQL и остальные сервисы не перезапускают�
 через `docker load`, бинарники устанавливаются из каталога, оригиналы сохраняются
 в `/root/mellcore-backups/binaries`, а контрольные суммы записываются в
 `/opt/mellcore/artifacts/SHA256SUMS`. Cargo и пересборки не используются.
+До изменения сервисов установщик запускает Middle бинарник в загруженном образе
+с отсутствующим конфигом и проверяет ожидаемую ошибку чтения. Несовместимый
+бинарник, например требующий `GLIBC_2.38` при более старом runtime, остановит
+установку до замены сервисов.
+
 После установки скрипт проверяет миграции, вход Admin, ресурсы, HTTPS,
 доставку команд и события в БД.
 

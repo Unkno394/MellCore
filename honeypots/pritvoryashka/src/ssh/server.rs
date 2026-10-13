@@ -1,7 +1,8 @@
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
+use hf_core::SHARED_SSH_IDENTIFICATION;
 use russh::{
-    Channel, ChannelId, Pty,
+    Channel, ChannelId, MethodKind, MethodSet, Pty,
     keys::load_secret_key,
     server::{self, Auth, ChannelOpenHandle, Msg, Server as _, Session},
 };
@@ -20,6 +21,17 @@ use crate::{
 
 use super::auth::constant_time_eq;
 
+fn advertised_auth_methods() -> MethodSet {
+    [MethodKind::Password].as_slice().into()
+}
+
+fn reject_auth() -> Auth {
+    Auth::Reject {
+        proceed_with_methods: Some(advertised_auth_methods()),
+        partial_success: false,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     #[error("cannot load SSH host key: {0}")]
@@ -33,7 +45,8 @@ pub enum ServerError {
 pub async fn run(config: Config, emitter: EventEmitter) -> Result<(), ServerError> {
     let key = load_secret_key(&config.host_key, None)?;
     let ssh_config = Arc::new(server::Config {
-        server_id: russh::SshId::Standard("SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.10".into()),
+        server_id: russh::SshId::Standard(SHARED_SSH_IDENTIFICATION.into()),
+        methods: advertised_auth_methods(),
         keys: vec![key],
         max_auth_attempts: config.auth.max_attempts,
         inactivity_timeout: Some(config.idle_timeout()),
@@ -217,7 +230,7 @@ impl server::Handler for Handler {
 
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
         self.record_auth(user, None, false);
-        Ok(Auth::reject())
+        Ok(reject_auth())
     }
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
@@ -243,7 +256,7 @@ impl server::Handler for Handler {
             self.authenticated_user = Some(user.to_owned());
             Ok(Auth::Accept)
         } else {
-            Ok(Auth::reject())
+            Ok(reject_auth())
         }
     }
 
@@ -482,4 +495,34 @@ async fn shutdown() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! { () = ctrl_c => {}, () = terminate => {} }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[test]
+    fn middle_advertises_only_password_authentication() {
+        let methods = advertised_auth_methods();
+        assert!(methods.contains(&MethodKind::Password));
+        assert!(!methods.contains(&MethodKind::PublicKey));
+        assert!(!methods.contains(&MethodKind::HostBased));
+        assert!(!methods.contains(&MethodKind::KeyboardInteractive));
+    }
+
+    #[test]
+    fn rejected_password_keeps_password_available_for_retry() {
+        match reject_auth() {
+            Auth::Reject {
+                proceed_with_methods: Some(methods),
+                partial_success: false,
+            } => {
+                assert!(methods.contains(&MethodKind::Password));
+                assert!(!methods.contains(&MethodKind::PublicKey));
+                assert!(!methods.contains(&MethodKind::HostBased));
+                assert!(!methods.contains(&MethodKind::KeyboardInteractive));
+            }
+            _ => panic!("rejected auth must preserve the advertised methods"),
+        }
+    }
 }

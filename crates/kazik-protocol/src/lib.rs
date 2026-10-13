@@ -77,6 +77,8 @@ pub struct Acknowledgement {
 pub struct AgentStatus {
     pub hostname: String,
     pub active_trap_count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 /// Normalized event emitted by any trap source. `payload` remains source-specific;
@@ -226,6 +228,7 @@ mod tests {
                 status: AgentStatus {
                     hostname: "vps".into(),
                     active_trap_count: 1,
+                    capabilities: vec![],
                 },
             },
         );

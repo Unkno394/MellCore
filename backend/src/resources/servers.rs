@@ -88,6 +88,15 @@ pub async fn update(
     input.server.validate()?;
     let mut tx = owned_tx(pool, principal).await?;
     let previous = lock(&mut tx, principal.user.id, id).await?;
+    let deletion_pending: bool = sqlx::query_scalar(
+        "SELECT deletion_pending FROM servers WHERE server_id=$1",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if deletion_pending {
+        return Err(AppError::conflict("This server is being deleted."));
+    }
     check_version(previous.version, input.expected_version)?;
     if input.server.dispatcher_port.is_none() {
         let backends:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM server_ports WHERE server_id=$1 AND route_mode='dispatcher_backend')").bind(id).fetch_one(&mut *tx).await?;

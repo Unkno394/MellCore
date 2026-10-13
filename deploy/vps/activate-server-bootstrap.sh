@@ -7,10 +7,12 @@ repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 center_bin=${1:-/tmp/hf-center-bootstrap}
 backend_bin=${2:-/tmp/honeyforge-backend-bootstrap}
 frontend_archive=${3:-/tmp/mellcore-frontend-dist.tar.gz}
-for path in "$center_bin" "$backend_bin" "$frontend_archive"; do
+agent_bin=${4:-$repo/target/release/hf-agent}
+dispatcher_bin=${5:-$repo/target/release/hf-dispatcher}
+for path in "$center_bin" "$backend_bin" "$frontend_archive" "$agent_bin" "$dispatcher_bin"; do
     [[ -s $path ]] || { echo "Не найден артефакт: $path" >&2; exit 1; }
 done
-for path in "$center_bin" "$backend_bin"; do
+for path in "$center_bin" "$backend_bin" "$agent_bin" "$dispatcher_bin"; do
     file "$path" | grep -q 'ELF 64-bit.*x86-64' || { echo "Нужен ELF x86-64: $path" >&2; exit 1; }
     if ldd "$path" | grep -q 'not found'; then
         echo "Отсутствует системная библиотека для $path" >&2
@@ -20,15 +22,31 @@ done
 
 backup="/root/mellcore-backups/server-bootstrap-$(date +%Y%m%d-%H%M%S)"
 install -d -m 0700 "$backup"
-cp -a /usr/local/bin/hf-center /usr/local/bin/honeyforge-backend "$backup/"
+cp -a /usr/local/bin/hf-center /usr/local/bin/honeyforge-backend /usr/local/bin/hf-agent /usr/local/bin/hf-dispatcher "$backup/"
 cp -a /etc/honeyforge/backend.env /etc/nginx/conf.d/mellcore-https.conf "$backup/"
 rollback() {
-    cp -a "$backup/hf-center" "$backup/honeyforge-backend" /usr/local/bin/
-    cp -a "$backup/backend.env" /etc/honeyforge/backend.env
-    cp -a "$backup/mellcore-https.conf" /etc/nginx/conf.d/mellcore-https.conf
-    systemctl restart hf-center honeyforge-backend || true
-    nginx -t && systemctl reload nginx || true
+    local failure_status=$?
+    trap - ERR
+    set +e
+    systemctl stop hf-center honeyforge-backend
+    restore_file() {
+        local source=$1 destination=$2 temporary
+        temporary="${destination}.rollback.$$"
+        cp -a "$source" "$temporary" && mv -f "$temporary" "$destination"
+    }
+    restore_file "$backup/hf-center" /usr/local/bin/hf-center || echo 'Не удалось восстановить hf-center' >&2
+    restore_file "$backup/honeyforge-backend" /usr/local/bin/honeyforge-backend || echo 'Не удалось восстановить honeyforge-backend' >&2
+    restore_file "$backup/hf-agent" /usr/local/bin/hf-agent || echo 'Не удалось восстановить hf-agent' >&2
+    restore_file "$backup/hf-dispatcher" /usr/local/bin/hf-dispatcher || echo 'Не удалось восстановить hf-dispatcher' >&2
+    restore_file "$backup/backend.env" /etc/honeyforge/backend.env || echo 'Не удалось восстановить backend.env' >&2
+    restore_file "$backup/mellcore-https.conf" /etc/nginx/conf.d/mellcore-https.conf || echo 'Не удалось восстановить конфигурацию Nginx' >&2
+    nginx -t && systemctl reload nginx
+    systemctl start hf-center honeyforge-backend
+    for service in hf-agent hf-dispatcher; do
+        if systemctl is-active --quiet "$service"; then systemctl restart "$service"; fi
+    done
     echo "Активация не завершилась; файлы сервисов восстановлены из $backup" >&2
+    return "$failure_status"
 }
 trap rollback ERR
 
@@ -63,14 +81,23 @@ PY
 nginx -t
 systemctl reload nginx
 
-install -m 0755 "$backend_bin" /usr/local/bin/honeyforge-backend
+install -m 0755 "$backend_bin" "/usr/local/bin/honeyforge-backend.new.$$"
+mv -f "/usr/local/bin/honeyforge-backend.new.$$" /usr/local/bin/honeyforge-backend
 set -a
 source /etc/honeyforge/backend.env
 set +a
 /usr/local/bin/honeyforge-backend migrate
-install -m 0755 "$center_bin" /usr/local/bin/hf-center
+install -m 0755 "$agent_bin" "/usr/local/bin/hf-agent.new.$$"
+mv -f "/usr/local/bin/hf-agent.new.$$" /usr/local/bin/hf-agent
+install -m 0755 "$dispatcher_bin" "/usr/local/bin/hf-dispatcher.new.$$"
+mv -f "/usr/local/bin/hf-dispatcher.new.$$" /usr/local/bin/hf-dispatcher
+install -m 0755 "$center_bin" "/usr/local/bin/hf-center.new.$$"
+mv -f "/usr/local/bin/hf-center.new.$$" /usr/local/bin/hf-center
 systemctl restart hf-center honeyforge-backend
 systemctl is-active --quiet hf-center honeyforge-backend
+for service in hf-agent hf-dispatcher; do
+    if systemctl is-active --quiet "$service"; then systemctl restart "$service"; fi
+done
 bash "$repo/deploy/vps/deploy-frontend.sh" "$frontend_archive"
 trap - ERR
 echo "Bootstrap API и React-форма активированы. Backup: $backup"

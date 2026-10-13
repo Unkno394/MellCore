@@ -140,6 +140,16 @@ impl AgentSecurityStore {
         self.state.targets.get(agent_id).map(|target| (target.address.as_str(), target.ssh_port))
     }
 
+    pub(crate) fn remove_agent(&mut self, agent_id: Uuid) -> anyhow::Result<()> {
+        let mut next = clone_state(&self.state)?;
+        next.targets.remove(&agent_id);
+        next.compromised.remove(&agent_id);
+        next.traps.retain(|_, owner| *owner != agent_id);
+        next.isolated_traps.retain(|_, trap| trap.agent_id != agent_id);
+        next.pending_removals.retain(|_, removal| removal.agent_id != agent_id);
+        self.persist(next)
+    }
+
     pub(crate) fn owns_trap(&self, agent_id: Uuid, trap_id: Uuid) -> bool {
         self.state.traps.get(&trap_id) == Some(&agent_id)
     }

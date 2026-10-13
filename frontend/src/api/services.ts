@@ -10,6 +10,9 @@ import type {
   Profile,
   ProfileInput,
   Server,
+  ServerPresence,
+  DeleteServerResult,
+  ServerActionProgress,
   ServerInput,
   TokenResponse,
   Trap,
@@ -83,6 +86,7 @@ export function createApi(client: ApiClient) {
     },
     servers: {
       list: () => collectPages<Server>(client, '/servers'),
+      presence: (serverId: string) => client.request<ServerPresence>(`/servers/${serverId}/presence`),
       bootstrap: (input: BootstrapServerInput) =>
         client.request<BootstrapProgress>('/servers/bootstrap', { method: 'POST', body: input }),
       bootstrapStatus: (serverId: string) =>
@@ -95,7 +99,11 @@ export function createApi(client: ApiClient) {
           body: { expected_version: server.version, server: input },
         }),
       delete: (id: string) =>
-        client.request<void>(`/servers/${id}`, { method: 'DELETE' }),
+        client.request<DeleteServerResult>(`/servers/${id}`, { method: 'DELETE' }),
+      action: (id: string, action: 'reboot') =>
+        client.request<ServerActionProgress>(`/servers/${id}/actions`, { method: 'POST', body: { action } }),
+      actionStatus: (serverId: string, actionId: string) =>
+        client.request<ServerActionProgress>(`/servers/${serverId}/actions/${actionId}`),
       ports: (id: string) =>
         client.request<PortReservation[]>(`/servers/${id}/ports`),
     },

@@ -3,20 +3,16 @@ import FuzzyText from '../FuzzyText'
 
 export type PageName =
   | 'Dashboard'
-  | 'Honeypots'
+  | 'Infrastructure'
   | 'Profiles'
-  | 'ConnectServer'
-  | 'CreateHoneypot'
   | 'LiveFeed'
   | 'Settings'
 
 const navItems = [
   { page: 'Dashboard', label: 'Обзор', icon: '◫' },
-  { page: 'ConnectServer', label: 'Добавить сервер', icon: '+' },
-  { page: 'CreateHoneypot', label: 'Добавить ловушку', icon: '++' },
-  { page: 'Honeypots', label: 'Ловушки', icon: '⌘' },
+  { page: 'Infrastructure', label: 'Инфраструктура', icon: '⌘' },
   { page: 'Profiles', label: 'Профили', icon: '◎' },
-  { page: 'LiveFeed', label: 'Атаки', icon: '⌁' },
+  { page: 'LiveFeed', label: 'События', icon: '⌁' },
   { page: 'Settings', label: 'Настройки', icon: '⚙' },
 ] as const satisfies ReadonlyArray<{ page: PageName; label: string; icon: string }>
 
@@ -66,7 +62,7 @@ export default function Sidebar({
                   : 'text-[#e8dfda]/65 hover:bg-white/5 hover:text-white'
               }`}
             >
-              <span className="w-5 text-center text-base">
+              <span className="inline-flex w-5 shrink-0 justify-center whitespace-nowrap text-base">
                 {item.icon}
               </span>
 

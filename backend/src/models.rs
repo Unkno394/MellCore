@@ -16,6 +16,7 @@ pub enum Role {
 pub enum TrapLevel {
     Low,
     Medium,
+    High,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, ToSchema)]

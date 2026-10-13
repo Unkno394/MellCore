@@ -62,6 +62,8 @@ struct CenterProgress {
     agent_id: Uuid,
     status: String,
     registered: bool,
+    #[serde(default)]
+    connected: bool,
     message: Option<String>,
 }
 
@@ -137,6 +139,12 @@ pub async fn start(
     if input.server.credential_ref.is_some() || input.server.dispatcher_port.is_some() {
         return Err(AppError::invalid("SSH bootstrap does not accept credential references or dispatcher ports"));
     }
+    let already_connected: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM servers s JOIN server_bootstrap_jobs j USING(server_id) WHERE s.user_id=$1 AND s.host=$2 AND (j.status='succeeded' OR (j.status='running' AND j.created_at > now() - interval '15 minutes')))"
+    ).bind(principal.user.id).bind(&input.server.host).fetch_one(state.pool()?).await?;
+    if already_connected {
+        return Err(AppError::conflict("На этом адресе уже есть агент или выполняется его установка. Используйте существующий сервер."));
+    }
     center_token(&state)?;
     let body = serde_json::to_vec(&CenterRequest {
         host: &input.server.host, ssh_port: input.server.ssh_port, ssh_user: &input.server.ssh_user,
@@ -199,16 +207,27 @@ pub async fn status(
         return Ok(Json(BootstrapProgress { server_id, agent_id,
             registered: stored_status == "succeeded", status: stored_status, message: stored_message }));
     }
-    let current: CenterProgress = serde_json::from_slice(
-        &center_request(&state, "GET", format!("/v1/agents/bootstrap/{job_id}"), None).await?
-    ).map_err(|_| AppError::unavailable())?;
-    if current.agent_id != agent_id { return Err(AppError::unavailable()); }
     let timed_out = Utc::now().signed_duration_since(created_at).num_minutes() >= 15;
-    let status = if current.status == "failed" || (timed_out && !current.registered) { "failed" }
-        else if current.status == "succeeded" && current.registered { "succeeded" }
+    let response = center_request(&state, "GET", format!("/v1/agents/bootstrap/{job_id}"), None).await;
+    let current: CenterProgress = match response {
+        Ok(body) => serde_json::from_slice(&body).map_err(|_| AppError::unavailable())?,
+        Err(_) if timed_out => CenterProgress {
+            agent_id, status: "failed".into(), registered: false, connected: false,
+            message: Some("Центр потерял задание установки или недоступен более 15 минут. Проверьте журнал hf-center и службу hf-agent.".into()),
+        },
+        Err(error) => return Err(error),
+    };
+    if current.agent_id != agent_id { return Err(AppError::unavailable()); }
+    let ready = current.status == "succeeded" && current.registered && current.connected;
+    let status = if current.status == "failed" || (timed_out && !ready) { "failed" }
+        else if ready { "succeeded" }
         else { "running" };
-    let message = if timed_out && !current.registered && current.message.is_none() {
-        Some("Агент не зарегистрировался в Центре за 15 минут. Проверьте журнал установки на сервере.".into())
+    let message = if current.status == "failed" && current.message.is_some() {
+        current.message
+    } else if timed_out && !ready {
+        Some("Агент не вышел на связь с Центром за 15 минут. Проверьте службу hf-agent и журнал установки на сервере.".into())
+    } else if current.registered && !current.connected {
+        Some("Агент зарегистрирован. Ожидаю подключения к Центру.".into())
     } else { current.message };
     if status != "running" {
         let mut tx = state.pool()?.begin().await?;

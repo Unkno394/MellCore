@@ -9,11 +9,47 @@ use uuid::Uuid;
 pub const INTERNAL_PORT_START: u16 = 31_000;
 pub const INTERNAL_PORT_END: u16 = 32_000;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct GroupCandidate {
     pub trap_id: Uuid,
     pub weight: u8,
     pub trap_kind: SharedTcpTrapKind,
+    pub service_type: String,
+}
+
+pub fn compatible_ssh_trap_kind(
+    service_type: &str,
+    honeypot_type: &str,
+    level: crate::models::TrapLevel,
+) -> Option<SharedTcpTrapKind> {
+    if service_type != "ssh" {
+        return None;
+    }
+    match (honeypot_type, level) {
+        ("kozyavka", crate::models::TrapLevel::Low) => Some(SharedTcpTrapKind::Kozyavka),
+        ("pritvoryashka", crate::models::TrapLevel::Medium) => {
+            Some(SharedTcpTrapKind::Pritvoryashka)
+        }
+        _ => None,
+    }
+}
+
+/// Shared listeners are currently SSH-only. Keep this check in the planner as well as the API
+/// boundary so a future caller cannot accidentally create a mixed-protocol endpoint.
+pub fn validate_group_compatibility(candidates: &[GroupCandidate]) -> Result<(), &'static str> {
+    let Some(first) = candidates.first() else {
+        return Err("a shared listener needs at least one trap");
+    };
+    if first.service_type != "ssh" {
+        return Err("shared TCP listeners currently support SSH traps only");
+    }
+    if candidates
+        .iter()
+        .any(|candidate| candidate.service_type != first.service_type)
+    {
+        return Err("traps sharing an endpoint must use the same application protocol");
+    }
+    Ok(())
 }
 
 /// Allocates loopback ports deterministically from the HoneyForge internal range and creates the
@@ -29,6 +65,7 @@ pub fn plan_tcp_port_group(
     if listener_port == 0 || candidates.is_empty() {
         return Err("a shared listener needs a port and at least one trap");
     }
+    validate_group_compatibility(candidates)?;
     if candidates
         .iter()
         .map(|candidate| u16::from(candidate.weight))
@@ -95,11 +132,13 @@ mod tests {
                     trap_id: first,
                     weight: 50,
                     trap_kind: SharedTcpTrapKind::Kozyavka,
+                    service_type: "ssh".into(),
                 },
                 GroupCandidate {
                     trap_id: second,
                     weight: 50,
                     trap_kind: SharedTcpTrapKind::Kozyavka,
+                    service_type: "ssh".into(),
                 },
             ],
             &HashSet::from([31_000]),

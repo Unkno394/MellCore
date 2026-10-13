@@ -17,10 +17,10 @@ for name in hf-center hf-agent hf-dispatcher honeyforge-backend; do
         exit 1
     fi
 done
-"$artifacts/hf-center" --help | grep -q HF_CENTER_CREDENTIALS_FILE
-"$artifacts/hf-center" --help | grep -q HF_HYSTERIA_STATS_URL
-strings "$artifacts/hf-agent" | grep -q HF_TELEMETRY_PUBLIC_ENDPOINT
-strings "$artifacts/hf-agent" | grep -q 'final trap telemetry queued before removal'
+"$artifacts/hf-center" --help | grep -F HF_CENTER_CREDENTIALS_FILE >/dev/null
+"$artifacts/hf-center" --help | grep -F HF_HYSTERIA_STATS_URL >/dev/null
+strings "$artifacts/hf-agent" | grep -F HF_TELEMETRY_PUBLIC_ENDPOINT >/dev/null
+strings "$artifacts/hf-agent" | grep -F 'final trap telemetry queued before removal' >/dev/null
 
 python3 - "$artifacts/mellcore-frontend-dist.tar.gz" <<'PY'
 import sys, tarfile
@@ -78,10 +78,17 @@ new = '''    location /v1/ {
         try_files $uri $uri/ /index.html;
     }
 '''
-if new not in text:
+if 'location /v1/' not in text or 'proxy_pass http://127.0.0.1:18081;' not in text:
     if text.count(old) != 1:
-        raise SystemExit('Ожидаемый старый location / не найден ровно один раз; nginx не менялся.')
-    path.write_text(text.replace(old, new, 1))
+        raise SystemExit('Не найден ожидаемый старый location / или маршрут /v1/; nginx не менялся.')
+    text = text.replace(old, new, 1)
+    path.write_text(text)
+elif (
+    'location / {' not in text
+    or 'root /var/www/mellcore/current;' not in text
+    or 'try_files $uri $uri/ /index.html;' not in text
+):
+    raise SystemExit('В Nginx не найден статический React root; nginx не менялся.')
 PY
 
 if ! nginx -t; then
@@ -94,7 +101,15 @@ for name in hf-center hf-agent hf-dispatcher honeyforge-backend; do
     mv -f "/usr/local/bin/.$name.new" "/usr/local/bin/$name"
 done
 systemctl reload nginx
-systemctl restart honeyforge-backend hf-center hf-agent hf-dispatcher
+systemctl restart honeyforge-backend hf-center hf-agent
+if [[ -s /etc/honeyforge/dispatcher.json ]]; then
+    systemctl enable hf-dispatcher
+    systemctl restart hf-dispatcher
+else
+    # No shared trap group is configured on this host. The agent enables the
+    # dispatcher after it writes the first valid routing config.
+    systemctl disable --now hf-dispatcher 2>/dev/null || true
+fi
 
 printf 'Выкладка завершена. Backup: %s\n' "$backup"
 printf 'Frontend: %s\n' "$release"

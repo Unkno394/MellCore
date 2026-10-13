@@ -9,7 +9,7 @@ use axum::{Extension, Json, extract::{Path, State}, http::StatusCode};
 use hf_core::{AgentCommand, PritvoryashkaDeployment, SharedTcpTrapKind, TcpPortGroup};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use sqlx::Row;
+use sqlx::{Row, types::Json as SqlxJson};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -49,6 +49,17 @@ pub struct SharedPortMember { pub trap_id: Uuid, pub weight: u8 }
 #[serde(deny_unknown_fields)]
 pub struct SharePortRequest { pub listener_port: u16, pub members: Vec<SharedPortMember> }
 
+fn shared_trap_kind(profile: &crate::management::Profile) -> Result<SharedTcpTrapKind, AppError> {
+    crate::dispatcher::compatible_ssh_trap_kind(
+        &profile.service_type,
+        &profile.honeypot_type,
+        profile.level,
+    )
+    .ok_or_else(|| {
+        AppError::conflict("Only compatible SSH Low and Middle traps can join the Dispatcher")
+    })
+}
+
 /// Replaces direct publications with loopback backends after the agent confirms that
 /// the dispatcher is listening. The caller supplies the full desired member list.
 #[utoipa::path(post,path="/api/v1/traps/{trap_id}/share-port",tag="traps",security(("bearer"=[])),params(("trap_id"=Uuid,Path)),request_body=SharePortRequest,responses((status=202,body=TrapActionProgress),(status=409,body=crate::errors::ErrorResponse)))]
@@ -77,12 +88,13 @@ pub async fn share_port(
             || (trap.ports[0].route_mode == resources::RouteMode::DispatcherBackend
                 && trap.ports[0].host_port != input.listener_port)
         { return Err(AppError::conflict("Every shared-port trap must be running on this server")); }
-        let trap_kind = match trap.profile_snapshot.honeypot_type.as_str() {
-            "kozyavka" => SharedTcpTrapKind::Kozyavka,
-            "pritvoryashka" => SharedTcpTrapKind::Pritvoryashka,
-            _ => return Err(AppError::conflict("This trap cannot join a shared TCP port")),
-        };
-        candidates.push(crate::dispatcher::GroupCandidate { trap_id: trap.trap_id, weight: member.weight, trap_kind });
+        let trap_kind = shared_trap_kind(&trap.profile_snapshot)?;
+        candidates.push(crate::dispatcher::GroupCandidate {
+            trap_id: trap.trap_id,
+            weight: member.weight,
+            trap_kind,
+            service_type: trap.profile_snapshot.service_type.clone(),
+        });
     }
     candidates.sort_by_key(|candidate| candidate.trap_id);
     let reservations = resources::servers::ports(state.pool()?, &principal, server.server_id).await?;
@@ -124,13 +136,56 @@ pub async fn share_port(
 }
 
 async fn complete_shared_port(state: &AppState, plan: TcpPortGroup, user_id: Uuid) -> Result<(), AppError> {
+    if plan.members.is_empty() || plan.members.len() > 100
+        || plan.members.iter().map(|member| u16::from(member.weight)).sum::<u16>() != 100
+        || plan.members.iter().any(|member| member.weight == 0 || member.backend_port == 0)
+    {
+        return Err(AppError::conflict("Dispatcher plan has invalid members or weights"));
+    }
+    let member_ids: Vec<_> = plan.members.iter().map(|member| member.trap_id).collect();
+    if member_ids.iter().copied().collect::<HashSet<_>>().len() != member_ids.len() {
+        return Err(AppError::conflict("Dispatcher plan contains a duplicate trap"));
+    }
     let mut tx = state.pool()?.begin().await?;
     let server_id: Uuid = sqlx::query_scalar("SELECT server_id FROM traps WHERE trap_id=$1 AND user_id=$2")
-        .bind(plan.members[0].trap_id).bind(user_id).fetch_one(&mut *tx).await?;
+        .bind(member_ids[0]).bind(user_id).fetch_one(&mut *tx).await?;
     let server: resources::Server = resources::servers::lock(&mut tx, user_id, server_id).await?;
-    if server.dispatcher_port.is_some_and(|port| port != i32::from(plan.listener_port)) {
+    if plan.listener_port == 0 || server.ssh_port == i32::from(plan.listener_port)
+        || server.dispatcher_port.is_some_and(|port| port != i32::from(plan.listener_port))
+    {
         return Err(AppError::conflict("Server dispatcher port changed during transition"));
     }
+
+    // Revalidate the persisted profile snapshot after the agent ACK, before recording this
+    // endpoint in the port registry. This protects reconciliation from stale or altered plans.
+    let rows = sqlx::query("SELECT trap_id,server_id,profile_snapshot FROM traps WHERE user_id=$1 AND trap_id=ANY($2)")
+        .bind(user_id).bind(&member_ids).fetch_all(&mut *tx).await?;
+    if rows.len() != plan.members.len() {
+        return Err(AppError::conflict("A Dispatcher trap was removed during transition"));
+    }
+    let profiles: HashMap<Uuid, (Uuid, crate::management::Profile)> = rows.into_iter().map(|row| {
+        let trap_id: Uuid = row.get("trap_id");
+        let member_server_id: Uuid = row.get("server_id");
+        let profile: SqlxJson<crate::management::Profile> = row.get("profile_snapshot");
+        (trap_id, (member_server_id, profile.0))
+    }).collect();
+    let mut candidates = Vec::with_capacity(plan.members.len());
+    for member in &plan.members {
+        let Some((member_server_id, profile)) = profiles.get(&member.trap_id) else {
+            return Err(AppError::conflict("A Dispatcher trap was removed during transition"));
+        };
+        if *member_server_id != server_id || shared_trap_kind(profile)? != member.trap_kind {
+            return Err(AppError::conflict("Dispatcher members no longer match compatible SSH profiles"));
+        }
+        candidates.push(crate::dispatcher::GroupCandidate {
+            trap_id: member.trap_id,
+            weight: member.weight,
+            trap_kind: member.trap_kind,
+            service_type: profile.service_type.clone(),
+        });
+    }
+    crate::dispatcher::validate_group_compatibility(&candidates).map_err(AppError::conflict)?;
+
     for member in &plan.members {
         let changed = sqlx::query("UPDATE server_ports SET host_port=$3,target_port=$4,route_mode='dispatcher_backend',weight=$5 WHERE server_id=$1 AND trap_id=$2 AND transport='tcp'")
             .bind(server_id).bind(member.trap_id).bind(i32::from(plan.listener_port))
@@ -179,7 +234,7 @@ pub async fn reconcile_shared_jobs(state: AppState) {
             let plan: serde_json::Value = job.get("dispatcher_plan");
             let Ok(plan) = serde_json::from_value::<TcpPortGroup>(plan) else { continue; };
             if let Err(error) = complete_shared_port(&state, plan, job.get("user_id")).await {
-                tracing::warn!(%error, %action_id, "shared port registry reconciliation failed");
+                tracing::warn!(?error, %action_id, "shared port registry reconciliation failed");
                 continue;
             }
             let _ = sqlx::query("UPDATE trap_action_jobs SET status='succeeded',updated_at=now() WHERE action_id=$1 AND status='queued'")
@@ -202,25 +257,21 @@ async fn shared_start_plan(state: &AppState, principal: &Principal, trap: &Trap)
     for (id, weight) in member_ids {
         let member = resources::traps::get(state.pool()?, principal, id).await?;
         if id != trap.trap_id && member.actual_state != crate::models::ActualState::Running { continue; }
-        let trap_kind = match member.profile_snapshot.honeypot_type.as_str() {
-            "kozyavka" => SharedTcpTrapKind::Kozyavka,
-            "pritvoryashka" => SharedTcpTrapKind::Pritvoryashka,
-            _ => return Err(AppError::conflict("Unsupported shared-port trap profile")),
-        };
-        active.push((id, weight, trap_kind));
+        let trap_kind = shared_trap_kind(&member.profile_snapshot)?;
+        active.push((id, weight, trap_kind, member.profile_snapshot.service_type.clone()));
     }
     if active.is_empty() { return Err(AppError::conflict("Shared-port trap has no reservation")); }
-    let total: u32 = active.iter().map(|(_, weight, _)| weight).sum();
+    let total: u32 = active.iter().map(|(_, weight, _, _)| *weight).sum();
     let mut remaining = 100_u16;
     let count = active.len();
-    active.sort_by_key(|(trap_id, _, _)| *trap_id);
-    let candidates = active.into_iter().enumerate().map(|(index, (trap_id, weight, trap_kind))| {
+    active.sort_by_key(|(trap_id, _, _, _)| *trap_id);
+    let candidates = active.into_iter().enumerate().map(|(index, (trap_id, weight, trap_kind, service_type))| {
         let share = if index + 1 == count { remaining as u8 } else {
             let share = ((weight * 100 / total).max(1) as u16).min(remaining - (count - index - 1) as u16);
             remaining -= share;
             share as u8
         };
-        crate::dispatcher::GroupCandidate { trap_id, weight: share, trap_kind }
+        crate::dispatcher::GroupCandidate { trap_id, weight: share, trap_kind, service_type }
     }).collect::<Vec<_>>();
     let occupied: HashSet<u16> = reservations.iter().filter_map(|port| {
         if port.route_mode == Some(resources::RouteMode::DispatcherBackend) { port.target_port }
@@ -241,14 +292,43 @@ pub async fn start(
 ) -> Result<(StatusCode, Json<TrapActionProgress>), AppError> {
     resources::owned_tx(state.pool()?, &principal).await?.commit().await?;
     let trap = resources::traps::get(state.pool()?, &principal, trap_id).await?;
-    let agent_id: Uuid = sqlx::query_scalar("SELECT cas.agent_id FROM traps t JOIN center_agent_servers cas ON cas.server_id=t.server_id JOIN servers s ON s.server_id=t.server_id AND s.user_id=t.user_id WHERE t.trap_id=$1 AND t.user_id=$2 AND s.status='online'")
+    let agent_id: Uuid = sqlx::query_scalar("SELECT cas.agent_id FROM traps t JOIN center_agent_servers cas ON cas.server_id=t.server_id JOIN servers s ON s.server_id=t.server_id AND s.user_id=t.user_id WHERE t.trap_id=$1 AND t.user_id=$2")
         .bind(trap_id).bind(principal.user.id).fetch_optional(state.pool()?).await?.ok_or_else(AppError::not_found)?;
+    if !crate::api::servers::agent_presence(&state, agent_id).await?.connected {
+        return Err(AppError::conflict("Агент сейчас не отвечает Центру; команда ловушке не отправлена."));
+    }
+
     let action_id = Uuid::new_v4();
     let mut commands = commands_for(input.action, &trap)?;
     let group_command = if matches!(input.action, TrapAction::Start | TrapAction::Restart) {
         shared_start_plan(&state, &principal, &trap).await?
     } else { None };
     if let Some(command) = &group_command { commands.push(command.clone()); }
+    // Hold the server row lock until the action job is recorded. Server deletion
+    // uses the same lock to set deletion_pending and checks queued actions first.
+    let mut tx = resources::owned_tx(state.pool()?, &principal).await?;
+    resources::servers::lock(&mut tx, principal.user.id, trap.server_id).await?;
+    let deletion_pending: bool = sqlx::query_scalar(
+        "SELECT deletion_pending FROM servers WHERE server_id=$1 AND user_id=$2",
+    )
+    .bind(trap.server_id)
+    .bind(principal.user.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if deletion_pending {
+        return Err(AppError::conflict(
+            "This server is being deleted; trap actions are disabled.",
+        ));
+    }
+    let current_trap = resources::traps::in_tx(&mut tx, principal.user.id, trap_id).await?;
+    if current_trap.version != trap.version {
+        return Err(AppError::conflict("The trap changed while preparing the command. Refresh and retry."));
+    }
+    if matches!(input.action, TrapAction::Start | TrapAction::Restart)
+        && current_trap.actual_state == crate::models::ActualState::Removed
+    {
+        return Err(AppError::conflict("A removed trap registration cannot be started."));
+    }
     let dispatcher_plan = match &group_command {
         Some(AgentCommand::ReconcileTcpPortGroup(plan)) => Some(sqlx::types::Json(plan)),
         _ => None,
@@ -265,8 +345,7 @@ pub async fn start(
     sqlx::query("INSERT INTO trap_action_jobs(action_id,trap_id,agent_id,action,command_ids,dispatcher_plan) VALUES($1,$2,$3,$4,$5,$6)")
         .bind(action_id).bind(trap_id).bind(agent_id).bind(action_name).bind(&message_ids)
         .bind(dispatcher_plan)
-        .execute(state.pool()?).await?;
-    let mut tx = state.pool()?.begin().await?;
+        .execute(&mut *tx).await?;
     management::audit(&mut tx, principal.user.id, "trap.action_queued", trap_id, request_id.0).await?;
     tx.commit().await?;
     Ok((StatusCode::ACCEPTED, Json(TrapActionProgress { action_id, status: "queued".into(), detail: None })))
@@ -344,6 +423,7 @@ fn commands_for(action: TrapAction, trap: &Trap) -> Result<Vec<AgentCommand>, Ap
     let deploy = || -> Result<AgentCommand, AppError> {
         match trap.profile_snapshot.honeypot_type.as_str() {
             "kozyavka" => crate::kozyavka::deployment_command(trap),
+            "high_ubuntu_ssh" => crate::high_ubuntu::deployment_command(trap),
             "pritvoryashka" => {
                 let settings = crate::pritvoryashka::validate_profile(trap.profile_snapshot.level, &trap.profile_snapshot.service_type, &trap.effective_config)?;
                 let port = trap.ports.first().ok_or_else(AppError::internal)?;

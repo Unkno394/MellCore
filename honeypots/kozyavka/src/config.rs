@@ -1,5 +1,9 @@
 use serde::Deserialize;
-use std::{fs, io, net::IpAddr, path::Path};
+use std::{
+    fs, io,
+    net::IpAddr,
+    path::{Path, PathBuf},
+};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -9,6 +13,8 @@ pub struct Config {
     pub port: u16,
     pub banner: String,
     pub trap_id: Uuid,
+    /// Optional persistent SSH host key. When omitted, a key is generated in memory.
+    pub host_key_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -19,6 +25,7 @@ impl Default for Config {
             banner: "SSH-2.0-OpenSSH_9.6".into(),
             // Stable development identity. Assign a unique UUID per deployed trap.
             trap_id: Uuid::from_u128(0x9a8a8262_556b_43c4_a73f_736c32556721),
+            host_key_path: None,
         }
     }
 }

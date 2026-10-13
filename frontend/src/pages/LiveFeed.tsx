@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { eventLabel, dateTime } from '../i18n/labels'
 import type { MellCoreApi } from '../api/services'
 import type { AttackEvent, AttackGraphMatch, Trap } from '../api/types'
@@ -83,6 +83,7 @@ function jaccard(left: Attack, right: Attack) {
 }
 
 export default function LiveFeed({ api, events, traps, initialTrapId = null, loading, error, onRefresh }: Props) {
+  const eventsPerPage = 10
   const [search, setSearch] = useState('')
   const [service, setService] = useState('Все сервисы')
   const [trapFilter, setTrapFilter] = useState(initialTrapId ?? 'all')
@@ -90,6 +91,8 @@ export default function LiveFeed({ api, events, traps, initialTrapId = null, loa
   const [matches, setMatches] = useState<AttackGraphMatch[]>([])
   const [matchesLoading, setMatchesLoading] = useState(false)
   const [matchesUnavailable, setMatchesUnavailable] = useState(false)
+  const [eventPage, setEventPage] = useState(0)
+  const timelineRef = useRef<HTMLDivElement | null>(null)
   const trapNames = useMemo(() => new Map(traps.map((trap) => [trap.trap_id, trap.name])), [traps])
   const trapIds = useMemo(() => traps.map((trap) => trap.trap_id), [traps])
   const services = useMemo(() => [...new Set(events.map((item) => item.event.service_type))].sort(), [events])
@@ -149,6 +152,17 @@ export default function LiveFeed({ api, events, traps, initialTrapId = null, loa
     }
   }, [filtered, selectedKey])
   const selected = filtered.find((attack) => attack.key === selectedKey) ?? null
+  const eventPageCount = selected ? Math.max(1, Math.ceil(selected.events.length / eventsPerPage)) : 1
+  const visibleEvents = selected?.events.slice(eventPage * eventsPerPage, (eventPage + 1) * eventsPerPage) ?? []
+  useEffect(() => {
+    setEventPage(0)
+  }, [selectedKey])
+  useEffect(() => {
+    if (eventPage >= eventPageCount) setEventPage(eventPageCount - 1)
+  }, [eventPage, eventPageCount])
+  useEffect(() => {
+    timelineRef.current?.scrollTo({ top: 0 })
+  }, [eventPage, selectedKey])
   const comparison = selected ? attacks.filter((attack) => attack.key !== selected.key)
     .map((attack) => ({ attack, score: jaccard(selected, attack) }))
     .sort((a, b) => b.score - a.score)[0] ?? null : null
@@ -163,7 +177,7 @@ export default function LiveFeed({ api, events, traps, initialTrapId = null, loa
 
   return <section className="space-y-6 p-5 sm:p-7">
     <header className="flex flex-wrap items-end justify-between gap-4">
-      <div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-orange-300/70">Центр наблюдения</p><h2 className="mt-2 text-3xl font-semibold tracking-tight">Атаки</h2><p className="mt-2 max-w-2xl text-sm text-white/45">Сессии атак, совпадения со сценариями и последовательность действий в ловушках.</p></div>
+      <div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-orange-300/70">Центр наблюдения</p><h2 className="mt-2 text-3xl font-semibold tracking-tight">События</h2><p className="mt-2 max-w-2xl text-sm text-white/45">Сессии, совпадения со сценариями и последовательность действий в ловушках.</p></div>
       <button type="button" disabled={loading} onClick={() => void onRefresh()} className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.03] px-4 py-2.5 text-sm text-white/75 transition hover:border-orange-400/30 hover:text-orange-200 disabled:opacity-50"><Icon name="refresh" className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />{loading ? 'Обновление…' : 'Обновить'}</button>
     </header>
     {error && <p role="alert" className="rounded-lg border border-red-400/20 bg-red-400/5 px-4 py-3 text-sm text-red-300">{error}</p>}
@@ -199,12 +213,21 @@ export default function LiveFeed({ api, events, traps, initialTrapId = null, loa
           <div className="flex flex-wrap items-start justify-between gap-4 border-b border-white/5 p-5 sm:p-6"><div className="min-w-0"><p className="text-xs font-semibold uppercase tracking-[0.16em] text-violet-200/70">Детали атаки</p><h3 className="mt-2 text-xl font-semibold">{selected.match?.technique_name ?? 'Наблюдаемая последовательность'}</h3><p className="mt-1 break-all font-mono text-xs text-white/35">{selected.sessionId ?? 'Событие без ID сессии'}</p></div><span className={`rounded-full border px-3 py-1.5 text-xs ${matchStatus(selected.match).tone}`}>{matchStatus(selected.match).label}</span></div>
           <div className="grid gap-3 border-b border-white/5 p-5 sm:grid-cols-3 sm:p-6"><Info label="Ловушка" value={trapNames.get(selected.trapId) ?? selected.trapId}/><Info label="Источник" value={selected.sourceIp ?? 'Не определён'} mono/><Info label="Время" value={dateTime(selected.first)}/></div>
           {selected.match && <div className="mx-5 mt-5 rounded-lg border border-violet-300/15 bg-violet-300/[0.04] p-4 sm:mx-6"><div className="flex items-center justify-between gap-3"><div><p className="text-sm font-medium">Совпадение со сценарием</p><p className="mt-1 text-xs text-white/40">{selected.match.technique_key} · покрытие узлов сценария</p></div><span className="text-2xl font-semibold text-violet-200">{Math.round(selected.match.similarity * 100)}<span className="text-sm">%</span></span></div><div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/5"><div className="h-full rounded-full bg-gradient-to-r from-violet-400 to-orange-300" style={{ width: `${Math.max(0, Math.min(100, selected.match.similarity * 100))}%` }}/></div></div>}
-          <div className="p-5 sm:p-6"><div className="mb-5 flex items-center justify-between"><div><h4 className="font-semibold">Ход событий</h4><p className="mt-1 text-xs text-white/40">Фактическая последовательность, зафиксированная ловушкой</p></div><span className="text-xs text-white/35">{selected.events.length} узлов</span></div>
-            <div className="relative space-y-0">{selected.events.map((item, index) => {
+          <div className="flex h-[580px] flex-col p-5 sm:h-[680px] sm:p-6"><div className="mb-5 flex shrink-0 items-center justify-between"><div><h4 className="font-semibold">Ход событий</h4><p className="mt-1 text-xs text-white/40">Фактическая последовательность, зафиксированная ловушкой</p></div><span className="text-xs text-white/35">{selected.events.length} узлов</span></div>
+            <div ref={timelineRef} className="relative min-h-0 flex-1 space-y-0 overflow-y-auto pr-2">{visibleEvents.map((item, pageIndex) => {
+              const index = eventPage * eventsPerPage + pageIndex
               const detail = eventDetail(item)
               const isLast = index === selected.events.length - 1
               return <div key={item.event.event_id} className="relative flex gap-4 pb-5 last:pb-0"><div className="flex w-8 shrink-0 flex-col items-center"><span className={`z-10 flex h-8 w-8 items-center justify-center rounded-full border ${isLast ? 'border-orange-300/40 bg-orange-300/10 text-orange-200' : 'border-white/10 bg-[#100a09] text-white/45'}`}><span className="text-[10px] font-semibold">{index + 1}</span></span>{!isLast && <span className="absolute top-8 bottom-0 w-px bg-gradient-to-b from-orange-300/30 to-white/5"/>}</div><article className="min-w-0 flex-1 rounded-lg border border-white/5 bg-black/10 px-4 py-3"><div className="flex flex-wrap items-center justify-between gap-2"><h5 className="text-sm font-medium text-white/85">{eventLabel(item.event.event_type)}</h5><time className="text-[11px] text-white/35">{dateTime(item.event.occurred_at)}</time></div>{detail && <code className="mt-2 block break-all rounded bg-black/25 px-2.5 py-2 font-mono text-xs text-orange-100/75">{detail}</code>}<p className="mt-2 text-[11px] text-white/35">{item.event.protocol.toUpperCase()} · {item.event.service_type}{item.event.destination_port ? ` · порт ${item.event.destination_port}` : ''}</p></article></div>
             })}</div>
+            <div className="mt-4 flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-white/5 pt-4">
+              <span className="text-xs text-white/35">Показано {selected.events.length ? eventPage * eventsPerPage + 1 : 0}–{Math.min((eventPage + 1) * eventsPerPage, selected.events.length)} из {selected.events.length}</span>
+              <div className="flex items-center gap-2">
+                <button type="button" onClick={() => setEventPage((page) => Math.max(0, page - 1))} disabled={eventPage === 0} className="rounded-md border border-white/10 px-3 py-1.5 text-xs text-white/70 transition hover:border-orange-300/30 disabled:cursor-not-allowed disabled:opacity-35">Назад</button>
+                <span className="min-w-20 text-center text-xs text-white/45">Страница {eventPage + 1} из {eventPageCount}</span>
+                <button type="button" onClick={() => setEventPage((page) => Math.min(eventPageCount - 1, page + 1))} disabled={eventPage + 1 >= eventPageCount} className="rounded-md border border-white/10 px-3 py-1.5 text-xs text-white/70 transition hover:border-orange-300/30 disabled:cursor-not-allowed disabled:opacity-35">Вперёд</button>
+              </div>
+            </div>
           </div>
           {comparison && <div className="border-t border-white/5 p-5 sm:p-6"><div className="flex flex-wrap items-end justify-between gap-3"><div><h4 className="font-semibold">Сравнение сценариев</h4><p className="mt-1 text-xs text-white/40">Сходство множеств нормализованных действий — коэффициент Жаккара</p></div><span className="text-xl font-semibold text-sky-200">{Math.round(comparison.score * 100)}%</span></div><div className="mt-4 grid gap-3 md:grid-cols-2"><CompareSequence label="Выбранная сессия" attack={selected} trapName={trapNames.get(selected.trapId) ?? 'Ловушка'}/><CompareSequence label="Ближайшая сессия" attack={comparison.attack} trapName={trapNames.get(comparison.attack.trapId) ?? 'Ловушка'}/></div></div>}
         </>}

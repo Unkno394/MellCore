@@ -49,7 +49,7 @@ pub struct UpdateUser {
     pub password: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, FromRow, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Profile {
     pub id: Uuid,
     pub name: String,
@@ -107,7 +107,7 @@ impl ProfileInput {
             }
         }
         validate_config(&self.config)?;
-        if let Some(resources) = self.resources {
+        if let Some(resources) = self.resources.filter(|_| self.level != TrapLevel::High) {
             resources.validate_for_level(self.level)?;
         }
         if self.honeypot_type == "kozyavka" {
@@ -116,12 +116,24 @@ impl ProfileInput {
         if self.honeypot_type == "pritvoryashka" {
             crate::pritvoryashka::validate_profile(self.level, &self.service_type, &self.config)?;
         }
+        if self.honeypot_type == "high_ubuntu_ssh" {
+            crate::high_ubuntu::validate_profile(self.level, &self.service_type, &self.config)?;
+        } else if self.level == TrapLevel::High {
+            return Err(AppError::invalid(
+                "High interaction currently requires the high_ubuntu_ssh profile",
+            ));
+        }
         Ok(())
     }
 
     pub fn resolved_resources(&self) -> crate::resources::ContainerResourceLimits {
+        if self.level == TrapLevel::High {
+            return crate::resources::ContainerResourceLimits::low_default();
+        }
         self.resources.unwrap_or_else(|| match self.level {
-            TrapLevel::Low => crate::resources::ContainerResourceLimits::low_default(),
+            TrapLevel::Low | TrapLevel::High => {
+                crate::resources::ContainerResourceLimits::low_default()
+            }
             TrapLevel::Medium => crate::resources::ContainerResourceLimits::middle_default(),
         })
     }

@@ -3,6 +3,9 @@
 pub mod math;
 pub mod security;
 
+/// SSH identification shared by Low and Middle backends behind one Dispatcher listener.
+pub const SHARED_SSH_IDENTIFICATION: &str = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.10";
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -99,6 +102,10 @@ pub enum AgentCommand {
     DeployHighUbuntu(HighUbuntuDeployment),
     ResetHighUbuntu { command_id: Uuid, trap_id: Uuid },
     ReconcileTcpPortGroup(TcpPortGroup),
+    /// Requests exactly one host reboot through systemd; no command text is caller supplied.
+    RebootSystem { command_id: Uuid },
+    /// Schedules removal of this agent's services and files after its command ACK.
+    UninstallAgent { command_id: Uuid },
     StopTrap { command_id: Uuid, trap_id: Uuid },
     RemoveTrap { command_id: Uuid, trap_id: Uuid },
 }
@@ -111,6 +118,8 @@ impl AgentCommand {
             Self::DeployHighUbuntu(command) => command.command_id,
             Self::ResetHighUbuntu { command_id, .. } => *command_id,
             Self::ReconcileTcpPortGroup(command) => command.command_id,
+            Self::RebootSystem { command_id } => *command_id,
+            Self::UninstallAgent { command_id } => *command_id,
             Self::StopTrap { command_id, .. } | Self::RemoveTrap { command_id, .. } => *command_id,
         }
     }
@@ -207,7 +216,7 @@ pub struct TcpPortGroupMember {
 
 /// The Dispatcher only sees TCP targets; the agent needs this to recreate the correct recipe on
 /// a loopback backend port during a direct-listener → shared-listener transition.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SharedTcpTrapKind {
     #[default]

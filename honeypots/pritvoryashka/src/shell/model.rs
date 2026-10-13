@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 use crate::filesystem::{FsError, VirtualFileSystem};
 
@@ -175,10 +176,15 @@ pub struct VirtualServer {
     db_users: Vec<DbUser>,
     db_audit: Vec<String>,
     backups: Vec<Backup>,
+    booted_at: DateTime<Utc>,
 }
 
 impl VirtualServer {
     pub fn new(fs: &mut VirtualFileSystem, now: DateTime<Utc>) -> Self {
+        static BOOTED_AT: OnceLock<DateTime<Utc>> = OnceLock::new();
+        let booted_at = BOOTED_AT
+            .get_or_init(|| now - Duration::days(17))
+            .to_owned();
         let processes = [
             Process {
                 pid: 1,
@@ -202,9 +208,9 @@ impl VirtualServer {
                 rss_kib: 42100,
             },
             Process {
-                pid: 763,
+                pid: 1224,
                 user: "redis",
-                command: "/usr/bin/redis-server 127.0.0.1:6379",
+                command: "redis-server *:6379",
                 state: ProcessState::Sleeping,
                 rss_kib: 13820,
             },
@@ -263,16 +269,6 @@ impl VirtualServer {
                 },
             ),
             (
-                "redis",
-                Service {
-                    description: "Advanced key-value store",
-                    pid: 763,
-                    port: Some(6379),
-                    address: "127.0.0.1",
-                    active: true,
-                },
-            ),
-            (
                 "ssh",
                 Service {
                     description: "OpenBSD Secure Shell server",
@@ -307,6 +303,18 @@ impl VirtualServer {
                     port: None,
                     running: true,
                     logs: "2026-10-12T07:41:15Z INFO worker: connected to redis\n2026-10-12T07:42:01Z INFO worker: invoice queue idle\n",
+                },
+            ),
+            (
+                "redis",
+                Container {
+                    id: "a82f4c0d19e7",
+                    name: "redis",
+                    image: "redis:7.2-alpine",
+                    pid: Some(1224),
+                    port: None,
+                    running: true,
+                    logs: "1:C 12 Oct 2026 07:40:58.011 # Redis is starting\n1:M 12 Oct 2026 07:40:58.012 * Ready to accept connections\n",
                 },
             ),
             (
@@ -412,9 +420,14 @@ impl VirtualServer {
             db_users,
             db_audit: vec!["deploy completed for billing-api:2.8.4".into()],
             backups,
+            booted_at,
         };
         model.seed_filesystem(fs, now);
         model
+    }
+
+    pub fn booted_at(&self) -> DateTime<Utc> {
+        self.booted_at.to_owned()
     }
 
     pub fn initial_history() -> Vec<String> {
@@ -439,6 +452,9 @@ impl VirtualServer {
             format!("{}\n", history.join("\n")),
             now,
         );
+        if let Ok(node) = fs.node_mut("/home/admin/.bash_history") {
+            node.permissions = crate::filesystem::permissions::Permissions(0o600);
+        }
     }
 
     pub fn execute(
@@ -496,6 +512,23 @@ impl VirtualServer {
         fs.put_file("/srv/billing-api/.env", "APP_ENV=production\nDATABASE_URL=postgres://billing_app:decoy-db-pass@db-internal:5432/billing\nREDIS_URL=redis://redis:6379/0\nJWT_SIGNING_KEY=decoy-jwt-signing-key-never-valid\n", now);
         fs.put_file("/srv/billing-api/.env.production", "SENTRY_DSN=https://decoy-public-key@errors.internal/42\nPAYMENTS_TOKEN=hf_decoy_payments_01J9Z8F2\n", now);
         fs.put_file("/home/admin/.ssh/id_deploy", "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA-DECOY-KEY-NOT-VALID-AAAA\n-----END OPENSSH PRIVATE KEY-----\n", now);
+        fs.put_file(
+            "/home/admin/.ssh/authorized_keys",
+            format!("{}\n", self.authorized_keys.join("\n")),
+            now,
+        );
+        if let Ok(node) = fs.node_mut("/home/admin/.ssh/authorized_keys") {
+            node.permissions = crate::filesystem::permissions::Permissions(0o600);
+        }
+        if let Ok(node) = fs.node_mut("/home/admin/.ssh") {
+            node.permissions = crate::filesystem::permissions::Permissions(0o700);
+        }
+        if let Ok(node) = fs.node_mut("/home/admin/.ssh/id_deploy") {
+            node.permissions = crate::filesystem::permissions::Permissions(0o600);
+        }
+        if let Ok(node) = fs.node_mut("/home/admin/.ssh/authorized_keys") {
+            node.permissions = crate::filesystem::permissions::Permissions(0o600);
+        }
         fs.put_file("/home/admin/.ssh/config", "Host db-internal\n    HostName 10.20.4.12\n    User deploy\n    IdentityFile ~/.ssh/id_deploy\n", now);
         fs.put_file("/root/.aws/credentials", "[production-readonly]\naws_access_key_id = AKIADECOY00000000000\naws_secret_access_key = decoySecretKeyMaterialNeverAccepted\n", now);
         fs.put_file("/etc/billing/config.toml", "environment = \"production\"\nregistry = \"registry.internal\"\nops_token = \"decoy-companyctl-token-4d18\"\n", now);
@@ -509,7 +542,7 @@ impl VirtualServer {
                 now,
             );
         }
-        fs.put_file("/srv/billing-api/compose.yml", "services:\n  api:\n    image: registry.internal/billing-api:2.8.4\n    ports: [\"8080:8080\"]\n  worker:\n    image: registry.internal/billing-api:2.8.4\n", now);
+        fs.put_file("/srv/billing-api/compose.yml", "services:\n  api:\n    container_name: billing-api\n    image: registry.internal/billing-api:2.8.4\n    ports: [\"8080:8080\"]\n    depends_on: [redis]\n  worker:\n    container_name: billing-worker\n    image: registry.internal/billing-api:2.8.4\n    depends_on: [redis]\n  redis:\n    container_name: redis\n    image: redis:7.2-alpine\n    restart: unless-stopped\n", now);
         fs.put_file("/srv/billing-api/.gitignore", "/target\n.env.local\n", now);
         for (relative, content) in &self.git_baseline {
             fs.put_file(&format!("/srv/billing-api/{relative}"), *content, now);
@@ -544,11 +577,12 @@ impl VirtualServer {
         for process in self.processes.values() {
             if full {
                 output.push_str(&format!(
-                    "{:<9} {:>5}  0.0  {:>3.1} {}    07:40   {}\n",
+                    "{:<9} {:>5}  0.0  {:>3.1} {}    {}   {}\n",
                     process.user,
                     process.pid,
                     f64::from(process.rss_kib) / 40_000.0,
                     process.state.code(),
+                    (self.booted_at + Duration::minutes(12)).format("%b%d"),
                     process.command
                 ));
             } else if process.user == "admin" || process.pid == 1312 {
@@ -579,8 +613,9 @@ impl VirtualServer {
             .filter(|p| p.state == ProcessState::Stopped)
             .count();
         let mut output = format!(
-            "top - {} up 17 days,  1 user,  load average: 0.08, 0.04, 0.01\nTasks: {:>3} total, {:>3} running, {:>3} sleeping, {:>3} stopped, {:>3} zombie\n%Cpu(s):  1.0 us,  0.3 sy, 98.7 id\nMiB Mem :   3930.0 total,   1124.2 free,    842.1 used,   1963.7 buff/cache\n\n  PID USER      S    RES COMMAND\n",
+            "top - {} up {},  1 user,  load average: 0.08, 0.04, 0.01\nTasks: {:>3} total, {:>3} running, {:>3} sleeping, {:>3} stopped, {:>3} zombie\n%Cpu(s):  1.0 us,  0.3 sy, 98.7 id\nMiB Mem :   3930.0 total,   1124.2 free,    842.1 used,   1963.7 buff/cache\n\n  PID USER      S    RES COMMAND\n",
             now.format("%H:%M:%S"),
+            format!("{} days", (now - self.booted_at).num_days().max(0)),
             self.processes.len(),
             running,
             sleeping,
@@ -911,8 +946,10 @@ impl VirtualServer {
             "status" => {
                 if service.active {
                     format!(
-                        "● {name}.service - {}\n     Loaded: loaded (/lib/systemd/system/{name}.service; enabled)\n     Active: active (running) since Mon 2026-10-12 07:40:12 UTC\n   Main PID: {} ({name})\n",
-                        service.description, service.pid
+                        "● {name}.service - {}\n     Loaded: loaded (/lib/systemd/system/{name}.service; enabled)\n     Active: active (running) since {} UTC\n   Main PID: {} ({name})\n",
+                        service.description,
+                        (self.booted_at + Duration::minutes(12)).format("%a %Y-%m-%d %H:%M:%S"),
+                        service.pid
                     )
                 } else {
                     format!(
@@ -937,13 +974,6 @@ impl VirtualServer {
                         command: "/usr/lib/postgresql/14/bin/postgres",
                         state: ProcessState::Sleeping,
                         rss_kib: 42100,
-                    },
-                    "redis" => Process {
-                        pid: 763,
-                        user: "redis",
-                        command: "/usr/bin/redis-server 127.0.0.1:6379",
-                        state: ProcessState::Sleeping,
-                        rss_kib: 13820,
                     },
                     "ssh" => Process {
                         pid: 684,
@@ -1119,9 +1149,9 @@ impl VirtualServer {
                     .filter(|container| all || container.running)
                 {
                     let status = if container.running {
-                        "Up 17 hours"
+                        format!("Up {} days", (now - self.booted_at).num_days().max(0))
                     } else {
-                        "Exited (0)"
+                        "Exited (0)".to_owned()
                     };
                     let ports = if container.running {
                         container
@@ -1143,6 +1173,30 @@ impl VirtualServer {
                 }
                 VirtualCommand::success("docker", "container_list", None, output)
             }
+            "images" => self.docker_images(),
+            "image" if args.get(1).is_some_and(|value| value == "ls") => self.docker_images(),
+            "info" => VirtualCommand::success(
+                "docker",
+                "daemon_info",
+                None,
+                format!(
+                    "Client: Docker Engine - Community\n Version: 27.3.1\n Context: default\n\nServer:\n Containers: {}\n  Running: {}\n  Paused: 0\n  Stopped: {}\n Images: {}\n Server Version: 27.3.1\n Storage Driver: overlay2\n Cgroup Driver: systemd\n Cgroup Version: 2\n Operating System: Ubuntu 22.04.4 LTS\n Architecture: x86_64\n CPUs: 2\n Total Memory: 3.84GiB\n Docker Root Dir: /var/lib/docker\n",
+                    self.containers.len(),
+                    self.containers
+                        .values()
+                        .filter(|container| container.running)
+                        .count(),
+                    self.containers
+                        .values()
+                        .filter(|container| !container.running)
+                        .count(),
+                    self.containers
+                        .values()
+                        .map(|container| container.image)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                ),
+            ),
             "inspect" => {
                 let Some(name) = args.get(1) else {
                     return VirtualCommand::failure(
@@ -1161,10 +1215,11 @@ impl VirtualServer {
                     0
                 };
                 let ip_address = if container.running {
-                    if container.name == "billing-api" {
-                        "172.18.0.3"
-                    } else {
-                        "172.18.0.4"
+                    match container.name {
+                        "billing-api" => "172.18.0.3",
+                        "billing-worker" => "172.18.0.4",
+                        "redis" => "172.18.0.5",
+                        _ => "",
                     }
                 } else {
                     ""
@@ -1181,7 +1236,7 @@ impl VirtualServer {
                     "container_inspect",
                     Some(container.name.into()),
                     format!(
-                        "[{{\n  \"Id\": \"{}\",\n  \"Name\": \"/{}\",\n  \"Config\": {{\"Image\": \"{}\", \"Env\": [\"APP_ENV=production\",\"DATABASE_URL=postgres://billing_app:decoy-db-pass@db-internal:5432/billing\"]}},\n  \"State\": {{\"Running\": {}, \"Pid\": {pid}}},\n  \"NetworkSettings\": {{\"IPAddress\": \"{ip_address}\", \"Ports\": {{{ports}}}}}\n}}]\n",
+                        "[{{\n  \"Id\": \"{}\",\n  \"Name\": \"/{}\",\n  \"Config\": {{\"Image\": \"{}\", \"Env\": [\"APP_ENV=production\",\"DATABASE_URL=postgres://billing_app:decoy-db-pass@db-internal:5432/billing\",\"REDIS_URL=redis://redis:6379/0\"]}},\n  \"State\": {{\"Running\": {}, \"Pid\": {pid}}},\n  \"NetworkSettings\": {{\"IPAddress\": \"{ip_address}\", \"Ports\": {{{ports}}}}}\n}}]\n",
                         container.id, container.name, container.image, container.running
                     ),
                 )
@@ -1259,19 +1314,31 @@ impl VirtualServer {
             .collect::<Vec<_>>()
             .join(" ");
         let output = match command.as_str() {
+            "ls /app" | "ls -la /app" | "ls -l /app" if container.name != "redis" => {
+                "total 17420\ndrwxr-xr-x 1 root root     4096 Oct 12 07:40 .\ndrwxr-xr-x 1 root root     4096 Oct 12 07:40 ..\n-rwxr-xr-x 1 app  app  12492800 Oct 11 19:12 billing-api\n-rwxr-xr-x 1 app  app   5144576 Oct 11 19:12 billing-worker\n-rw-r--r-- 1 app  app      1024 Oct 12 07:39 config.toml\n".into()
+            }
+            "cat /app/config.toml" if container.name != "redis" => {
+                "listen = \"0.0.0.0:8080\"\nredis_url = \"redis://redis:6379/0\"\nlog_level = \"info\"\n".into()
+            }
+            "env" | "printenv" if container.name == "redis" => {
+                "REDIS_VERSION=7.2\nREDIS_PORT=6379\n".into()
+            }
             "env" | "printenv" => {
                 format!("APP_ENV=production\nHOSTNAME={}\nDATABASE_URL=postgres://billing_app:decoy-db-pass@db-internal:5432/billing\nREDIS_URL=redis://redis:6379/0\n", container.id)
             }
             "ps" | "ps aux" => {
                 let process = if container.name == "billing-worker" {
                     "/app/billing-worker --queue invoices"
+                } else if container.name == "redis" {
+                    "redis-server *:6379"
                 } else {
                     "/app/billing-api --config /app/config.toml"
                 };
-                format!("PID USER     STAT COMMAND\n  1 app      S    {process}\n")
+                let user = if container.name == "redis" { "redis" } else { "app" };
+                format!("PID USER     STAT COMMAND\n  1 {user:<8} S    {process}\n")
             }
             "cat /app/.env" => {
-                "APP_ENV=production\nDATABASE_URL=postgres://billing_app:decoy-db-pass@db-internal:5432/billing\n".into()
+                "APP_ENV=production\nDATABASE_URL=postgres://billing_app:decoy-db-pass@db-internal:5432/billing\nREDIS_URL=redis://redis:6379/0\n".into()
             }
             "hostname" => container.id.into(),
             _ => {
@@ -1291,17 +1358,35 @@ impl VirtualServer {
         )
     }
 
+    fn docker_images(&self) -> VirtualCommand {
+        let mut output =
+            "REPOSITORY                         TAG       IMAGE ID       CREATED        SIZE\n"
+                .to_owned();
+        let mut seen = std::collections::BTreeSet::new();
+        for container in self.containers.values() {
+            if seen.insert(container.image) {
+                let (repository, tag) = container
+                    .image
+                    .rsplit_once(':')
+                    .unwrap_or((container.image, "latest"));
+                let image_id = container.id.get(..12).unwrap_or(container.id);
+                output.push_str(&format!(
+                    "{repository:<35} {tag:<9} {image_id:<14} 3 weeks ago    142MB\n"
+                ));
+            }
+        }
+        VirtualCommand::success("docker", "image_list", None, output)
+    }
+
     fn docker_objects(&self, kind: &'static str, args: &[String]) -> VirtualCommand {
         let action = args.first().map(String::as_str).unwrap_or("ls");
         let target = args.get(1).cloned();
         let output = match (kind, action) {
-            ("volume", "ls") => {
-                "DRIVER    VOLUME NAME\nlocal     billing_uploads\nlocal     billing_pgdata\n"
-            }
+            ("volume", "ls") => "DRIVER    VOLUME NAME\nlocal     billing_uploads\n",
             ("volume", "inspect")
                 if target
                     .as_deref()
-                    .is_some_and(|name| matches!(name, "billing_uploads" | "billing_pgdata")) =>
+                    .is_some_and(|name| name == "billing_uploads") =>
             {
                 "[{\"Driver\":\"local\",\"Mountpoint\":\"/var/lib/docker/volumes/decoy/_data\",\"Scope\":\"local\"}]\n"
             }
@@ -1379,25 +1464,25 @@ impl VirtualServer {
                 VirtualCommand::success("docker", "compose_ps", Some("billing".into()), output)
             }
             "up" | "start" => {
-                for name in ["billing-api", "billing-worker"] {
+                for name in ["billing-api", "billing-worker", "redis"] {
                     let _ = self.set_container(name, true, fs, now);
                 }
                 VirtualCommand::success(
                     "docker",
                     format!("compose_{action}"),
                     Some("billing".into()),
-                    "[+] Running 2/2\n ✔ Container billing-api     Started\n ✔ Container billing-worker  Started\n",
+                    "[+] Running 3/3\n ✔ Container billing-api     Started\n ✔ Container billing-worker  Started\n ✔ Container redis           Started\n",
                 )
             }
             "down" | "stop" => {
-                for name in ["billing-api", "billing-worker"] {
+                for name in ["billing-api", "billing-worker", "redis"] {
                     let _ = self.set_container(name, false, fs, now);
                 }
                 VirtualCommand::success(
                     "docker",
                     format!("compose_{action}"),
                     Some("billing".into()),
-                    "[+] Stopping 2/2\n ✔ Container billing-worker  Stopped\n ✔ Container billing-api     Stopped\n",
+                    "[+] Stopping 3/3\n ✔ Container redis           Stopped\n ✔ Container billing-worker  Stopped\n ✔ Container billing-api     Stopped\n",
                 )
             }
             "logs" => VirtualCommand::success(
@@ -1405,15 +1490,17 @@ impl VirtualServer {
                 "compose_logs",
                 Some("billing".into()),
                 format!(
-                    "billing-api-1  | {}billing-worker-1 | {}",
-                    self.containers["billing-api"].logs, self.containers["billing-worker"].logs
+                    "billing-api-1  | {}billing-worker-1 | {}redis-1        | {}",
+                    self.containers["billing-api"].logs,
+                    self.containers["billing-worker"].logs,
+                    self.containers["redis"].logs
                 ),
             ),
             "config" => VirtualCommand::success(
                 "docker",
                 "compose_config",
                 Some("billing".into()),
-                "name: billing\nservices:\n  api:\n    image: registry.internal/billing-api:2.8.4\n  worker:\n    image: registry.internal/billing-api:2.8.4\n",
+                "name: billing\nservices:\n  api:\n    container_name: billing-api\n    image: registry.internal/billing-api:2.8.4\n    depends_on:\n      - redis\n  worker:\n    container_name: billing-worker\n    image: registry.internal/billing-api:2.8.4\n    depends_on:\n      - redis\n  redis:\n    container_name: redis\n    image: redis:7.2-alpine\n    restart: unless-stopped\n",
             ),
             _ => VirtualCommand::failure(
                 "docker",
@@ -1481,6 +1568,13 @@ impl VirtualServer {
                         command: "/app/billing-worker --queue invoices",
                         state: ProcessState::Sleeping,
                         rss_kib: 47640,
+                    },
+                    "redis" => Process {
+                        pid,
+                        user: "redis",
+                        command: "redis-server *:6379",
+                        state: ProcessState::Sleeping,
+                        rss_kib: 13820,
                     },
                     _ => unreachable!("only running containers have a configured PID"),
                 };
@@ -1891,23 +1985,15 @@ impl VirtualServer {
                 let api = self.containers["billing-api"].running;
                 let worker = self.containers["billing-worker"].running;
                 let postgres = self.services["postgresql"].active;
-                let redis = self.services["redis"].active;
+                let redis = self.containers["redis"].running;
                 let api_endpoint = if api { "http://10.20.4.21:8080" } else { "-" };
-                let worker_endpoint = if worker {
-                    "redis://127.0.0.1:6379/0"
-                } else {
-                    "-"
-                };
+                let worker_endpoint = if worker { "redis://redis:6379/0" } else { "-" };
                 let postgres_endpoint = if postgres {
                     "postgres://10.20.4.12:5432/billing"
                 } else {
                     "-"
                 };
-                let redis_endpoint = if redis {
-                    "redis://127.0.0.1:6379/0"
-                } else {
-                    "-"
-                };
+                let redis_endpoint = if redis { "redis://redis:6379/0" } else { "-" };
                 let output = format!(
                     "SERVICE          STATE     ENDPOINT\nbilling-api      {:<9} {api_endpoint}\nbilling-worker   {:<9} {worker_endpoint}\npostgresql       {:<9} {postgres_endpoint}\nredis            {:<9} {redis_endpoint}\n",
                     state_word(api),
@@ -2156,10 +2242,11 @@ impl VirtualServer {
                         .unwrap_or("process"),
                     process.state.description(),
                     process.pid,
-                    if process.user == "root" {
-                        "0\t0\t0\t0"
-                    } else {
-                        "1000\t1000\t1000\t1000"
+                    match process.user {
+                        "root" => "0\t0\t0\t0",
+                        "postgres" => "114\t114\t114\t114",
+                        "redis" => "999\t999\t999\t999",
+                        _ => "1000\t1000\t1000\t1000",
                     },
                     process.rss_kib
                 ),
@@ -2170,8 +2257,38 @@ impl VirtualServer {
                 process.command.replace(' ', "\0"),
                 now,
             );
+            let cgroup = self
+                .containers
+                .values()
+                .find(|container| container.running && container.pid == Some(process.pid))
+                .map_or_else(
+                    || {
+                        format!(
+                            "0::/system.slice/{}.service\n",
+                            match process.pid {
+                                1 => "init",
+                                684 => "ssh",
+                                721 => "postgresql",
+                                901 => "docker",
+                                1312 => "getty@tty1",
+                                _ => "user@1000",
+                            }
+                        )
+                    },
+                    |container| format!("0::/system.slice/docker-{}.scope\n", container.id),
+                );
+            fs.put_file(&format!("{dir}/cgroup"), cgroup, now);
         }
-        fs.put_file("/proc/uptime", "1490532.12 5839142.44\n", now);
+        let uptime_seconds = now
+            .signed_duration_since(self.booted_at)
+            .num_milliseconds()
+            .max(0) as f64
+            / 1000.0;
+        fs.put_file(
+            "/proc/uptime",
+            format!("{uptime_seconds:.2} 5839142.44\n"),
+            now,
+        );
         fs.put_file(
             "/proc/version",
             "Linux version 5.15.0-119-generic (buildd@lcy02-amd64-118) #129-Ubuntu SMP\n",

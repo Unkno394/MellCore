@@ -78,6 +78,7 @@ impl ContainerResourceLimits {
         let (cpu, memory, pids) = match level {
             crate::models::TrapLevel::Low => (0.5, 128, 64),
             crate::models::TrapLevel::Medium => (1.0, 512, 256),
+            crate::models::TrapLevel::High => (0.5, 128, 64),
         };
         if !self.cpu_cores.is_finite() || self.cpu_cores < 0.05 || self.cpu_cores > cpu
             || !(32..=memory).contains(&self.memory_mb) || !(16..=pids).contains(&self.pids) {

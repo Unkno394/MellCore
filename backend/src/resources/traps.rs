@@ -24,8 +24,14 @@ async fn snapshot(
                 .clone(),
         );
     management::validate_config(&effective)?;
-    let resources = input.resources.unwrap_or(profile.resources);
-    resources.validate_for_level(profile.level)?;
+    let resources = if profile.level == crate::models::TrapLevel::High {
+        ContainerResourceLimits::low_default()
+    } else {
+        input.resources.unwrap_or(profile.resources)
+    };
+    if profile.level != crate::models::TrapLevel::High {
+        resources.validate_for_level(profile.level)?;
+    }
     if profile.honeypot_type == "kozyavka" {
         crate::kozyavka::validate_profile(profile.level, &profile.service_type, &effective)?;
         crate::kozyavka::validate_ports(&input.ports)?;
@@ -34,6 +40,17 @@ async fn snapshot(
         crate::pritvoryashka::validate_profile(profile.level, &profile.service_type, &effective)?;
         crate::pritvoryashka::validate_ports(&input.ports)?;
     }
+    if profile.honeypot_type == "high_ubuntu_ssh" {
+        crate::high_ubuntu::validate_profile(profile.level, &profile.service_type, &effective)?;
+        if input.ports.len() != 1
+            || input.ports[0].transport != Transport::Tcp
+            || input.ports[0].route_mode != RouteMode::Direct
+        {
+            return Err(AppError::invalid(
+                "High SSH requires exactly one direct TCP port",
+            ));
+        }
+    }
     Ok((profile, effective, resources))
 }
 async fn reserve(
@@ -41,6 +58,7 @@ async fn reserve(
     server: &Server,
     trap: Uuid,
     ports: &[PortBinding],
+    profile: &Profile,
 ) -> Result<(), AppError> {
     if server.dispatcher_port.is_none()
         && ports
@@ -50,6 +68,50 @@ async fn reserve(
         return Err(AppError::conflict(
             "Configure a dispatcher listener on this server first",
         ));
+    }
+    for port in ports
+        .iter()
+        .filter(|port| port.route_mode == RouteMode::DispatcherBackend)
+    {
+        if server.dispatcher_port != Some(i32::from(port.host_port)) {
+            return Err(AppError::conflict(
+                "A Dispatcher backend reservation must use the server's configured listener port",
+            ));
+        }
+        if port.transport != Transport::Tcp
+            || crate::dispatcher::compatible_ssh_trap_kind(
+                &profile.service_type,
+                &profile.honeypot_type,
+                profile.level,
+            )
+            .is_none()
+        {
+            return Err(AppError::conflict(
+                "The current Dispatcher accepts compatible SSH Low and Middle traps only",
+            ));
+        }
+        let existing_profiles: Vec<Json<Profile>> = sqlx::query_scalar(
+            "SELECT t.profile_snapshot FROM server_ports p JOIN traps t ON t.trap_id=p.trap_id WHERE p.server_id=$1 AND p.transport=$2 AND p.host_port=$3 AND p.route_mode='dispatcher_backend' AND p.trap_id<>$4",
+        )
+        .bind(server.server_id)
+        .bind(port.transport)
+        .bind(i32::from(port.host_port))
+        .bind(trap)
+        .fetch_all(&mut **tx)
+        .await?;
+        if existing_profiles.iter().any(|existing| {
+            existing.0.service_type.as_str() != profile.service_type.as_str()
+                || crate::dispatcher::compatible_ssh_trap_kind(
+                    &existing.0.service_type,
+                    &existing.0.honeypot_type,
+                    existing.0.level,
+                )
+                .is_none()
+        }) {
+            return Err(AppError::conflict(
+                "A shared endpoint requires one protocol and compatible SSH Low or Middle traps",
+            ));
+        }
     }
     sqlx::query("DELETE FROM server_ports WHERE trap_id=$1 AND user_id=$2")
         .bind(trap)
@@ -77,7 +139,7 @@ async fn reserve(
     }
     Ok(())
 }
-async fn in_tx(tx: &mut Transaction<'_, Postgres>, user: Uuid, id: Uuid) -> Result<Trap, AppError> {
+pub(crate) async fn in_tx(tx: &mut Transaction<'_, Postgres>, user: Uuid, id: Uuid) -> Result<Trap, AppError> {
     Ok(sqlx::query_as(SELECT_ONE)
         .bind(id)
         .bind(user)
@@ -93,24 +155,33 @@ pub async fn create(
     input.trap.validate()?;
     let mut tx = owned_tx(pool, principal).await?;
     let server = servers::lock(&mut tx, principal.user.id, input.server_id).await?;
-    if server.status != ServerStatus::Online {
-        return Err(AppError::conflict("Connect the server and register its agent before creating a trap"));
-    }
-    let agent_registered: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM center_agent_servers WHERE server_id=$1)",
+    let deletion_pending: bool = sqlx::query_scalar(
+        "SELECT deletion_pending FROM servers WHERE server_id=$1",
     )
     .bind(server.server_id)
     .fetch_one(&mut *tx)
     .await?;
+    if deletion_pending {
+        return Err(AppError::conflict(
+            "This server is being deleted; trap creation is disabled.",
+        ));
+    }
+    let agent_registered: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM center_agent_servers WHERE server_id=$1)")
+            .bind(server.server_id)
+            .fetch_one(&mut *tx)
+            .await?;
     if !agent_registered {
-        return Err(AppError::conflict("The connected server has no registered agent"));
+        return Err(AppError::conflict(
+            "The connected server has no registered agent",
+        ));
     }
     let (profile, effective, resources) = snapshot(&mut tx, &input.trap).await?;
     let id = Uuid::new_v4();
     let t = input.trap;
     sqlx::query("INSERT INTO traps(trap_id,server_id,user_id,name,profile_id,profile_version,profile_snapshot,config,effective_config,resources,desired_state) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
-        .bind(id).bind(server.server_id).bind(principal.user.id).bind(t.name).bind(t.profile_id).bind(profile.version).bind(Json(profile)).bind(t.config).bind(effective).bind(Json(resources)).bind(t.desired_state).execute(&mut *tx).await?;
-    reserve(&mut tx, &server, id, &t.ports).await?;
+        .bind(id).bind(server.server_id).bind(principal.user.id).bind(t.name).bind(t.profile_id).bind(profile.version).bind(Json(profile.clone())).bind(t.config).bind(effective).bind(Json(resources)).bind(t.desired_state).execute(&mut *tx).await?;
+    reserve(&mut tx, &server, id, &t.ports, &profile).await?;
     let trap = in_tx(&mut tx, principal.user.id, id).await?;
     management::audit(&mut tx, principal.user.id, "trap.create", id, request).await?;
     tx.commit().await?;
@@ -171,13 +242,24 @@ pub async fn update(
     input.trap.validate()?;
     let mut tx = owned_tx(pool, principal).await?;
     let server = lock_parent(&mut tx, principal.user.id, id).await?;
+    let deletion_pending: bool = sqlx::query_scalar(
+        "SELECT deletion_pending FROM servers WHERE server_id=$1",
+    )
+    .bind(server.server_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if deletion_pending {
+        return Err(AppError::conflict(
+            "This server is being deleted; trap changes are disabled.",
+        ));
+    }
     let previous = in_tx(&mut tx, principal.user.id, id).await?;
     check_version(previous.version, input.expected_version)?;
     let (profile, effective, resources) = snapshot(&mut tx, &input.trap).await?;
     let t = input.trap;
     sqlx::query("UPDATE traps SET name=$3,profile_id=$4,profile_version=$5,profile_snapshot=$6,config=$7,effective_config=$8,resources=$9,desired_state=$10,version=version+1,updated_at=now() WHERE trap_id=$1 AND user_id=$2")
-        .bind(id).bind(principal.user.id).bind(t.name).bind(t.profile_id).bind(profile.version).bind(Json(profile)).bind(t.config).bind(effective).bind(Json(resources)).bind(t.desired_state).execute(&mut *tx).await?;
-    reserve(&mut tx, &server, id, &t.ports).await?;
+        .bind(id).bind(principal.user.id).bind(t.name).bind(t.profile_id).bind(profile.version).bind(Json(profile.clone())).bind(t.config).bind(effective).bind(Json(resources)).bind(t.desired_state).execute(&mut *tx).await?;
+    reserve(&mut tx, &server, id, &t.ports, &profile).await?;
     let trap = in_tx(&mut tx, principal.user.id, id).await?;
     management::audit(&mut tx, principal.user.id, "trap.update", id, request).await?;
     tx.commit().await?;
@@ -194,10 +276,10 @@ pub async fn delete(
     let trap = in_tx(&mut tx, principal.user.id, id).await?;
     if !matches!(
         trap.actual_state,
-        ActualState::Unknown | ActualState::Stopped | ActualState::Removed
+        ActualState::Unknown | ActualState::Removed
     ) {
         return Err(AppError::conflict(
-            "Stop or remove the deployed trap before deleting its registration",
+            "Remove the deployed trap through the agent before deleting its registration",
         ));
     }
     sqlx::query("DELETE FROM traps WHERE trap_id=$1 AND user_id=$2")

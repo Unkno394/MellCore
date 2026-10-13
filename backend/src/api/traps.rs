@@ -33,6 +33,12 @@ pub async fn create(
     Extension(request): Extension<RequestId>,
     Json(input): Json<CreateTrap>,
 ) -> Result<(StatusCode, Json<Trap>), AppError> {
+    resources::servers::get(state.pool()?, &principal, input.server_id).await?;
+    let agent_id: Uuid = sqlx::query_scalar("SELECT agent_id FROM center_agent_servers WHERE server_id=$1")
+        .bind(input.server_id).fetch_optional(state.pool()?).await?.ok_or_else(AppError::not_found)?;
+    if !crate::api::servers::agent_presence(&state, agent_id).await?.connected {
+        return Err(AppError::conflict("Агент сейчас не отвечает Центру; ловушка не создана."));
+    }
     Ok((
         StatusCode::CREATED,
         Json(resources::traps::create(state.pool()?, &principal, request.0, input).await?),

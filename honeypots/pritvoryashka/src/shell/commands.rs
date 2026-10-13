@@ -6,6 +6,7 @@ pub const SUPPORTED: &[&str] = &[
     "echo",
     "whoami",
     "id",
+    "sudo",
     "uname",
     "hostname",
     "date",

@@ -1,12 +1,15 @@
 import { useEffect, useState } from 'react'
 
 export type ToastKind = 'success' | 'info' | 'error'
+export type ToastOptions = { persistent?: boolean }
+export type ToastNotify = (kind: ToastKind, title: string, message: string, options?: ToastOptions) => number
 
 export type ToastItem = {
   id: number
   kind: ToastKind
   title: string
   message: string
+  persistent?: boolean
 }
 
 type Props = {
@@ -24,6 +27,7 @@ function ToastCard({
   const [closing, setClosing] = useState(false)
 
   useEffect(() => {
+    if (toast.persistent) return
     const closeTimer = window.setTimeout(() => {
       setClosing(true)
     }, 5000)
@@ -36,7 +40,7 @@ function ToastCard({
       window.clearTimeout(closeTimer)
       window.clearTimeout(removeTimer)
     }
-  }, [toast.id, onDismiss])
+  }, [toast.id, toast.persistent, onDismiss])
 
   const styles: Record<ToastKind, { border: string; icon: string; symbol: string }> = {
     success: { border: 'border-emerald-400/50 shadow-emerald-500/10', icon: 'text-emerald-300', symbol: '✓' },

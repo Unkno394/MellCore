@@ -1984,6 +1984,7 @@ name = "pritvoryashka"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hf-core",
  "rand",
  "reqwest 0.13.5",
  "russh",

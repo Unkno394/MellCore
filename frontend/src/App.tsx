@@ -1,19 +1,17 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiClient, ApiError, apiErrorMessage } from './api/client'
 import { createApi } from './api/services'
 import type { AttackEvent, AttackGraphMatch, Profile, Server, Trap, User } from './api/types'
 import { clearSession, createSession, loadSession, saveSession, type AuthSession } from './auth/session'
 import Auth from './pages/Auth'
-import ConnectServer from './pages/ConnectServer'
-import CreateHoneypot from './pages/CreateHoneypot'
-import Honeypots from './pages/Honeypots'
+import Infrastructure from './pages/Infrastructure'
 import LiveFeed from './pages/LiveFeed'
 import Profiles from './pages/Profiles'
 import ResetPassword from './pages/ResetPassword'
 import Settings from './pages/Settings'
 import VerifyEmail from './pages/VerifyEmail'
 import CRTWarp from './components/CRTWarp'
-import ToastNotifications, { type ToastKind, type ToastItem } from './components/ToastNotifications'
+import ToastNotifications, { type ToastItem, type ToastNotify } from './components/ToastNotifications'
 import Sidebar, { type PageName } from './components/layout/Sidebar'
 import Topbar from './components/layout/Topbar'
 
@@ -59,12 +57,13 @@ function App() {
   const [attackTrapId, setAttackTrapId] = useState<string | null>(null)
   const isLightTheme = false
   const [toasts, setToasts] = useState<ToastItem[]>([])
+  const toastIdRef = useRef(Date.now())
 
-  const notify = useCallback((kind: ToastKind, title: string, message: string) => {
-    setToasts((current) => {
-      const id = Math.max(Date.now(), ...current.map((toast) => toast.id + 1))
-      return [...current, { id, kind, title, message }]
-    })
+  const notify = useCallback<ToastNotify>((kind, title, message, options) => {
+    const toastId = Math.max(Date.now(), toastIdRef.current + 1)
+    toastIdRef.current = toastId
+    setToasts((current) => [...current, { id: toastId, kind, title, message, persistent: options?.persistent }])
+    return toastId
   }, [])
   const dismissToast = useCallback((id: number) => {
     setToasts((current) => current.filter((toast) => toast.id !== id))
@@ -242,8 +241,8 @@ function App() {
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">{stats.map((stat) => <article key={stat.label} className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5 backdrop-blur-xl transition hover:border-orange-500/30"><p className="text-sm text-white/50">{stat.label}</p><p className="mt-4 text-3xl font-semibold tracking-tight">{stat.value}</p><p className="mt-2 text-xs text-white/40">{stat.detail}</p></article>)}</div>
           <section className="mt-4 rounded-xl border border-white/10 bg-[#160e0c]/80 p-5"><div className="flex items-center justify-between gap-3"><div><h3 className="font-semibold">Ошибки инфраструктуры</h3><p className="mt-1 text-xs text-white/40">Состояние подключённых серверов, установки и загрузки телеметрии</p></div><span className={`rounded-md border px-2 py-1 text-xs ${infrastructureIssues.length ? 'border-red-400/20 bg-red-400/5 text-red-200' : 'border-emerald-400/20 bg-emerald-400/5 text-emerald-200'}`}>{infrastructureIssues.length}</span></div><div className="mt-4 space-y-2">{infrastructureIssues.map((issue) => <div key={issue.key} className="flex items-start gap-3 rounded-lg border border-red-400/10 bg-red-400/[0.025] px-3 py-2.5"><span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-red-300"/><div className="min-w-0"><p className="text-xs font-medium text-white/80">{issue.title}</p><p className="mt-1 break-words text-xs text-red-200/65">{issue.detail}</p></div></div>)}{infrastructureIssues.length === 0 && <p className="py-3 text-sm text-white/40">Ошибок инфраструктуры нет.</p>}</div></section>
           <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-[1.15fr_0.85fr]"><section className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5"><div className="flex items-start justify-between gap-3"><div><h3 className="font-semibold">Активные инциденты</h3><p className="mt-1 text-xs text-white/40">Незавершённые совпадения графа за последние 24 часа</p></div><span className="rounded-md border border-orange-400/20 bg-orange-400/5 px-2 py-1 text-xs text-orange-200">{activeIncidents.length}</span></div><div className="mt-5 space-y-3">{activeIncidents.map(({ match, event }) => <button type="button" key={`${match.trap_id}:${match.session_key}:${match.technique_key}`} onClick={() => { setAttackTrapId(match.trap_id); setCurrentPage('LiveFeed') }} className="flex w-full items-center gap-3 rounded-lg border border-white/5 bg-black/10 p-3 text-left transition hover:border-orange-400/20 hover:bg-white/[0.03]"><span className="h-2 w-2 shrink-0 rounded-full bg-amber-300 shadow-[0_0_10px_rgba(252,211,77,0.35)]"/><span className="min-w-0 flex-1"><span className="block truncate text-sm text-white/85">{match.technique_name}</span><span className="mt-1 block truncate text-xs text-white/40">{trapNames.get(match.trap_id) ?? 'Ловушка'} · {event?.event.source_ip ?? 'источник неизвестен'}</span></span><span className="shrink-0 text-xs text-violet-200">{Math.round(match.similarity * 100)}%</span></button>)}{activeIncidents.length === 0 && <p className="py-8 text-center text-sm text-white/40">Активных подозрений нет.</p>}</div></section>
-            <section className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5"><div className="flex items-start justify-between gap-3"><div><h3 className="font-semibold">Последние инциденты</h3><p className="mt-1 text-xs text-white/40">Совпадения с известными сценариями</p></div><button type="button" onClick={() => setCurrentPage('LiveFeed')} className="text-xs text-orange-200/70 transition hover:text-orange-100">Все атаки →</button></div><div className="mt-5 space-y-4">{latestIncidents.map(({ match, event }) => <button type="button" key={`${match.trap_id}:${match.session_key}:${match.technique_key}`} onClick={() => { setAttackTrapId(match.trap_id); setCurrentPage('LiveFeed') }} className="flex w-full items-start gap-3 text-left"><span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${match.status === 'confirmed' ? 'bg-red-400' : 'bg-violet-300'}`}/><span className="min-w-0 flex-1"><span className="block truncate text-sm">{match.technique_name}</span><span className="mt-1 block truncate text-xs text-white/40">{trapNames.get(match.trap_id) ?? 'Ловушка'} · {event?.event.source_ip ?? 'источник неизвестен'}</span></span><span className="shrink-0 text-[10px] text-white/35">{new Date(match.updated_at).toLocaleTimeString('ru-RU')}</span></button>)}{latestIncidents.length === 0 && <p className="py-8 text-center text-sm text-white/40">Совпадений с известными сценариями пока нет.</p>}</div></section></div>
-        </section> : currentPage === 'Honeypots' ? <Honeypots api={api} traps={traps} servers={servers} events={events} readOnly={readOnly} onChanged={refreshInventory} onShowAttacks={(trapId) => { setAttackTrapId(trapId); setCurrentPage('LiveFeed') }}/> : currentPage === 'ConnectServer' ? <ConnectServer api={api} readOnly={readOnly} onChanged={refreshInventory} notify={notify}/> : currentPage === 'CreateHoneypot' ? <CreateHoneypot api={api} profiles={profiles} servers={servers} traps={traps} readOnly={readOnly} onCreated={refreshInventory}/> : currentPage === 'LiveFeed' ? <LiveFeed api={api} events={events} traps={traps} initialTrapId={attackTrapId} loading={eventsLoading} error={eventError} onRefresh={() => refreshEvents(traps)}/> : currentPage === 'Settings' ? <Settings api={api} user={user} notify={notify} onPasswordChanged={logout}/> : <Profiles api={api} profiles={profiles} isAdmin={user.role === 'admin'} onChanged={refreshInventory}/>}</div></div> : (
+            <section className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5"><div className="flex items-start justify-between gap-3"><div><h3 className="font-semibold">Последние инциденты</h3><p className="mt-1 text-xs text-white/40">Совпадения с известными сценариями</p></div><button type="button" onClick={() => setCurrentPage('LiveFeed')} className="text-xs text-orange-200/70 transition hover:text-orange-100">Все события →</button></div><div className="mt-5 space-y-4">{latestIncidents.map(({ match, event }) => <button type="button" key={`${match.trap_id}:${match.session_key}:${match.technique_key}`} onClick={() => { setAttackTrapId(match.trap_id); setCurrentPage('LiveFeed') }} className="flex w-full items-start gap-3 text-left"><span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${match.status === 'confirmed' ? 'bg-red-400' : 'bg-violet-300'}`}/><span className="min-w-0 flex-1"><span className="block truncate text-sm">{match.technique_name}</span><span className="mt-1 block truncate text-xs text-white/40">{trapNames.get(match.trap_id) ?? 'Ловушка'} · {event?.event.source_ip ?? 'источник неизвестен'}</span></span><span className="shrink-0 text-[10px] text-white/35">{new Date(match.updated_at).toLocaleTimeString('ru-RU')}</span></button>)}{latestIncidents.length === 0 && <p className="py-8 text-center text-sm text-white/40">Совпадений с известными сценариями пока нет.</p>}</div></section></div>
+        </section> : currentPage === 'Infrastructure' ? <Infrastructure api={api} profiles={profiles} servers={servers} traps={traps} readOnly={readOnly} onChanged={refreshInventory} onShowAttacks={(trapId) => { setAttackTrapId(trapId); setCurrentPage('LiveFeed') }} notify={notify} dismissToast={dismissToast}/> : currentPage === 'LiveFeed' ? <LiveFeed api={api} events={events} traps={traps} initialTrapId={attackTrapId} loading={eventsLoading} error={eventError} onRefresh={() => refreshEvents(traps)}/> : currentPage === 'Settings' ? <Settings api={api} user={user} notify={notify} onPasswordChanged={logout}/> : <Profiles api={api} profiles={profiles} isAdmin={user.role === 'admin'} onChanged={refreshInventory}/>}</div></div> : (
         <Auth api={api} notice={authNotice} onAuthenticated={(nextSession) => { authEpoch += 1; setAuthNotice(''); setAuthChecking(true); setSession(nextSession); setUser(nextSession.user) }}/>
       )}
     </div>

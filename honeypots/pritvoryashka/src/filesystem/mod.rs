@@ -55,7 +55,11 @@ impl VirtualFileSystem {
             "/var/log",
             "/var/backups",
         ] {
-            fs.nodes.insert(path.into(), Node::directory(now));
+            let mut node = Node::directory(now);
+            if path == "/home/admin" {
+                node.owner = "admin".into();
+            }
+            fs.nodes.insert(path.into(), node);
         }
         fs.put_file("/etc/hostname", format!("{hostname}\n"), now);
         fs.put_file(
@@ -117,6 +121,10 @@ impl VirtualFileSystem {
         self.nodes.get(path).ok_or(FsError::NotFound)
     }
 
+    pub fn node_mut(&mut self, path: &str) -> Result<&mut Node, FsError> {
+        self.nodes.get_mut(path).ok_or(FsError::NotFound)
+    }
+
     pub fn read(&self, path: &str) -> Result<&[u8], FsError> {
         match &self.node(path)?.kind {
             NodeKind::File(data) => Ok(data),
@@ -144,7 +152,11 @@ impl VirtualFileSystem {
     }
 
     pub fn put_file(&mut self, path: &str, content: impl Into<Vec<u8>>, now: DateTime<Utc>) {
-        self.nodes.insert(path.into(), Node::file(content, now));
+        let mut node = Node::file(content, now);
+        if path == "/home/admin" || path.starts_with("/home/admin/") {
+            node.owner = "admin".into();
+        }
+        self.nodes.insert(path.into(), node);
     }
 
     fn require_parent(&self, path: &str) -> Result<(), FsError> {
@@ -182,7 +194,11 @@ impl VirtualFileSystem {
             return Err(FsError::NoSpace);
         }
         self.require_parent(path)?;
-        self.nodes.insert(path.into(), Node::directory(now));
+        let mut node = Node::directory(now);
+        if path == "/home/admin" || path.starts_with("/home/admin/") {
+            node.owner = "admin".into();
+        }
+        self.nodes.insert(path.into(), node);
         Ok(())
     }
 

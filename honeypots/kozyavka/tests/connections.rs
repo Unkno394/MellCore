@@ -5,7 +5,8 @@ use honeyforge_low::{
 };
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
-    io::AsyncReadExt,
+    io::AsyncBufReadExt,
+    io::BufReader,
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot},
     task::{JoinHandle, JoinSet},
@@ -61,11 +62,11 @@ impl TestServer {
 
 async fn read_banner(address: SocketAddr) -> (SocketAddr, Vec<u8>) {
     timeout(Duration::from_secs(5), async {
-        let mut stream = TcpStream::connect(address).await.unwrap();
+        let stream = TcpStream::connect(address).await.unwrap();
         let client = stream.local_addr().unwrap();
+        let mut reader = BufReader::new(stream);
         let mut bytes = Vec::new();
-        // Reading to EOF also proves that the trap closes without waiting for commands.
-        stream.read_to_end(&mut bytes).await.unwrap();
+        reader.read_until(b'\n', &mut bytes).await.unwrap();
         (client, bytes)
     })
     .await

@@ -9,7 +9,7 @@ fn now() -> chrono::DateTime<Utc> {
 }
 
 #[test]
-fn parser_supports_quotes_but_rejects_host_shell_operators() {
+fn parser_supports_quotes_and_virtual_output_redirection_but_rejects_host_shell_operators() {
     assert_eq!(
         parser::parse("echo 'hello world' \"again\"", 1024).unwrap(),
         ["echo", "hello world", "again"]
@@ -20,7 +20,6 @@ fn parser_supports_quotes_but_rejects_host_shell_operators() {
     );
     for dangerous in [
         "cat /etc/passwd | sh",
-        "echo x > /tmp/x",
         "pwd && id",
         "echo $(id)",
         "echo `id`",
@@ -28,6 +27,10 @@ fn parser_supports_quotes_but_rejects_host_shell_operators() {
     ] {
         assert!(parser::parse(dangerous, 1024).is_err(), "{dangerous}");
     }
+    assert_eq!(
+        parser::parse("echo x > /tmp/x", 1024).unwrap(),
+        ["echo", "x", ">", "/tmp/x"]
+    );
     assert!(parser::parse("echo 'unfinished", 1024).is_err());
 }
 
@@ -56,8 +59,12 @@ fn supported_commands_are_simulated_and_never_delegated() {
         "cd /tmp",
         "cat /etc/hostname",
         "echo hello",
+        "echo hello > /tmp/redirected.txt",
+        "echo world >> /tmp/redirected.txt",
+        "cat /tmp/redirected.txt",
         "whoami",
         "id",
+        "sudo -l",
         "uname -a",
         "hostname",
         "date",

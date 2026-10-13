@@ -231,9 +231,11 @@ fn queue_events(
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
     for batch in plan_batches(events, identity, now)? {
         let message_id = batch.envelope.message_id;
-        outbox.enqueue(batch.envelope)?;
         if batch.critical {
+            outbox.enqueue(batch.envelope)?;
             outbox.prioritize(message_id)?;
+        } else {
+            outbox.enqueue_batchable_telemetry(batch.envelope)?;
         }
     }
     Ok(count)
@@ -272,9 +274,11 @@ pub(crate) fn enqueue_immediate_event(
     let envelope = telemetry_envelope(identity, now, vec![event]);
     ensure_packet_size(&envelope)?;
     let message_id = envelope.message_id;
-    outbox.enqueue(envelope)?;
     if critical {
+        outbox.enqueue(envelope)?;
         outbox.prioritize(message_id)?;
+    } else {
+        outbox.enqueue_batchable_telemetry(envelope)?;
     }
     Ok(message_id)
 }

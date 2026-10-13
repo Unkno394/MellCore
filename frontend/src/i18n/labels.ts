@@ -11,7 +11,7 @@ export function statusLabel(value: string): string {
   return labels[value] ?? value
 }
 
-const internalProfileNames = new Set(['kozyavka', 'pritvoryashka'])
+const internalProfileNames = new Set(['kozyavka', 'pritvoryashka', 'high_ubuntu_ssh'])
 
 export function profileNameLabel(name: string, level: string): string {
   return internalProfileNames.has(name.trim().toLowerCase()) ? statusLabel(level) : name

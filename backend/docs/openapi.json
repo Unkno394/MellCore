@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "HoneyForge Backend",
-    "description": "Management API and internal telemetry ingestion. Public registration always grants user role. Email login uses Bearer JWT. Profiles are shared templates; only administrators modify them. Servers and traps are owner-scoped. The server bootstrap endpoint installs an agent through Center over SSH; ordinary server registration and desired trap state do not deploy anything. Port reservations are exclusive per registered server/protocol/port; dispatcher backends use distinct TCP ports. Pritvoryashka telemetry uses an independent opaque bearer token, validates trap/server ownership and is stored idempotently in PostgreSQL.",
+    "description": "Management API and internal telemetry ingestion. Public registration always grants user role. Email login uses Bearer JWT. Profiles are shared templates; only administrators modify them. Servers and traps are owner-scoped. The server bootstrap endpoint installs an agent through Center over SSH; ordinary server registration and desired trap state do not deploy anything. A shared public endpoint uses one application protocol; the current TCP Dispatcher accepts compatible SSH Low/Middle traps and assigns each a distinct loopback backend port. Pritvoryashka telemetry uses an independent opaque bearer token, validates trap/server ownership and is stored idempotently in PostgreSQL.",
     "license": {
       "name": ""
     },
@@ -4474,7 +4474,8 @@
         "type": "string",
         "enum": [
           "low",
-          "medium"
+          "medium",
+          "high"
         ]
       },
       "TrapPage": {
