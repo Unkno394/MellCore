@@ -261,6 +261,16 @@ impl HighOsProfile {
     pub const fn windows_rdp() -> Self {
         Self {
             guest_os: HighGuestOs::Windows,
+            image_kind: HighImageKind::PreparedQcow2,
+            image_preparation: HighImagePreparation::Sysprep,
+            connection: HighGuestConnection::Rdp { guest_port: 3389 },
+        }
+    }
+
+    /// Compatibility profile for manifests created by the original ISO installer adapter.
+    pub const fn windows_rdp_legacy_iso() -> Self {
+        Self {
+            guest_os: HighGuestOs::Windows,
             image_kind: HighImageKind::InstallMediaAndDisk,
             image_preparation: HighImagePreparation::UnattendedInstall,
             connection: HighGuestConnection::Rdp { guest_port: 3389 },
@@ -515,6 +525,7 @@ mod tests {
             HighOsProfile::ubuntu_ssh(),
             HighOsProfile::arch_linux_ssh(),
             HighOsProfile::windows_rdp(),
+            HighOsProfile::windows_rdp_legacy_iso(),
         ] {
             let encoded = serde_json::to_vec(&profile).unwrap();
             assert_eq!(

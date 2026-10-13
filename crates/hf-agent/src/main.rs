@@ -443,7 +443,8 @@ impl ComposeProjectStore {
         allow_existing_ubuntu_image: bool,
     ) -> anyhow::Result<()> {
         if deployment.trap_id.is_nil()
-            || deployment.external_service_port == 0
+            || (deployment.external_service_port == 0
+                && deployment.profile != HighOsProfile::windows_rdp())
             || deployment.base_image.trim().is_empty()
         {
             anyhow::bail!("invalid High VM deployment command");
@@ -2156,8 +2157,11 @@ fn high_vm_required_tools(profile: HighOsProfile) -> Vec<&'static str> {
             required_tools.extend(["cloud-localds", "base64"]);
         }
         hf_core::HighImagePreparation::UnattendedInstall => required_tools.push("xorriso"),
-        hf_core::HighImagePreparation::OfflineGuestPreparation
-        | hf_core::HighImagePreparation::Sysprep => {}
+        hf_core::HighImagePreparation::Sysprep => required_tools.push("xorriso"),
+        hf_core::HighImagePreparation::OfflineGuestPreparation => {}
+    }
+    if profile == HighOsProfile::arch_linux_ssh() || profile == HighOsProfile::windows_rdp() {
+        required_tools.push("setfacl");
     }
     required_tools
 }
@@ -2192,8 +2196,13 @@ fn ensure_high_vm_runtime(profile: HighOsProfile) -> anyhow::Result<()> {
                         packages.push("cloud-image-utils")
                     }
                     hf_core::HighImagePreparation::UnattendedInstall => packages.push("xorriso"),
-                    hf_core::HighImagePreparation::OfflineGuestPreparation
-                    | hf_core::HighImagePreparation::Sysprep => {}
+                    hf_core::HighImagePreparation::Sysprep => packages.push("xorriso"),
+                    hf_core::HighImagePreparation::OfflineGuestPreparation => {}
+                }
+                if profile == HighOsProfile::arch_linux_ssh()
+                    || profile == HighOsProfile::windows_rdp()
+                {
+                    packages.push("acl");
                 }
                 run_program("apt-get", &packages)?;
                 run_program("systemctl", &["enable", "--now", "libvirtd"])?;
@@ -2217,8 +2226,13 @@ fn ensure_high_vm_runtime(profile: HighOsProfile) -> anyhow::Result<()> {
                         packages.push("cloud-utils")
                     }
                     hf_core::HighImagePreparation::UnattendedInstall => packages.push("xorriso"),
-                    hf_core::HighImagePreparation::OfflineGuestPreparation
-                    | hf_core::HighImagePreparation::Sysprep => {}
+                    hf_core::HighImagePreparation::Sysprep => packages.push("xorriso"),
+                    hf_core::HighImagePreparation::OfflineGuestPreparation => {}
+                }
+                if profile == HighOsProfile::arch_linux_ssh()
+                    || profile == HighOsProfile::windows_rdp()
+                {
+                    packages.push("acl");
                 }
                 run_program("dnf", &packages)?;
                 run_program("systemctl", &["enable", "--now", "libvirtd"])?;
@@ -2244,8 +2258,13 @@ fn ensure_high_vm_runtime(profile: HighOsProfile) -> anyhow::Result<()> {
                     hf_core::HighImagePreparation::UnattendedInstall => {
                         packages.push("libisoburn")
                     }
-                    hf_core::HighImagePreparation::OfflineGuestPreparation
-                    | hf_core::HighImagePreparation::Sysprep => {}
+                    hf_core::HighImagePreparation::Sysprep => packages.push("libisoburn"),
+                    hf_core::HighImagePreparation::OfflineGuestPreparation => {}
+                }
+                if profile == HighOsProfile::arch_linux_ssh()
+                    || profile == HighOsProfile::windows_rdp()
+                {
+                    packages.push("acl");
                 }
                 run_program("pacman", &packages)?;
                 run_program("systemctl", &["enable", "--now", "libvirtd"])?;
@@ -2524,7 +2543,7 @@ mod tests {
     use super::{
         Args, ComposeProjectStore, DispatcherConfig, DispatcherListener, DispatcherTarget,
         HighDesiredState, HighOsProfile, HighRuntimeManifest, Platform, QuarantineMarker,
-        STANDALONE_IDENTITY_FILE, compose_remove_id, high_vm_required_tools,
+        STANDALONE_IDENTITY_FILE, compose_remove_id, default_image_for, high_vm_required_tools,
         load_or_create_standalone_high_identity, parse_platform, quarantine_result,
         standalone_high_command, validate_standalone_high_args,
     };
@@ -2659,9 +2678,15 @@ mod tests {
         assert!(ubuntu.contains(&"cloud-localds"));
         assert!(ubuntu.contains(&"python3"));
         assert!(!ubuntu.contains(&"xorriso"));
+        assert!(!ubuntu.contains(&"setfacl"));
+
+        let arch = high_vm_required_tools(HighOsProfile::arch_linux_ssh());
+        assert!(arch.contains(&"cloud-localds"));
+        assert!(arch.contains(&"setfacl"));
 
         let windows = high_vm_required_tools(HighOsProfile::windows_rdp());
         assert!(windows.contains(&"xorriso"));
+        assert!(windows.contains(&"setfacl"));
         assert!(!windows.contains(&"cloud-localds"));
     }
 
@@ -2686,6 +2711,23 @@ mod tests {
 
         assert!(error.to_string().contains("arbitrary images are not supported"));
         assert!(!store.high_manifest_path(trap_id).exists());
+    }
+
+    #[test]
+    fn prepared_windows_accepts_host_only_rdp_without_an_external_port() {
+        let deployment = HighVmDeployment {
+            command_id: Uuid::new_v4(),
+            trap_id: Uuid::new_v4(),
+            base_image: default_image_for(HighOsProfile::windows_rdp()).into(),
+            external_service_port: 0,
+            profile: HighOsProfile::windows_rdp(),
+        };
+        ComposeProjectStore::validate_high_deployment(&deployment, false).unwrap();
+
+        let mut legacy = deployment;
+        legacy.profile = HighOsProfile::windows_rdp_legacy_iso();
+        legacy.base_image = default_image_for(legacy.profile).into();
+        assert!(ComposeProjectStore::validate_high_deployment(&legacy, false).is_err());
     }
 
     #[test]

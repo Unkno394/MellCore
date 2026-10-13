@@ -13,13 +13,18 @@ pub const DEFAULT_UBUNTU_24_04_IMAGE: &str =
 
 const DEFAULT_ARCH_LINUX_IMAGE: &str =
     "/var/lib/honeyforge/images/arch-linux-x86_64-cloudimg.qcow2";
+const DEFAULT_WINDOWS_PREPARED_IMAGE: &str =
+    "/var/lib/honeyforge/images/windows-server-prepared.qcow2";
 const DEFAULT_WINDOWS_SERVER_ISO: &str = "/var/lib/honeyforge/images/windows-server-eval.iso";
 
 pub fn default_image_for(profile: HighOsProfile) -> &'static str {
+    if profile == HighOsProfile::windows_rdp_legacy_iso() {
+        return DEFAULT_WINDOWS_SERVER_ISO;
+    }
     match profile.guest_os {
         HighGuestOs::Ubuntu => DEFAULT_UBUNTU_24_04_IMAGE,
         HighGuestOs::ArchLinux => DEFAULT_ARCH_LINUX_IMAGE,
-        HighGuestOs::Windows => DEFAULT_WINDOWS_SERVER_ISO,
+        HighGuestOs::Windows => DEFAULT_WINDOWS_PREPARED_IMAGE,
     }
 }
 
@@ -70,7 +75,18 @@ struct HighOsAdapter {
     default_image: &'static str,
     readiness_timeout: Duration,
     dhcp_wait_attempts: u16,
+    /// Re-run the adapter's verifier before every new VM uses its managed base image.
+    /// This is required for immutable QCOW2 backing files: silently trusting an existing
+    /// cache entry would let corruption propagate into every new overlay.
+    verify_cached_managed_image: bool,
+    publication: HighPublication,
     scripts: HighLifecycleScripts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HighPublication {
+    Required,
+    Disabled,
 }
 
 #[derive(Clone, Copy)]
@@ -126,6 +142,26 @@ const GENERIC_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
     ],
 };
 
+const WINDOWS_PREPARED_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
+    download: "verify-prepared-image.sh",
+    launch: "launch-prepared.sh",
+    publish: "discover-rdp.sh",
+    check_publication: "check-rdp-isolated.sh",
+    stop: "stop.sh",
+    reset: "reset.sh",
+    required: &[
+        "launch-prepared.sh",
+        "create-prepared-overlay.sh",
+        "create-network.sh",
+        "firewall-common.sh",
+        "discover-rdp.sh",
+        "check-rdp-isolated.sh",
+        "stop.sh",
+        "reset.sh",
+        "verify-prepared-image.sh",
+    ],
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HighDomainState {
     Missing,
@@ -160,6 +196,8 @@ impl LibvirtSandboxManager {
                     default_image: default_image_for(HighOsProfile::ubuntu_ssh()),
                     readiness_timeout: Duration::from_secs(60),
                     dhcp_wait_attempts: 12,
+                    verify_cached_managed_image: false,
+                    publication: HighPublication::Required,
                     scripts: UBUNTU_SCRIPTS,
                 },
                 HighOsAdapter {
@@ -168,16 +206,28 @@ impl LibvirtSandboxManager {
                     default_image: default_image_for(HighOsProfile::arch_linux_ssh()),
                     readiness_timeout: Duration::from_secs(90),
                     dhcp_wait_attempts: 18,
+                    verify_cached_managed_image: true,
+                    publication: HighPublication::Required,
                     scripts: GENERIC_SCRIPTS,
                 },
                 HighOsAdapter {
                     profile: HighOsProfile::windows_rdp(),
                     recipe_dir: recipes_root.join("high-windows-rdp"),
                     default_image: default_image_for(HighOsProfile::windows_rdp()),
-                    // The first unattended Windows setup can take several minutes.  Do not
-                    // mark a healthy installer as failed using the cloud-image timeout.
+                    readiness_timeout: Duration::from_secs(300),
+                    dhcp_wait_attempts: 180,
+                    verify_cached_managed_image: true,
+                    publication: HighPublication::Disabled,
+                    scripts: WINDOWS_PREPARED_SCRIPTS,
+                },
+                HighOsAdapter {
+                    profile: HighOsProfile::windows_rdp_legacy_iso(),
+                    recipe_dir: recipes_root.join("high-windows-rdp"),
+                    default_image: default_image_for(HighOsProfile::windows_rdp_legacy_iso()),
                     readiness_timeout: Duration::from_secs(900),
                     dhcp_wait_attempts: 180,
+                    verify_cached_managed_image: false,
+                    publication: HighPublication::Required,
                     scripts: GENERIC_SCRIPTS,
                 },
             ],
@@ -186,13 +236,13 @@ impl LibvirtSandboxManager {
     }
 
     pub fn create_and_start(&self, vm: &HighVm) -> anyhow::Result<()> {
-        if vm.external_service_port == 0 {
+        let adapter = self.adapter_for(vm.profile)?;
+        if vm.external_service_port == 0 && adapter.publication == HighPublication::Required {
             anyhow::bail!(
                 "High {} VM needs an external service port",
                 profile_recipe_name(vm.profile)
             );
         }
-        let adapter = self.adapter_for(vm.profile)?;
         for script in adapter.scripts.required {
             let path = adapter.recipe_dir.join("scripts").join(script);
             if !path.is_file() {
@@ -203,8 +253,9 @@ impl LibvirtSandboxManager {
                 );
             }
         }
-        if !vm.base_image.is_file() {
-            if vm.base_image == Path::new(adapter.default_image) {
+        let managed_image = vm.base_image == Path::new(adapter.default_image);
+        if !vm.base_image.is_file() || (managed_image && adapter.verify_cached_managed_image) {
+            if managed_image {
                 self.run(
                     vm.profile,
                     adapter.scripts.download,
@@ -237,17 +288,11 @@ impl LibvirtSandboxManager {
                 &port,
             ],
         )?;
-        if let Err(error) = self
-            .run(vm.profile, adapter.scripts.publish, &[&instance_id, &port])
-            .and_then(|()| self.wait_until_ready(vm))
-        {
-            // A VM without its requested external listener is not a deployed trap.  Remove
-            // the overlay and libvirt definition now; the next idempotent command can retry
-            // from a clean base instead of accumulating inaccessible guests.
+        if let Err(error) = self.prepare_access_and_wait(vm) {
             let cleanup = self.run(vm.profile, adapter.scripts.reset, &[&instance_id]);
             if let Err(cleanup_error) = cleanup {
                 return Err(anyhow::anyhow!(
-                    "High VM publication failed ({error}); cleanup also failed: {cleanup_error}"
+                    "High VM readiness failed ({error}); cleanup also failed: {cleanup_error}"
                 ));
             }
             return Err(error);
@@ -292,13 +337,13 @@ impl LibvirtSandboxManager {
             }
             ReconcileAction::Start => {
                 self.virsh(&["start", &format!("hf-high-{}", vm.instance_id)])?;
-                self.publish_and_wait(vm)
+                self.prepare_access_and_wait(vm)
             }
             ReconcileAction::Resume => {
                 self.virsh(&["resume", &format!("hf-high-{}", vm.instance_id)])?;
-                self.publish_and_wait(vm)
+                self.prepare_access_and_wait(vm)
             }
-            ReconcileAction::Verify => self.publish_and_wait(vm),
+            ReconcileAction::Verify => self.prepare_access_and_wait(vm),
         }
     }
 
@@ -384,7 +429,7 @@ impl LibvirtSandboxManager {
         Ok(String::from_utf8(output.stdout)?)
     }
 
-    fn publish_and_wait(&self, vm: &HighVm) -> anyhow::Result<()> {
+    fn prepare_access_and_wait(&self, vm: &HighVm) -> anyhow::Result<()> {
         let adapter = self.adapter_for(vm.profile)?;
         let instance_id = vm.instance_id.to_string();
         let port = vm.external_service_port.to_string();
@@ -396,7 +441,7 @@ impl LibvirtSandboxManager {
         let timeout = self.adapter_for(vm.profile)?.readiness_timeout;
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if self.has_published_service(vm) && self.guest_service_ready(vm) {
+            if self.access_policy_ready(vm) && self.guest_service_ready(vm) {
                 if !self.guest_agent_ready(vm.instance_id) {
                     tracing::warn!(trap_id = %vm.instance_id, "High VM service is ready but qemu-guest-agent is unavailable");
                 }
@@ -405,7 +450,7 @@ impl LibvirtSandboxManager {
             std::thread::sleep(Duration::from_secs(2));
         }
         anyhow::bail!(
-            "High VM did not reach guest service and publication readiness before timeout"
+            "High VM did not reach guest service and access-policy readiness before timeout"
         )
     }
 
@@ -420,6 +465,10 @@ impl LibvirtSandboxManager {
             &[&instance_id],
         )
         .is_ok()
+    }
+
+    fn access_policy_ready(&self, vm: &HighVm) -> bool {
+        self.has_published_service(vm)
     }
 
     fn guest_service_ready(&self, vm: &HighVm) -> bool {
@@ -484,7 +533,9 @@ impl LibvirtSandboxManager {
     }
 
     pub fn service_is_published(&self, vm: &HighVm) -> bool {
-        self.has_published_service(vm)
+        self.adapter_for(vm.profile)
+            .is_ok_and(|adapter| adapter.publication == HighPublication::Required)
+            && self.has_published_service(vm)
     }
 
     fn adapter_for(&self, profile: HighOsProfile) -> anyhow::Result<&HighOsAdapter> {
@@ -544,10 +595,13 @@ pub fn profile_recipe_name(profile: HighOsProfile) -> &'static str {
 }
 
 pub fn profile_manifest_kind(profile: HighOsProfile) -> &'static str {
+    if profile == HighOsProfile::windows_rdp_legacy_iso() {
+        return "high_windows_rdp";
+    }
     match profile.guest_os {
         HighGuestOs::Ubuntu => "high_ubuntu_ssh",
         HighGuestOs::ArchLinux => "high_arch_ssh",
-        HighGuestOs::Windows => "high_windows_rdp",
+        HighGuestOs::Windows => "high_windows_rdp_prepared",
     }
 }
 
@@ -555,6 +609,7 @@ pub fn is_supported_profile(profile: HighOsProfile) -> bool {
     profile == HighOsProfile::ubuntu_ssh()
         || profile == HighOsProfile::arch_linux_ssh()
         || profile == HighOsProfile::windows_rdp()
+        || profile == HighOsProfile::windows_rdp_legacy_iso()
 }
 
 fn domain_xml_matches_security_profile(
@@ -631,11 +686,8 @@ mod tests {
 
         let windows = HighOsProfile::windows_rdp();
         assert_eq!(windows.guest_os, HighGuestOs::Windows);
-        assert_eq!(windows.image_kind, HighImageKind::InstallMediaAndDisk);
-        assert_eq!(
-            windows.image_preparation,
-            HighImagePreparation::UnattendedInstall
-        );
+        assert_eq!(windows.image_kind, HighImageKind::PreparedQcow2);
+        assert_eq!(windows.image_preparation, HighImagePreparation::Sysprep);
         assert_eq!(
             windows.connection,
             HighGuestConnection::Rdp { guest_port: 3389 }
@@ -683,6 +735,46 @@ mod tests {
         assert_eq!(
             reconcile_action(HighDomainState::Running, false),
             ReconcileAction::Recreate
+        );
+    }
+
+    #[test]
+    fn immutable_backing_images_are_revalidated_before_new_overlays() {
+        let manager = LibvirtSandboxManager::with_high_root("/recipes/ubuntu", "/state/high");
+        let arch = manager
+            .adapter_for(HighOsProfile::arch_linux_ssh())
+            .unwrap();
+        let ubuntu = manager.adapter_for(HighOsProfile::ubuntu_ssh()).unwrap();
+        let windows = manager.adapter_for(HighOsProfile::windows_rdp()).unwrap();
+        let legacy = manager
+            .adapter_for(HighOsProfile::windows_rdp_legacy_iso())
+            .unwrap();
+        assert!(arch.verify_cached_managed_image);
+        assert!(!ubuntu.verify_cached_managed_image);
+        assert!(windows.verify_cached_managed_image);
+        assert_eq!(windows.publication, HighPublication::Disabled);
+        assert!(!legacy.verify_cached_managed_image);
+        assert_eq!(legacy.publication, HighPublication::Required);
+    }
+
+    #[test]
+    fn prepared_windows_uses_local_qcow2_and_no_publication_script() {
+        let manager = LibvirtSandboxManager::with_high_root("/recipes/ubuntu", "/state/high");
+        let adapter = manager.adapter_for(HighOsProfile::windows_rdp()).unwrap();
+        assert_eq!(
+            adapter.default_image,
+            "/var/lib/honeyforge/images/windows-server-prepared.qcow2"
+        );
+        assert_eq!(adapter.scripts.publish, "discover-rdp.sh");
+        assert_eq!(adapter.scripts.check_publication, "check-rdp-isolated.sh");
+        assert_ne!(adapter.scripts.publish, "publish-service.sh");
+        assert_eq!(
+            profile_manifest_kind(HighOsProfile::windows_rdp()),
+            "high_windows_rdp_prepared"
+        );
+        assert_eq!(
+            profile_manifest_kind(HighOsProfile::windows_rdp_legacy_iso()),
+            "high_windows_rdp"
         );
     }
 
