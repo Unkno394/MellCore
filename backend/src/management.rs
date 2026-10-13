@@ -59,6 +59,7 @@ pub struct Profile {
     pub service_type: String,
     pub config: Value,
     #[sqlx(json)]
+    #[serde(default)]
     pub resources: crate::resources::ContainerResourceLimits,
     pub version: i64,
     pub created_at: DateTime<Utc>,

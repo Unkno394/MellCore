@@ -127,5 +127,5 @@ pub async fn ports(
     id: Uuid,
 ) -> Result<Vec<PortReservation>, AppError> {
     get(pool, principal, id).await?;
-    Ok(sqlx::query_as("SELECT server_id,transport,host_port,purpose,trap_id,target_port,route_mode FROM server_ports WHERE server_id=$1 AND user_id=$2 ORDER BY transport,host_port").bind(id).bind(principal.user.id).fetch_all(pool).await?)
+    Ok(sqlx::query_as("SELECT server_id,transport,host_port,purpose,trap_id,target_port,route_mode,weight FROM server_ports WHERE server_id=$1 AND user_id=$2 ORDER BY transport,host_port").bind(id).bind(principal.user.id).fetch_all(pool).await?)
 }

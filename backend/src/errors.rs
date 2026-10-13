@@ -102,9 +102,18 @@ impl From<sqlx::Error> for AppError {
     fn from(error: sqlx::Error) -> Self {
         match error {
             sqlx::Error::RowNotFound => Self::not_found(),
-            sqlx::Error::Database(ref db) if db.is_unique_violation() => {
-                Self::conflict("Resource already exists")
-            }
+            sqlx::Error::Database(ref db) if db.is_unique_violation() => match db.constraint() {
+                Some("server_ports_external_listener_unique") => {
+                    Self::conflict("Public port is already reserved on this server")
+                }
+                Some("server_ports_dispatcher_target_unique") => {
+                    Self::conflict("Dispatcher backend port is already reserved")
+                }
+                Some("server_ports_dispatcher_member_unique") => {
+                    Self::conflict("Trap already belongs to this dispatcher port")
+                }
+                _ => Self::conflict("Resource already exists"),
+            },
             // PostgreSQL reports explicit ON DELETE RESTRICT as 23001;
             // SQLx's helper only recognizes the 23503 foreign-key variant.
             sqlx::Error::Database(ref db)

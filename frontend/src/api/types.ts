@@ -100,6 +100,7 @@ export type PortBinding = {
   host_port: number
   target_port: number
   route_mode: RouteMode
+  weight?: number | null
 }
 
 export type PortReservation = {
@@ -110,6 +111,7 @@ export type PortReservation = {
   trap_id: string | null
   target_port: number | null
   route_mode: RouteMode | null
+  weight: number | null
 }
 
 export type TrapInput = {

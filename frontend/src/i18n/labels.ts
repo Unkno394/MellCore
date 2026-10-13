@@ -3,12 +3,18 @@ export function statusLabel(value: string): string {
   const labels: Record<string, string> = {
     running: 'Работает', installing: 'Устанавливается', failed: 'Ошибка',
     stopped: 'Остановлена', removed: 'Удалена', unknown: 'Неизвестно',
-    low: 'Низкий', medium: 'Средний', high: 'Высокий',
+    low: 'Нижний', medium: 'Средний', high: 'Высокий',
     admin: 'Администратор', viewer: 'Наблюдатель', user: 'Пользователь',
     active: 'Активен', inactive: 'Неактивен', pending: 'Ожидает',
     online: 'В сети', offline: 'Не в сети', error: 'Ошибка',
   }
   return labels[value] ?? value
+}
+
+const internalProfileNames = new Set(['kozyavka', 'pritvoryashka'])
+
+export function profileNameLabel(name: string, level: string): string {
+  return internalProfileNames.has(name.trim().toLowerCase()) ? statusLabel(level) : name
 }
 
 export function eventLabel(value: string): string {

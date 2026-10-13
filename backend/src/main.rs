@@ -8,6 +8,13 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load local development settings when present. systemd-provided variables
+    // take precedence; production still supplies them through EnvironmentFile.
+    for path in ["backend/.env", ".env", "/etc/honeyforge/backend.env"] {
+        if dotenvy::from_path(path).is_ok() {
+            break;
+        }
+    }
     let config = Config::from_env()?;
     tracing_subscriber::fmt()
         .json()
@@ -80,11 +87,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let app = if let Some(pool) = database.clone() {
-        api::router_with_state(
-            api::AppState::new(config.clone(), pool)
-                .await
-                .map_err(|e| e.message)?,
-        )
+        let state = api::AppState::new(config.clone(), pool)
+            .await
+            .map_err(|e| e.message)?;
+        tokio::spawn(api::trap_actions::reconcile_shared_jobs(state.clone()));
+        api::router_with_state(state)
     } else {
         api::router(&config)
     };

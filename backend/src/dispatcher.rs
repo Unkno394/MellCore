@@ -1,7 +1,7 @@
 //! Control-plane planning for one shared public TCP listener.
 //! The API/UI supplies only the desired external port and optional weights.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use hf_core::{AgentCommand, SharedTcpTrapKind, TcpPortGroup, TcpPortGroupMember};
 use uuid::Uuid;
@@ -18,14 +18,16 @@ pub struct GroupCandidate {
 
 /// Allocates loopback ports deterministically from the HoneyForge internal range and creates the
 /// single command consumed by the agent. The caller supplies every already allocated backend port
-/// for this VPS, including Docker-published ports.
+/// for this VPS, including Docker-published ports. Existing members keep their backend port
+/// so adding another trap does not unnecessarily move a live listener.
 pub fn plan_tcp_port_group(
     listener_port: u16,
     candidates: &[GroupCandidate],
     occupied_backend_ports: &HashSet<u16>,
+    existing_backend_ports: &HashMap<Uuid, u16>,
 ) -> Result<AgentCommand, &'static str> {
-    if listener_port == 0 || candidates.len() < 2 {
-        return Err("a shared listener needs a port and at least two traps");
+    if listener_port == 0 || candidates.is_empty() {
+        return Err("a shared listener needs a port and at least one trap");
     }
     if candidates.iter().map(|candidate| u16::from(candidate.weight)).sum::<u16>() != 100
         || candidates.iter().any(|candidate| candidate.weight == 0)
@@ -41,20 +43,28 @@ pub fn plan_tcp_port_group(
     let mut next = INTERNAL_PORT_START;
     let mut members = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        while unavailable.contains(&next) && next < INTERNAL_PORT_END {
-            next += 1;
-        }
-        if next >= INTERNAL_PORT_END {
-            return Err("no free internal backend ports remain");
-        }
+        let backend_port = if let Some(&port) = existing_backend_ports.get(&candidate.trap_id) {
+            if port == 0 || port == listener_port {
+                return Err("existing dispatcher backend port is invalid");
+            }
+            port
+        } else {
+            while unavailable.contains(&next) && next < INTERNAL_PORT_END {
+                next += 1;
+            }
+            if next >= INTERNAL_PORT_END {
+                return Err("no free internal backend ports remain");
+            }
+            next
+        };
         members.push(TcpPortGroupMember {
             trap_id: candidate.trap_id,
-            backend_port: next,
+            backend_port,
             weight: candidate.weight,
             trap_kind: candidate.trap_kind,
         });
-        unavailable.insert(next);
-        next += 1;
+        unavailable.insert(backend_port);
+        if backend_port == next { next += 1; }
     }
     Ok(AgentCommand::ReconcileTcpPortGroup(TcpPortGroup {
         command_id: Uuid::new_v4(),
@@ -78,6 +88,7 @@ mod tests {
                 GroupCandidate { trap_id: second, weight: 50, trap_kind: SharedTcpTrapKind::Kozyavka },
             ],
             &HashSet::from([31_000]),
+            &HashMap::new(),
         )
         .unwrap();
         let AgentCommand::ReconcileTcpPortGroup(group) = command else { panic!("wrong command") };

@@ -91,9 +91,10 @@ pub fn runtime_config(trap: &Trap) -> Result<RuntimeConfig, AppError> {
     }
     let settings = validate_profile(profile.level, &profile.service_type, &trap.effective_config)?;
     let port = validate_ports(&trap.ports)?;
+    let container_port = if trap.ports[0].route_mode == crate::resources::RouteMode::DispatcherBackend { 2222 } else { port };
     Ok(RuntimeConfig {
         bind_address: settings.bind_address,
-        port,
+        port: container_port,
         banner: settings.banner,
         trap_id: trap.trap_id,
     })
@@ -104,7 +105,11 @@ pub fn runtime_config(trap: &Trap) -> Result<RuntimeConfig, AppError> {
 pub fn deployment_command(trap: &Trap) -> Result<AgentCommand, AppError> {
     let runtime = runtime_config(trap)?;
     let binding = trap.ports.first().ok_or_else(AppError::internal)?;
-    let host_port = binding.host_port;
+    let host_port = if binding.route_mode == crate::resources::RouteMode::DispatcherBackend {
+        binding.target_port
+    } else {
+        binding.host_port
+    };
     Ok(AgentCommand::DeployKozyavka(KozyavkaDeployment {
         command_id: Uuid::new_v4(),
         trap_id: runtime.trap_id,

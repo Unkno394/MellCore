@@ -2,8 +2,8 @@ use super::*;
 use sqlx::types::Json;
 
 // A single statement returns a consistent trap+ports snapshot even during updates.
-const SELECT_ONE: &str = "SELECT t.*,COALESCE((SELECT jsonb_agg(jsonb_build_object('transport',p.transport,'host_port',p.host_port,'target_port',p.target_port,'route_mode',p.route_mode) ORDER BY p.transport,p.host_port) FROM server_ports p WHERE p.trap_id=t.trap_id),'[]'::jsonb) AS ports FROM traps t WHERE t.trap_id=$1 AND t.user_id=$2";
-const SELECT_PAGE: &str = "SELECT t.*,COALESCE((SELECT jsonb_agg(jsonb_build_object('transport',p.transport,'host_port',p.host_port,'target_port',p.target_port,'route_mode',p.route_mode) ORDER BY p.transport,p.host_port) FROM server_ports p WHERE p.trap_id=t.trap_id),'[]'::jsonb) AS ports FROM traps t WHERE t.user_id=$1 AND ($2::uuid IS NULL OR t.server_id=$2) AND ($3::uuid IS NULL OR t.trap_id>$3) ORDER BY t.trap_id LIMIT $4";
+const SELECT_ONE: &str = "SELECT t.*,COALESCE((SELECT jsonb_agg(jsonb_build_object('transport',p.transport,'host_port',p.host_port,'target_port',p.target_port,'route_mode',p.route_mode,'weight',p.weight) ORDER BY p.transport,p.host_port) FROM server_ports p WHERE p.trap_id=t.trap_id),'[]'::jsonb) AS ports FROM traps t WHERE t.trap_id=$1 AND t.user_id=$2";
+const SELECT_PAGE: &str = "SELECT t.*,COALESCE((SELECT jsonb_agg(jsonb_build_object('transport',p.transport,'host_port',p.host_port,'target_port',p.target_port,'route_mode',p.route_mode,'weight',p.weight) ORDER BY p.transport,p.host_port) FROM server_ports p WHERE p.trap_id=t.trap_id),'[]'::jsonb) AS ports FROM traps t WHERE t.user_id=$1 AND ($2::uuid IS NULL OR t.server_id=$2) AND ($3::uuid IS NULL OR t.trap_id>$3) ORDER BY t.trap_id LIMIT $4";
 async fn snapshot(
     tx: &mut Transaction<'_, Postgres>,
     input: &TrapInput,
@@ -57,8 +57,23 @@ async fn reserve(
         .execute(&mut **tx)
         .await?;
     for port in ports {
-        sqlx::query("INSERT INTO server_ports(server_id,user_id,transport,host_port,purpose,trap_id,target_port,route_mode) VALUES ($1,$2,$3,$4,'trap',$5,$6,$7)")
-            .bind(server.server_id).bind(server.user_id).bind(port.transport).bind(i32::from(port.host_port)).bind(trap).bind(i32::from(port.target_port)).bind(port.route_mode).execute(&mut **tx).await?;
+        if port.route_mode != RouteMode::DispatcherBackend {
+            let occupied: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM server_ports WHERE server_id=$1 AND transport=$2 AND host_port=$3 AND route_mode IS DISTINCT FROM 'dispatcher_backend')",
+            )
+            .bind(server.server_id)
+            .bind(port.transport)
+            .bind(i32::from(port.host_port))
+            .fetch_one(&mut **tx)
+            .await?;
+            if occupied {
+                return Err(AppError::conflict(
+                    "Public port is already reserved on this server",
+                ));
+            }
+        }
+        sqlx::query("INSERT INTO server_ports(server_id,user_id,transport,host_port,purpose,trap_id,target_port,route_mode,weight) VALUES ($1,$2,$3,$4,'trap',$5,$6,$7,$8)")
+            .bind(server.server_id).bind(server.user_id).bind(port.transport).bind(i32::from(port.host_port)).bind(trap).bind(i32::from(port.target_port)).bind(port.route_mode).bind(port.weight.map(i32::from)).execute(&mut **tx).await?;
     }
     Ok(())
 }

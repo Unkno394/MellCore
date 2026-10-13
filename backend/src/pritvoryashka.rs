@@ -149,8 +149,9 @@ pub fn runtime_config(
     }
     let settings = validate_profile(profile.level, &profile.service_type, &trap.effective_config)?;
     let port = validate_ports(&trap.ports)?;
+    let container_port = if trap.ports[0].route_mode == crate::resources::RouteMode::DispatcherBackend { 2222 } else { port };
     Ok(RuntimeConfig {
-        bind: SocketAddr::new(settings.bind_address, port),
+        bind: SocketAddr::new(settings.bind_address, container_port),
         health_bind: SocketAddr::new(settings.health_bind_address, settings.health_port),
         trap_id: trap.trap_id,
         server_id: trap.server_id,

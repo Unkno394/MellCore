@@ -597,7 +597,11 @@ impl ComposeProjectStore {
                 } else if high_runtime {
                     self.high_manager().stop(trap_id)
                 } else {
-                    self.compose_down(trap_id, false)
+                    let manifest = self.root.join(trap_id.to_string()).join("manifest.json");
+                    let shared = fs::read(manifest).ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .is_some_and(|manifest| manifest["publish_address"].as_str() == Some("127.0.0.1"));
+                    if shared { self.prepare_remove(trap_id) } else { self.compose_down(trap_id, false) }
                 }
             }
             AgentCommand::RemoveTrap { .. } => {
@@ -783,8 +787,8 @@ impl ComposeProjectStore {
         pritvoryashka_image: &str,
         agent_id: uuid::Uuid,
     ) -> anyhow::Result<()> {
-        if group.listener_port == 0 || group.members.len() < 2 {
-            anyhow::bail!("TCP port group needs an external port and at least two traps");
+        if group.listener_port == 0 || group.members.is_empty() {
+            anyhow::bail!("TCP port group needs an external port and at least one trap");
         }
         let total: u16 = group
             .members
@@ -822,6 +826,7 @@ impl ComposeProjectStore {
             }
             originals.push(deployment);
         }
+        let prior_dispatcher = fs::read("/etc/honeyforge/dispatcher.json").ok();
         let result = (|| -> anyhow::Result<()> {
             for (member, deployment) in group.members.iter().zip(&originals) {
                 self.deploy_shared_backend(
@@ -850,10 +855,29 @@ impl ComposeProjectStore {
                 Path::new("/etc/honeyforge/dispatcher.json"),
                 &serde_json::to_vec_pretty(&config)?,
             )?;
-            run_program("systemctl", &["enable", "--now", "hf-dispatcher"])
+            run_program("systemctl", &["enable", "hf-dispatcher.service"])?;
+            // The service may already be running with the previous routing table. Restart
+            // before acknowledging the command so new targets are active immediately.
+            run_program("systemctl", &["restart", "hf-dispatcher.service"])?;
+            let address = SocketAddr::from(([127, 0, 0, 1], group.listener_port));
+            for _ in 0..20 {
+                if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+                    return run_program("systemctl", &["is-active", "--quiet", "hf-dispatcher.service"]);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            anyhow::bail!("dispatcher did not open the shared TCP listener")
         })();
         if let Err(error) = result {
             tracing::error!(%error, port = group.listener_port, "dispatcher transition failed; restoring prior trap publications");
+            if let Some(previous) = prior_dispatcher {
+                if let Err(rollback) = self.restore_dispatcher(&previous) {
+                    tracing::error!(%rollback, "dispatcher configuration rollback failed");
+                }
+            } else {
+                let _ = run_program("systemctl", &["disable", "--now", "hf-dispatcher.service"]);
+                let _ = fs::remove_file("/etc/honeyforge/dispatcher.json");
+            }
             for deployment in originals {
                 if let Err(rollback) = self.deploy_shared_original(
                     deployment,

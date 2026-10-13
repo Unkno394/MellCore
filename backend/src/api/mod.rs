@@ -121,11 +121,13 @@ pub struct HealthResponse {
         version = "0.1.0",
         description = "Management API and internal telemetry ingestion. Public registration always grants user role. Email login uses Bearer JWT. Profiles are shared templates; only administrators modify them. Servers and traps are owner-scoped. The server bootstrap endpoint installs an agent through Center over SSH; ordinary server registration and desired trap state do not deploy anything. Port reservations are exclusive per registered server/protocol/port; dispatcher backends use distinct TCP ports. Pritvoryashka telemetry uses an independent opaque bearer token, validates trap/server ownership and is stored idempotently in PostgreSQL."
     ),
-    paths(live, ready, auth::register, auth::verify_email, auth::resend_verification, auth::forgot_password, auth::reset_password, auth::change_password, auth::change_email, auth::login, auth::refresh, auth::me, auth::logout, users::create, users::list, users::get, users::update, users::delete, profiles::create, profiles::list, profiles::get, profiles::update, profiles::delete, servers::create, servers::list, servers::get, servers::update, servers::delete, servers::ports, server_bootstrap::start, server_bootstrap::status, traps::create, traps::list, traps::get, traps::update, traps::delete, traps::runtime_config, trap_actions::start, trap_actions::status, telemetry::ingest, telemetry::ingest_from_center, telemetry::list, telemetry::list_attack_matches, telemetry::list_graph_proposals, telemetry::review_graph_proposal),
+    paths(live, ready, auth::register, auth::verify_email, auth::resend_verification, auth::forgot_password, auth::reset_password, auth::change_password, auth::change_email, auth::login, auth::refresh, auth::me, auth::logout, users::create, users::list, users::get, users::update, users::delete, profiles::create, profiles::list, profiles::get, profiles::update, profiles::delete, servers::create, servers::list, servers::get, servers::update, servers::delete, servers::ports, server_bootstrap::start, server_bootstrap::status, traps::create, traps::list, traps::get, traps::update, traps::delete, traps::runtime_config, trap_actions::start, trap_actions::status, trap_actions::share_port, telemetry::ingest, telemetry::ingest_from_center, telemetry::list, telemetry::list_attack_matches, telemetry::list_graph_proposals, telemetry::review_graph_proposal),
     modifiers(&SecuritySchemes),
     components(schemas(
         trap_actions::TrapActionRequest,
         trap_actions::TrapActionProgress,
+        trap_actions::SharedPortMember,
+        trap_actions::SharePortRequest,
         HealthResponse,
         ErrorResponse,
         auth::ChangePassword,
@@ -230,6 +232,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/api/v1/traps/{trap_id}/events", get(telemetry::list))
         .route("/api/v1/traps/{trap_id}/actions", post(trap_actions::start))
         .route("/api/v1/traps/{trap_id}/actions/{action_id}", get(trap_actions::status))
+        .route("/api/v1/traps/{trap_id}/share-port", post(trap_actions::share_port))
         .route("/api/v1/traps/{trap_id}/attack-matches", get(telemetry::list_attack_matches))
         .route("/api/v1/knowledge/proposals", get(telemetry::list_graph_proposals))
         .route("/api/v1/knowledge/proposals/{proposal_id}/review", post(telemetry::review_graph_proposal))

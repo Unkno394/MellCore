@@ -5,6 +5,7 @@ import type {
   BootstrapProgress,
   BootstrapServerInput,
   CursorPage,
+  IncomingEvent,
   PortReservation,
   Profile,
   ProfileInput,
@@ -17,6 +18,9 @@ import type {
   TrapInput,
   User,
 } from './types'
+
+// The management API flattens IncomingEvent into each stored event record.
+type StoredAttackEvent = Omit<AttackEvent, 'event'> & IncomingEvent
 
 export function createApi(client: ApiClient) {
   return {
@@ -109,14 +113,25 @@ export function createApi(client: ApiClient) {
         }),
       delete: (id: string) =>
         client.request<void>(`/traps/${id}`, { method: 'DELETE' }),
-      events: (id: string) =>
-        client.request<CursorPage<AttackEvent>>(`/traps/${id}/events?limit=100`),
+      events: async (id: string): Promise<CursorPage<AttackEvent>> => {
+        const page = await client.request<CursorPage<StoredAttackEvent>>(`/traps/${id}/events?limit=100`)
+        return {
+          ...page,
+          items: page.items.map(({ schema_version, agent_id, server_id, received_at, expires_at, ...event }) => ({
+            schema_version, agent_id, server_id, received_at, expires_at, event,
+          })),
+        }
+      },
       attackMatches: (id: string) =>
         client.request<AttackGraphMatch[]>(`/traps/${id}/attack-matches`),
       action: (id: string, action: TrapAction) =>
         client.request<TrapActionProgress>(`/traps/${id}/actions`, { method: 'POST', body: { action } }),
       actionStatus: (trapId: string, actionId: string) =>
         client.request<TrapActionProgress>(`/traps/${trapId}/actions/${actionId}`),
+      sharePort: (trapId: string, listenerPort: number, members: { trap_id: string; weight: number }[]) =>
+        client.request<TrapActionProgress>(`/traps/${trapId}/share-port`, {
+          method: 'POST', body: { listener_port: listenerPort, members },
+        }),
     },
   }
 }

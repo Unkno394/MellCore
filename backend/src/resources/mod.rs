@@ -164,6 +164,8 @@ pub struct PortBinding {
     #[schema(minimum = 1, maximum = 65535)]
     pub target_port: u16,
     pub route_mode: RouteMode,
+    #[serde(default)]
+    pub weight: Option<u8>,
 }
 #[derive(Serialize, FromRow, ToSchema)]
 pub struct PortReservation {
@@ -174,6 +176,7 @@ pub struct PortReservation {
     pub trap_id: Option<Uuid>,
     pub target_port: Option<i32>,
     pub route_mode: Option<RouteMode>,
+    pub weight: Option<i32>,
 }
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -322,6 +325,8 @@ impl TrapInput {
                 || !seen.insert((port.transport, port.host_port))
                 || (port.route_mode == RouteMode::DispatcherBackend
                     && port.transport != Transport::Tcp)
+                || port.weight.is_some_and(|weight| weight == 0 || weight > 100)
+                || (port.route_mode == RouteMode::Direct && port.weight.is_some())
             {
                 return Err(AppError::invalid("Invalid or duplicate port binding"));
             }

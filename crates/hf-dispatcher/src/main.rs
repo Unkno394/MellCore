@@ -85,8 +85,12 @@ fn parse_config(bytes: &[u8]) -> anyhow::Result<DispatcherConfig> {
             .map(|target| u16::from(target.weight))
             .sum();
         anyhow::ensure!(total == 100, "target weights must total exactly 100");
+        let mut traps = std::collections::HashSet::new();
+        let mut addresses = std::collections::HashSet::new();
         for target in &listener.targets {
             anyhow::ensure!(target.weight > 0, "target weight must be positive");
+            anyhow::ensure!(traps.insert(target.trap_id), "duplicate target trap");
+            anyhow::ensure!(addresses.insert(target.address), "duplicate target address");
             anyhow::ensure!(
                 target.address.ip().is_loopback(),
                 "target address must be loopback"
