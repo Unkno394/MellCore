@@ -7,7 +7,10 @@ use std::{
     time::Duration,
 };
 
-use crate::sandbox::{HighDomainState, LibvirtSandboxManager, default_recipe_dir};
+use crate::sandbox::{
+    HighDomainState, LibvirtSandboxManager, default_recipe_dir, is_supported_profile,
+};
+use hf_core::{HighGuestConnection, HighOsProfile};
 use hf_services::high_telemetry::{
     HighTelemetryStore, SharedHighTelemetryStore, receive_high_telemetry_connection,
 };
@@ -39,7 +42,14 @@ struct HighOperationalSnapshot {
     #[serde(default)]
     vcpu_utilization_percent_total: Option<f64>,
     counters: DomainCounters,
+    /// Kept for compatibility with existing Ubuntu dashboards.  This is false for RDP guests.
+    #[serde(default)]
     ssh_ready: bool,
+    /// Profile-aware readiness for either SSH or RDP.
+    #[serde(default)]
+    guest_service_ready: bool,
+    #[serde(default)]
+    guest_connection: String,
     dnat_ready: bool,
     guest_agent_ready: bool,
     telemetry_channel_present: bool,
@@ -51,8 +61,8 @@ struct HighOperationalSnapshot {
 trait OperationalProbe {
     fn domain_state(&self, trap_id: Uuid) -> anyhow::Result<HighDomainState>;
     fn domstats(&self, trap_id: Uuid) -> anyhow::Result<String>;
-    fn ssh_ready(&self, trap_id: Uuid) -> bool;
-    fn has_dnat(&self, trap_id: Uuid) -> bool;
+    fn guest_service_ready(&self, trap_id: Uuid, profile: HighOsProfile) -> bool;
+    fn publication_ready(&self, trap_id: Uuid, profile: HighOsProfile) -> bool;
     fn guest_agent_ready(&self, trap_id: Uuid) -> bool;
 }
 
@@ -65,12 +75,17 @@ impl OperationalProbe for LibvirtSandboxManager {
         LibvirtSandboxManager::domstats(self, trap_id)
     }
 
-    fn ssh_ready(&self, trap_id: Uuid) -> bool {
-        LibvirtSandboxManager::ssh_ready(self, trap_id)
+    fn guest_service_ready(&self, trap_id: Uuid, profile: HighOsProfile) -> bool {
+        LibvirtSandboxManager::guest_service_is_ready(self, trap_id, profile)
     }
 
-    fn has_dnat(&self, trap_id: Uuid) -> bool {
-        LibvirtSandboxManager::has_dnat(self, trap_id)
+    fn publication_ready(&self, trap_id: Uuid, profile: HighOsProfile) -> bool {
+        self.service_is_published(&crate::sandbox::HighVm::with_profile(
+            trap_id,
+            PathBuf::new(),
+            0,
+            profile,
+        ))
     }
 
     fn guest_agent_ready(&self, trap_id: Uuid) -> bool {
@@ -162,6 +177,9 @@ fn collect_operational_snapshots_with_probe(
             Some(manifest) => manifest,
             None => continue,
         };
+        let Some(profile) = profile_from_manifest(&manifest) else {
+            continue;
+        };
         let state = probe
             .domain_state(trap_id)
             .unwrap_or(HighDomainState::Unknown);
@@ -198,6 +216,8 @@ fn collect_operational_snapshots_with_probe(
             .join(trap_id.to_string())
             .join("telemetry.sock")
             .exists();
+        let guest_service_ready =
+            state == HighDomainState::Running && probe.guest_service_ready(trap_id, profile);
         let snapshot = HighOperationalSnapshot {
             version: 1,
             trap_id,
@@ -213,8 +233,15 @@ fn collect_operational_snapshots_with_probe(
                 &counters,
             ),
             counters,
-            ssh_ready: state == HighDomainState::Running && probe.ssh_ready(trap_id),
-            dnat_ready: probe.has_dnat(trap_id),
+            ssh_ready: matches!(profile.connection, HighGuestConnection::Ssh { .. })
+                && guest_service_ready,
+            guest_service_ready,
+            guest_connection: match profile.connection {
+                HighGuestConnection::Ssh { .. } => "ssh",
+                HighGuestConnection::Rdp { .. } => "rdp",
+            }
+            .into(),
+            dnat_ready: probe.publication_ready(trap_id, profile),
             guest_agent_ready: state == HighDomainState::Running
                 && probe.guest_agent_ready(trap_id),
             telemetry_channel_present,
@@ -229,6 +256,17 @@ fn collect_operational_snapshots_with_probe(
         write_snapshot(&previous_path, &snapshot)?;
     }
     Ok(())
+}
+
+fn profile_from_manifest(manifest: &serde_json::Value) -> Option<HighOsProfile> {
+    let declared = manifest
+        .get("profile")
+        .or_else(|| manifest.pointer("/deployment/profile"));
+    let profile = match declared {
+        Some(value) => serde_json::from_value(value.clone()).ok()?,
+        None => HighOsProfile::ubuntu_ssh(),
+    };
+    is_supported_profile(profile).then_some(profile)
 }
 
 fn vcpu_utilization_percent(
@@ -391,8 +429,8 @@ mod tests {
     struct MockProbe {
         state: HighDomainState,
         stats: String,
-        ssh: bool,
-        dnat: bool,
+        service: bool,
+        publication: bool,
         guest_agent: bool,
     }
 
@@ -405,12 +443,12 @@ mod tests {
             Ok(self.stats.clone())
         }
 
-        fn ssh_ready(&self, _trap_id: Uuid) -> bool {
-            self.ssh
+        fn guest_service_ready(&self, _trap_id: Uuid, _profile: HighOsProfile) -> bool {
+            self.service
         }
 
-        fn has_dnat(&self, _trap_id: Uuid) -> bool {
-            self.dnat
+        fn publication_ready(&self, _trap_id: Uuid, _profile: HighOsProfile) -> bool {
+            self.publication
         }
 
         fn guest_agent_ready(&self, _trap_id: Uuid) -> bool {
@@ -453,8 +491,8 @@ mod tests {
         let first = MockProbe {
             state: HighDomainState::Running,
             stats: "vcpu.current=2\ncpu.time=1000000000\nballoon.current=2048\n".into(),
-            ssh: true,
-            dnat: true,
+            service: true,
+            publication: true,
             guest_agent: true,
         };
         collect_operational_snapshots_with_probe(&root, &store, &first, 10_000).unwrap();
@@ -469,8 +507,48 @@ mod tests {
                 .unwrap();
         assert_eq!(snapshot.domain_state, "running");
         assert_eq!(snapshot.vcpu_utilization_percent_total, Some(50.0));
-        assert!(snapshot.ssh_ready && snapshot.dnat_ready && snapshot.guest_agent_ready);
+        assert!(snapshot.ssh_ready && snapshot.guest_service_ready);
+        assert_eq!(snapshot.guest_connection, "ssh");
+        assert!(snapshot.dnat_ready && snapshot.guest_agent_ready);
         assert_eq!(snapshot.last_error.as_deref(), Some("previous failure"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn operational_collection_uses_rdp_readiness_for_windows_profiles() {
+        let root = std::env::temp_dir().join(format!("hf-high-windows-metrics-{}", Uuid::new_v4()));
+        let trap_id = Uuid::new_v4();
+        let trap_dir = root.join("traps").join(trap_id.to_string());
+        let runtime_dir = root.join("high").join(trap_id.to_string());
+        fs::create_dir_all(&trap_dir).unwrap();
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::write(
+            trap_dir.join("high.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "profile": HighOsProfile::windows_rdp()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(
+            HighTelemetryStore::open(root.join("telemetry.sqlite"), 10).unwrap(),
+        ));
+        let probe = MockProbe {
+            state: HighDomainState::Running,
+            stats: String::new(),
+            service: true,
+            publication: true,
+            guest_agent: false,
+        };
+
+        collect_operational_snapshots_with_probe(&root, &store, &probe, 10_000).unwrap();
+
+        let snapshot: HighOperationalSnapshot =
+            serde_json::from_slice(&fs::read(runtime_dir.join("operational.json")).unwrap())
+                .unwrap();
+        assert!(snapshot.guest_service_ready && snapshot.dnat_ready);
+        assert!(!snapshot.ssh_ready);
+        assert_eq!(snapshot.guest_connection, "rdp");
         fs::remove_dir_all(root).unwrap();
     }
 }

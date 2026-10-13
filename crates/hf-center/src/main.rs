@@ -81,7 +81,7 @@ struct Args {
     /// Statically built Dispatcher artifact. Required before a VPS can host shared-port groups.
     #[arg(long, env = "HF_DISPATCHER_BINARY")]
     dispatcher_binary: Option<PathBuf>,
-    /// Tar.gz with `high-ubuntu-ssh`; copied to a VPS during bootstrap for later High commands.
+    /// Tar.gz with all registered High OS recipes. The legacy environment name is retained.
     #[arg(long, env = "HF_HIGH_UBUNTU_RECIPE_ARCHIVE")]
     high_ubuntu_recipe_archive: Option<PathBuf>,
     /// Statically built Hysteria binary uploaded only during the initial SSH bootstrap.
@@ -515,6 +515,17 @@ async fn bootstrap(
     }
     let token = Uuid::new_v4().to_string();
     let initial_trap_id = request.initial_high_ubuntu.as_ref().map(|_| Uuid::new_v4());
+    if let Some(trap_id) = initial_trap_id {
+        state
+            .agent_security
+            .lock()
+            .await
+            .register_trap(agent_id, trap_id)
+            .map_err(|error| {
+                tracing::error!(%error, %agent_id, %trap_id, "could not persist initial High trap ownership");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
     let initial_command_json = match (request.initial_high_ubuntu, initial_trap_id) {
         (Some(high), Some(trap_id)) => Some(
             serde_json::to_vec(&AgentCommand::DeployHighUbuntu(HighUbuntuDeployment {
@@ -790,6 +801,8 @@ async fn queue_command(
     let deploys_isolated = match &command {
         AgentCommand::DeployKozyavka(item) => security.is_trap_isolated(item.trap_id),
         AgentCommand::DeployPritvoryashka(item) => security.is_trap_isolated(item.trap_id),
+        AgentCommand::DeployHighVm(item) => security.is_trap_isolated(item.trap_id),
+        AgentCommand::DeployHighUbuntu(item) => security.is_trap_isolated(item.trap_id),
         AgentCommand::ReconcileTcpPortGroup(group) => group.members.iter().any(|member| security.is_trap_isolated(member.trap_id)),
         _ => false,
     };
@@ -819,7 +832,18 @@ async fn queue_command(
             security.register_trap(agent_id, deployment.trap_id)
                 .map_err(|error| { warn!(%error, "could not persist trap ownership"); StatusCode::INTERNAL_SERVER_ERROR })?;
         }
-        AgentCommand::StopTrap { trap_id, .. } | AgentCommand::RemoveTrap { trap_id, .. } => {
+        AgentCommand::DeployHighVm(deployment) => {
+            security.register_trap(agent_id, deployment.trap_id)
+                .map_err(|error| { warn!(%error, "could not persist High trap ownership"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        }
+        AgentCommand::DeployHighUbuntu(deployment) => {
+            security.register_trap(agent_id, deployment.trap_id)
+                .map_err(|error| { warn!(%error, "could not persist High trap ownership"); StatusCode::INTERNAL_SERVER_ERROR })?;
+        }
+        AgentCommand::ResetHighVm { trap_id, .. }
+        | AgentCommand::ResetHighUbuntu { trap_id, .. }
+        | AgentCommand::StopTrap { trap_id, .. }
+        | AgentCommand::RemoveTrap { trap_id, .. } => {
             if !security.owns_trap(agent_id, *trap_id) { return Err(StatusCode::NOT_FOUND); }
         }
         _ => {}
@@ -1266,7 +1290,7 @@ fn render_install_script(token: &str, center_url: &str) -> String {
         "#!/bin/sh\nset -eu\nif [ \"$(id -u)\" -eq 0 ]; then SUDO=''; else SUDO='sudo -n'; fi\nensure_docker() {{\n  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then return; fi\n  [ -r /etc/os-release ] || {{ echo 'Cannot identify Linux distribution' >&2; exit 1; }}\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        echo 'Regional Ubuntu mirror configured; switching to archive.ubuntu.com before package update' >&2\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 bpftrace nftables\n      $SUDO systemctl enable --now docker\n      ;;\n    fedora)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    rhel|centos|rocky|almalinux)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    arch|manjaro)\n      $SUDO pacman -Sy --noconfirm docker docker-compose\n      $SUDO systemctl enable --now docker\n      ;;\n    alpine)\n      $SUDO apk add docker docker-cli-compose\n      $SUDO rc-update add docker default\n      $SUDO service docker start\n      ;;\n    *) echo \"Unsupported Linux distribution: $ID\" >&2; exit 1 ;;\n  esac\n  docker compose version >/dev/null\n}}\nif ! command -v bpftrace >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1; then\n  if [ ! -r /etc/os-release ]; then echo 'Cannot identify Linux distribution' >&2; exit 1; fi\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y bpftrace nftables\n      ;;\n    *) echo 'Install bpftrace and nftables for HoneyForge security monitoring' >&2 ;;\n  esac\nfi\n$SUDO install -d -m 0700 /etc/honeyforge\n$SUDO install -m 0755 /tmp/hf-agent-bootstrap /usr/local/bin/hf-agent\nif [ -f /tmp/hf-kozyavka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-kozyavka-image.tar\n  rm -f /tmp/hf-kozyavka-image.tar\nfi\nprintf '%s' '{token}' | $SUDO tee /etc/honeyforge/enrollment-token >/dev/null\nif command -v systemctl >/dev/null 2>&1; then\n  $SUDO tee /etc/systemd/system/hf-agent.service >/dev/null <<'UNIT'\n[Unit]\nDescription=HoneyForge agent\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nEnvironment=HF_CENTER_URL={center_url}\nEnvironment=HF_KOZYAVKA_IMAGE=honeyforge-low:local\nExecStart=/usr/local/bin/hf-agent\nRestart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\nUNIT\n  $SUDO systemctl daemon-reload\n  $SUDO systemctl enable --now hf-agent.service\nelif command -v rc-update >/dev/null 2>&1; then\n  $SUDO tee /etc/init.d/hf-agent >/dev/null <<'OPENRC'\n#!/sbin/openrc-run\nname=\"HoneyForge agent\"\ncommand=\"/usr/local/bin/hf-agent\"\ncommand_background=\"yes\"\npidfile=\"/run/hf-agent.pid\"\nexport HF_CENTER_URL={center_url}\nexport HF_KOZYAVKA_IMAGE=honeyforge-low:local\nOPENRC\n  $SUDO chmod 0755 /etc/init.d/hf-agent\n  $SUDO rc-update add hf-agent default\n  $SUDO rc-service hf-agent start\nelse\n  echo 'Unsupported init system: systemd or OpenRC is required' >&2\n  exit 1\nfi\nrm -f /tmp/hf-agent-bootstrap\n"
     );
     script.push_str(
-        "\nif [ -f /tmp/hf-high-ubuntu-ssh.tar.gz ]; then\n  $SUDO install -d -m 0755 /usr/local/lib/honeyforge\n  $SUDO tar -xzf /tmp/hf-high-ubuntu-ssh.tar.gz -C /usr/local/lib/honeyforge\n  $SUDO chmod -R a-w /usr/local/lib/honeyforge/high-ubuntu-ssh/cloud-init\n  $SUDO find /usr/local/lib/honeyforge/high-ubuntu-ssh/scripts -type f -exec chmod 0755 {} \\;\n  rm -f /tmp/hf-high-ubuntu-ssh.tar.gz\nfi\nif [ -f /tmp/hf-initial-command.json ]; then\n  $SUDO install -d -m 0700 /var/lib/honeyforge/inbox\n  $SUDO install -m 0600 /tmp/hf-initial-command.json /var/lib/honeyforge/inbox/initial-high.json\n  rm -f /tmp/hf-initial-command.json\nfi\n",
+        "\nif [ -f /tmp/hf-high-ubuntu-ssh.tar.gz ]; then\n  $SUDO install -d -m 0755 /usr/local/lib/honeyforge\n  $SUDO tar -xzf /tmp/hf-high-ubuntu-ssh.tar.gz -C /usr/local/lib/honeyforge\n  for recipe in /usr/local/lib/honeyforge/high-*; do\n    [ -d \"$recipe\" ] || continue\n    [ -d \"$recipe/cloud-init\" ] && $SUDO chmod -R a-w \"$recipe/cloud-init\"\n    [ -d \"$recipe/scripts\" ] && $SUDO find \"$recipe/scripts\" -type f -exec chmod 0755 {} \\;\n  done\n  rm -f /tmp/hf-high-ubuntu-ssh.tar.gz\nfi\nif [ -f /tmp/hf-initial-command.json ]; then\n  $SUDO install -d -m 0700 /var/lib/honeyforge/inbox\n  $SUDO install -m 0600 /tmp/hf-initial-command.json /var/lib/honeyforge/inbox/initial-high.json\n  rm -f /tmp/hf-initial-command.json\nfi\n",
     );
     script.push_str("\nif [ -f /tmp/hysteria-bootstrap ]; then\n  $SUDO install -m 0755 /tmp/hysteria-bootstrap /usr/local/bin/hysteria\n  rm -f /tmp/hysteria-bootstrap\nfi\nif [ -f /tmp/hf-pritvoryashka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-pritvoryashka-image.tar\n  rm -f /tmp/hf-pritvoryashka-image.tar\nfi\n");
     script
@@ -1356,7 +1380,7 @@ fn run_ssh_install(
     }
     if let Some(archive) = high_ubuntu_recipe_archive {
         upload_file(&session, &archive, "/tmp/hf-high-ubuntu-ssh.tar.gz", 0o600)?;
-        debug!(host = %target.host, "High Ubuntu recipe archive upload completed");
+        debug!(host = %target.host, "High OS recipe archive upload completed");
     }
     if let Some(binary) = hysteria_binary {
         upload_file(&session, &binary, "/tmp/hysteria-bootstrap", 0o700)?;

@@ -3,13 +3,17 @@ import json
 import os
 import stat
 import subprocess
+import tarfile
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
 RECIPE = Path(__file__).resolve().parents[1]
 SCRIPTS = RECIPE / "scripts"
+ARCH_RECIPE = RECIPE.parent / "high-arch-ssh"
+WINDOWS_RECIPE = RECIPE.parent / "high-windows-rdp"
 
 
 def executable(path, body):
@@ -91,6 +95,148 @@ class CloudInitGenerationTests(unittest.TestCase):
         agent_main = (RECIPE.parents[1] / "crates/hf-agent/src/main.rs").read_text(encoding="utf-8")
         self.assertNotIn("high_telemetry_store.prepare_kazik_batch", agent_main)
         self.assertNotIn("high_telemetry_store.acknowledge_durable_kazik_batch", agent_main)
+
+
+class MultiOsRecipeTests(unittest.TestCase):
+    def test_arch_cloud_init_embeds_both_valid_python_modules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            executable(fake_bin / "qemu-img", "#!/bin/sh\n: > \"$8\"\n")
+            executable(fake_bin / "cloud-localds", "#!/bin/sh\nshift\n: > \"$1\"\n")
+            base_image = root / "arch.qcow2"
+            base_image.write_bytes(b"test base")
+            instance = root / "instance"
+            environment = dict(os.environ)
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+            subprocess.run(
+                [
+                    "sh",
+                    str(ARCH_RECIPE / "scripts/create-overlay.sh"),
+                    str(base_image),
+                    str(instance),
+                    "11111111-2222-4333-8444-555555555555",
+                ],
+                check=True,
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+
+            user_data = (instance / "user-data").read_text(encoding="utf-8")
+            self.assertNotIn("@@", user_data)
+            files = embedded_files(user_data)
+            sensor = files["/usr/local/lib/honeyforge/high-telemetry-sensor"]
+            audit = files["/usr/local/lib/honeyforge/high_telemetry_audit.py"]
+            self.assertEqual(sensor, (RECIPE / "guest/high_telemetry_sensor.py").read_bytes())
+            self.assertEqual(audit, (RECIPE / "guest/high_telemetry_audit.py").read_bytes())
+            compile(sensor, "arch-sensor", "exec")
+            compile(audit, "arch-audit", "exec")
+
+    def test_windows_answer_file_is_unattended_and_sets_the_admin_password(self):
+        answer = WINDOWS_RECIPE / "autounattend.xml"
+        document = ET.parse(answer)
+        namespace = {"u": "urn:schemas-microsoft-com:unattend"}
+        self.assertIsNotNone(document.find(".//u:DiskConfiguration", namespace))
+        self.assertIsNotNone(document.find(".//u:ImageInstall", namespace))
+        self.assertIsNotNone(document.find(".//u:AdministratorPassword", namespace))
+        contents = answer.read_text(encoding="utf-8")
+        self.assertEqual(contents.count("@@ADMIN_PASSWORD@@"), 1)
+        self.assertIn("Microsoft-Windows-TerminalServices-LocalSessionManager", contents)
+        self.assertNotIn("<AutoLogon>", contents)
+
+    def test_windows_answer_file_generation_removes_markers_and_protects_password(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            executable(fake_bin / "qemu-img", "#!/bin/sh\n: > \"$4\"\n")
+            executable(
+                fake_bin / "xorriso",
+                "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n"
+                "  if [ \"$1\" = -o ]; then shift; : > \"$1\"; exit 0; fi\n"
+                "  shift\n"
+                "done\nexit 1\n",
+            )
+            base_iso = root / "windows.iso"
+            base_iso.write_bytes(b"test media")
+            instance = root / "instance"
+            environment = dict(os.environ)
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+            subprocess.run(
+                [
+                    "sh",
+                    str(WINDOWS_RECIPE / "scripts/create-overlay.sh"),
+                    str(base_iso),
+                    str(instance),
+                    "11111111-2222-4333-8444-555555555555",
+                ],
+                check=True,
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+
+            password_file = instance / "rdp-password"
+            password = password_file.read_text(encoding="utf-8").strip()
+            answer = (instance / "Autounattend.xml").read_text(encoding="utf-8")
+            self.assertGreaterEqual(len(password), 24)
+            self.assertNotIn("@@", answer)
+            self.assertEqual(answer.count(password), 1)
+            self.assertEqual(stat.S_IMODE(password_file.stat().st_mode), 0o600)
+            self.assertTrue((instance / "seed.iso").is_file())
+
+    def test_registered_multi_os_recipe_scripts_are_present_and_valid(self):
+        required = {
+            "launch.sh",
+            "create-overlay.sh",
+            "create-network.sh",
+            "firewall-common.sh",
+            "publish-service.sh",
+            "unpublish-service.sh",
+            "check-publication.sh",
+            "stop.sh",
+            "reset.sh",
+            "download-base-image.sh",
+        }
+        for recipe in (ARCH_RECIPE, WINDOWS_RECIPE):
+            scripts = recipe / "scripts"
+            self.assertTrue(required.issubset({path.name for path in scripts.glob("*.sh")}))
+            for script in scripts.glob("*.sh"):
+                subprocess.run(["sh", "-n", str(script)], check=True)
+
+    def test_new_downloaders_require_https_and_sha256(self):
+        for recipe in (ARCH_RECIPE, WINDOWS_RECIPE):
+            script = (recipe / "scripts/download-base-image.sh").read_text(encoding="utf-8")
+            self.assertIn("https://", script)
+            self.assertIn("sha256sum", script)
+            self.assertIn("checksum mismatch", script)
+
+    def test_profile_wrappers_publish_the_expected_guest_ports(self):
+        arch = (ARCH_RECIPE / "scripts/publish-service.sh").read_text(encoding="utf-8")
+        windows = (WINDOWS_RECIPE / "scripts/publish-service.sh").read_text(encoding="utf-8")
+        self.assertIn('"$2" 22', arch)
+        self.assertIn('"$2" 3389', windows)
+        self.assertIn("listen=127.0.0.1", (WINDOWS_RECIPE / "scripts/launch.sh").read_text())
+
+    def test_recipe_bundle_contains_all_registered_os_adapters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "high-recipes.tar.gz"
+            subprocess.run(
+                ["sh", str(SCRIPTS / "package-recipe.sh"), str(archive)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            with tarfile.open(archive) as bundle:
+                names = {member.name.split("/", 1)[0] for member in bundle.getmembers()}
+            self.assertEqual(
+                names,
+                {"high-ubuntu-ssh", "high-arch-ssh", "high-windows-rdp"},
+            )
 
 
 class FirewallPolicyTests(unittest.TestCase):
@@ -223,6 +369,23 @@ for chain, rules in state.get("iptables:nat", {}).items():
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("reserved for host management", result.stderr)
+
+    def test_publication_supports_a_profile_specific_guest_service_port(self):
+        self.run_script("create-network.sh")
+        trap_id = "11111111-2222-4333-8444-555555555555"
+        instance = self.root / "high" / trap_id
+        instance.mkdir(parents=True)
+        (instance / "external-ssh-port").write_text("23389\n", encoding="ascii")
+
+        self.run_script("publish-ssh.sh", trap_id, "23389", "3389")
+        self.run_script("check-dnat.sh", trap_id)
+        published = json.loads(self.state.read_text())
+        self.assertIn("192.168.250.100:3389", json.dumps(published["iptables:nat"]))
+        self.assertEqual((instance / "guest-service-port").read_text().strip(), "3389")
+
+        self.run_script("unpublish-ssh.sh", trap_id)
+        unpublished = json.loads(self.state.read_text())
+        self.assertNotIn("192.168.250.100:3389", json.dumps(unpublished))
 
     def test_mismatched_existing_libvirt_network_is_rejected(self):
         self.environment["FAKE_BAD_NETWORK"] = "1"
