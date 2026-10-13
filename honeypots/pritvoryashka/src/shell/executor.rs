@@ -5,6 +5,7 @@ use crate::{
     filesystem::{FsError, VirtualFileSystem, node::Node},
 };
 
+use super::model::{VirtualCommand, VirtualInteraction, VirtualServer};
 use super::parser;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +28,7 @@ pub struct ShellOutput {
     pub close: bool,
     pub fs_actions: Vec<FsAction>,
     pub deception: Option<Transition>,
+    pub virtual_interactions: Vec<VirtualInteraction>,
 }
 
 #[derive(Clone)]
@@ -37,19 +39,25 @@ pub struct Shell {
     history: Vec<String>,
     fs: VirtualFileSystem,
     deception: DeceptionEngine,
+    virtual_server: VirtualServer,
     max_input_bytes: usize,
     started_at: DateTime<Utc>,
 }
 
 impl Shell {
     pub fn new(hostname: &str, max_input_bytes: usize, now: DateTime<Utc>) -> Self {
+        let mut fs = VirtualFileSystem::linux(hostname, now);
+        let virtual_server = VirtualServer::new(&mut fs, now);
+        let history = VirtualServer::initial_history();
+        virtual_server.sync_history(&mut fs, &history, now);
         Self {
             cwd: "/home/admin".into(),
             user: "admin".into(),
             hostname: hostname.into(),
-            history: Vec::new(),
-            fs: VirtualFileSystem::linux(hostname, now),
+            history,
+            fs,
             deception: DeceptionEngine::default(),
+            virtual_server,
             max_input_bytes,
             started_at: now,
         }
@@ -95,6 +103,8 @@ impl Shell {
             if self.history.len() > 1000 {
                 self.history.remove(0);
             }
+            self.virtual_server
+                .sync_history(&mut self.fs, &self.history, now);
         }
         let words = match parser::parse(line, self.max_input_bytes) {
             Ok(words) => words,
@@ -104,44 +114,74 @@ impl Shell {
             return ShellOutput::default();
         };
         let deception = self.deception.observe(command, args, &mut self.fs, now);
-        let mut result = match command.as_str() {
-            "pwd" => success(format!("{}\n", self.cwd)),
-            "cd" => self.cd(args),
-            "ls" => self.ls(args),
-            "cat" => self.cat(args),
-            "echo" => success(format!("{}\n", self.expand_environment(args).join(" "))),
-            "whoami" => success(format!("{}\n", self.user)),
-            "id" => success("uid=1000(admin) gid=1000(admin) groups=1000(admin),27(sudo)\n"),
-            "uname" => self.uname(args),
-            "hostname" => success(format!("{}\n", self.hostname)),
-            "date" => success(format!("{}\n", now.format("%a %b %e %T UTC %Y"))),
-            "uptime" => self.uptime(now),
-            "ps" => success(
-                "  PID TTY          TIME CMD\n 1312 pts/0    00:00:00 bash\n 1488 pts/0    00:00:00 ps\n",
-            ),
-            "top" => success(
-                "top - 12:41:08 up 17 days,  3:22,  1 user,  load average: 0.08, 0.04, 0.01\nTasks:  91 total,   1 running,  90 sleeping,   0 stopped,   0 zombie\n%Cpu(s):  1.0 us,  0.3 sy, 98.7 id\nMiB Mem :   3930.0 total,   1124.2 free,    842.1 used,   1963.7 buff/cache\n\n  PID USER      PR  NI    VIRT    RES S  %CPU  %MEM COMMAND\n 1312 admin     20   0   10432   5360 S   0.0   0.1 bash\n",
-            ),
-            "history" => self.history(),
-            "mkdir" => self.mkdir(args, now),
-            "touch" => self.touch(args, now),
-            "rm" => self.rm(args),
-            "cp" => self.copy_move(args, now, false),
-            "mv" => self.copy_move(args, now, true),
-            "head" => self.head_tail(args, true),
-            "tail" => self.head_tail(args, false),
-            "grep" => self.grep(args),
-            "find" => self.find(args),
-            "clear" => success("\u{1b}[2J\u{1b}[H"),
-            "exit" | "logout" => ShellOutput {
-                output: "logout\n".into(),
-                close: true,
-                ..ShellOutput::default()
-            },
-            _ => failure(format!("bash: {command}: command not found\n")),
+        let virtual_command =
+            self.virtual_server
+                .execute(command, args, &self.cwd, &mut self.fs, now);
+        let mut result = if let Some(result) = virtual_command {
+            shell_output(result)
+        } else {
+            match command.as_str() {
+                "pwd" => success(format!("{}\n", self.cwd)),
+                "cd" => self.cd(args),
+                "ls" => self.ls(args),
+                "cat" => self.cat(args),
+                "echo" => success(format!("{}\n", self.expand_environment(args).join(" "))),
+                "whoami" => success(format!("{}\n", self.user)),
+                "id" => success("uid=1000(admin) gid=1000(admin) groups=1000(admin),27(sudo)\n"),
+                "uname" => self.uname(args),
+                "hostname" => success(format!("{}\n", self.hostname)),
+                "date" => success(format!("{}\n", now.format("%a %b %e %T UTC %Y"))),
+                "uptime" => self.uptime(now),
+                "history" => self.history(),
+                "mkdir" => self.mkdir(args, now),
+                "touch" => self.touch(args, now),
+                "rm" => self.rm(args),
+                "cp" => self.copy_move(args, now, false),
+                "mv" => self.copy_move(args, now, true),
+                "head" => self.head_tail(args, true),
+                "tail" => self.head_tail(args, false),
+                "grep" => self.grep(args),
+                "find" => self.find(args),
+                "clear" => success("\u{1b}[2J\u{1b}[H"),
+                "exit" | "logout" => ShellOutput {
+                    output: "logout\n".into(),
+                    close: true,
+                    ..ShellOutput::default()
+                },
+                _ => failure(format!("bash: {command}: command not found\n")),
+            }
         };
         for action in &result.fs_actions {
             self.deception.record_object(&action.path);
+        }
+        let inferred_interactions = result
+            .fs_actions
+            .iter()
+            .filter_map(|action| {
+                bait_for_path(&action.path).map(|bait| VirtualInteraction {
+                    bait,
+                    action: action.operation.into(),
+                    target: Some(action.path.clone()),
+                    success: result.exit_status == 0,
+                })
+            })
+            .collect::<Vec<_>>();
+        for interaction in inferred_interactions {
+            if !result
+                .virtual_interactions
+                .iter()
+                .any(|existing| existing.bait == interaction.bait)
+            {
+                result.virtual_interactions.push(interaction);
+            }
+        }
+        if command == "history" {
+            result.virtual_interactions.push(VirtualInteraction {
+                bait: "history",
+                action: "list".into(),
+                target: Some("/home/admin/.bash_history".into()),
+                success: result.exit_status == 0,
+            });
         }
         result.deception = deception;
         result
@@ -465,6 +505,51 @@ impl Shell {
             "find",
             path,
         )
+    }
+}
+
+fn shell_output(command: VirtualCommand) -> ShellOutput {
+    ShellOutput {
+        output: command.output,
+        exit_status: command.exit_status,
+        fs_actions: command
+            .artifacts
+            .into_iter()
+            .map(|action| FsAction {
+                kind: if action.modified {
+                    FsActionKind::Modified
+                } else {
+                    FsActionKind::Accessed
+                },
+                operation: action.operation,
+                path: action.path,
+            })
+            .collect(),
+        virtual_interactions: vec![command.interaction],
+        ..ShellOutput::default()
+    }
+}
+
+fn bait_for_path(path: &str) -> Option<&'static str> {
+    if path.starts_with("/proc/") || path == "/proc" {
+        Some("processes")
+    } else if path == "/home/admin/.bash_history" {
+        Some("history")
+    } else if path.contains("authorized_keys") || path.starts_with("/var/spool/cron") {
+        Some("persistence")
+    } else if path.starts_with("/var/backups/") {
+        Some("backups")
+    } else if path.starts_with("/srv/billing-api/.env")
+        || path == "/home/admin/.ssh/id_deploy"
+        || path == "/home/admin/.ssh/config"
+        || path.starts_with("/root/.aws/")
+        || path.starts_with("/etc/billing/")
+    {
+        Some("secrets")
+    } else if path.starts_with("/srv/billing-api/") {
+        Some("git")
+    } else {
+        None
     }
 }
 

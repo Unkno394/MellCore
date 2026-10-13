@@ -158,6 +158,17 @@ impl Handler {
                 json!({"operation":action.operation,"path":action.path}),
             );
         }
+        for interaction in &result.virtual_interactions {
+            self.telemetry.emit(
+                "deception.interaction",
+                json!({
+                    "bait":interaction.bait,
+                    "action":interaction.action,
+                    "target":interaction.target,
+                    "success":interaction.success
+                }),
+            );
+        }
         if let Some(change) = &result.deception {
             self.telemetry.emit(
                 "deception.triggered",

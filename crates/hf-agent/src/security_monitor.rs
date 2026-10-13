@@ -149,9 +149,45 @@ mod action_tests {
             Some(KernelAction::Open(12, -13, "/run/docker.sock"))));
         assert!(matches!(parse_kernel_action("HF_CONNECT 44 -115 3 2 47873 16777343 0 0 0"),
             Some(KernelAction::Connect(44, -115, 3, 2, 47873, 16777343, 0, 0, 0))));
-        assert_eq!(format_connect_destination(2, 47873, [16777343, 0, 0, 0]), "network:ipv4:127.0.0.1:443");
-        assert_eq!(format_connect_destination(10, 47873, [16777216, 0, 0, 0]), "network:ipv6:[::1]:443");
         assert!(parse_kernel_action("HF_OPEN fake 0 /run/docker.sock").is_none());
+    }
+
+    fn native_word(octets: [u8; 4]) -> u32 {
+        u32::from_ne_bytes(octets)
+    }
+
+    #[test]
+    fn formats_ipv4_words_read_from_sockaddr_memory() {
+        assert_eq!(
+            format_connect_destination(2, u16::from_ne_bytes([1, 187]), [
+                native_word([127, 0, 0, 1]), 0, 0, 0,
+            ]),
+            "network:ipv4:127.0.0.1:443"
+        );
+        assert_eq!(
+            format_connect_destination(2, u16::from_ne_bytes([31, 144]), [
+                native_word([192, 0, 2, 10]), 0, 0, 0,
+            ]),
+            "network:ipv4:192.0.2.10:8080"
+        );
+    }
+
+    #[test]
+    fn formats_ipv6_words_read_from_sockaddr_memory() {
+        assert_eq!(
+            format_connect_destination(10, u16::from_ne_bytes([1, 187]), [
+                native_word([0, 0, 0, 0]), native_word([0, 0, 0, 0]),
+                native_word([0, 0, 0, 0]), native_word([0, 0, 0, 1]),
+            ]),
+            "network:ipv6:[::1]:443"
+        );
+        assert_eq!(
+            format_connect_destination(10, u16::from_ne_bytes([31, 144]), [
+                native_word([0x20, 0x01, 0x0d, 0xb8]), native_word([0, 0, 0, 0]),
+                native_word([0, 0, 0, 0]), native_word([0, 0, 0, 1]),
+            ]),
+            "network:ipv6:[2001:db8::1]:8080"
+        );
     }
 }
 
@@ -198,15 +234,16 @@ fn apply_action(observation: &mut SecurityObservation, action: &KernelAction<'_>
 }
 
 fn format_connect_destination(family_raw: u16, port_raw: u16, address_raw: [u32; 4]) -> String {
-    // sockaddr family is native-endian; port and address fields are network-endian.
+    // bpftrace reads sockaddr fields as native integers. Preserve each word's
+    // in-memory byte order before constructing the network address.
     let family = family_raw;
     let port = u16::from_be(port_raw);
     match family {
-        2 => format!("network:ipv4:{}:{port}", std::net::Ipv4Addr::from(u32::from_be(address_raw[0]))),
+        2 => format!("network:ipv4:{}:{port}", std::net::Ipv4Addr::from(address_raw[0].to_ne_bytes())),
         10 => {
             let mut octets = [0_u8; 16];
             for (index, word) in address_raw.into_iter().enumerate() {
-                octets[index * 4..index * 4 + 4].copy_from_slice(&u32::from_be(word).to_be_bytes());
+                octets[index * 4..index * 4 + 4].copy_from_slice(&word.to_ne_bytes());
             }
             format!("network:ipv6:[{}]:{port}", std::net::Ipv6Addr::from(octets))
         }

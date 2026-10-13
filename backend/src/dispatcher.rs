@@ -29,13 +29,20 @@ pub fn plan_tcp_port_group(
     if listener_port == 0 || candidates.is_empty() {
         return Err("a shared listener needs a port and at least one trap");
     }
-    if candidates.iter().map(|candidate| u16::from(candidate.weight)).sum::<u16>() != 100
+    if candidates
+        .iter()
+        .map(|candidate| u16::from(candidate.weight))
+        .sum::<u16>()
+        != 100
         || candidates.iter().any(|candidate| candidate.weight == 0)
     {
         return Err("dispatcher group weights must total exactly 100");
     }
     let mut unique = HashSet::new();
-    if candidates.iter().any(|candidate| !unique.insert(candidate.trap_id)) {
+    if candidates
+        .iter()
+        .any(|candidate| !unique.insert(candidate.trap_id))
+    {
         return Err("a trap appears more than once in the dispatcher group");
     }
     let mut unavailable = occupied_backend_ports.clone();
@@ -84,14 +91,24 @@ mod tests {
         let command = plan_tcp_port_group(
             1488,
             &[
-                GroupCandidate { trap_id: first, weight: 50, trap_kind: SharedTcpTrapKind::Kozyavka },
-                GroupCandidate { trap_id: second, weight: 50, trap_kind: SharedTcpTrapKind::Kozyavka },
+                GroupCandidate {
+                    trap_id: first,
+                    weight: 50,
+                    trap_kind: SharedTcpTrapKind::Kozyavka,
+                },
+                GroupCandidate {
+                    trap_id: second,
+                    weight: 50,
+                    trap_kind: SharedTcpTrapKind::Kozyavka,
+                },
             ],
             &HashSet::from([31_000]),
             &HashMap::new(),
         )
         .unwrap();
-        let AgentCommand::ReconcileTcpPortGroup(group) = command else { panic!("wrong command") };
+        let AgentCommand::ReconcileTcpPortGroup(group) = command else {
+            panic!("wrong command")
+        };
         assert_eq!(group.listener_port, 1488);
         assert_eq!(group.members[0].backend_port, 31_001);
         assert_eq!(group.members[1].backend_port, 31_002);
