@@ -44,6 +44,6 @@ if command -v curl >/dev/null 2>&1; then
 else
   wget --https-only --tries=3 -O "$tmp" "$image_url"
 fi
-verify_image "$tmp" || { echo 'downloaded Arch image verification failed' >&2; exit 1; }
+verify_image "$tmp" || { echo 'downloaded Arch image checksum mismatch or QCOW2 validation failed' >&2; exit 1; }
 chmod 0600 "$tmp"
 mv "$tmp" "$destination"

@@ -198,8 +198,37 @@ pub struct HighUbuntuDeployment {
 #[serde(rename_all = "snake_case")]
 pub enum HighGuestOs {
     Ubuntu,
+    Debian,
     ArchLinux,
     Windows,
+    CustomLinux,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HighImageFormat {
+    Qcow2,
+    Iso,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HighImageArchitecture {
+    X86_64,
+    Aarch64,
+    #[serde(other)]
+    Unknown,
+}
+
+/// An operator-supplied immutable image. A trusted digest is mandatory: transport TLS alone does
+/// not prove that a mutable third-party URL still contains the reviewed artefact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HighImageSource {
+    pub url: String,
+    pub sha256: String,
+    pub format: HighImageFormat,
+    pub architecture: HighImageArchitecture,
 }
 
 /// The immutable artefact expected before an OS adapter starts a VM.
@@ -219,6 +248,10 @@ pub enum HighImagePreparation {
     OfflineGuestPreparation,
     UnattendedInstall,
     Sysprep,
+    /// Boots isolated installation media and probes the declared guest service. Success depends
+    /// on the media providing its own unattended mechanism; arbitrary installers are not claimed
+    /// to be universally automatable.
+    BestEffortInstall,
 }
 
 /// The service published externally by a High guest.
@@ -258,6 +291,15 @@ impl HighOsProfile {
         }
     }
 
+    pub const fn debian_ssh() -> Self {
+        Self {
+            guest_os: HighGuestOs::Debian,
+            image_kind: HighImageKind::CloudImage,
+            image_preparation: HighImagePreparation::CloudInitSeed,
+            connection: HighGuestConnection::Ssh { guest_port: 22 },
+        }
+    }
+
     pub const fn windows_rdp() -> Self {
         Self {
             guest_os: HighGuestOs::Windows,
@@ -276,6 +318,24 @@ impl HighOsProfile {
             connection: HighGuestConnection::Rdp { guest_port: 3389 },
         }
     }
+
+    pub const fn custom_linux_qcow2_ssh() -> Self {
+        Self {
+            guest_os: HighGuestOs::CustomLinux,
+            image_kind: HighImageKind::CloudImage,
+            image_preparation: HighImagePreparation::CloudInitSeed,
+            connection: HighGuestConnection::Ssh { guest_port: 22 },
+        }
+    }
+
+    pub const fn custom_linux_iso_ssh() -> Self {
+        Self {
+            guest_os: HighGuestOs::CustomLinux,
+            image_kind: HighImageKind::InstallMediaAndDisk,
+            image_preparation: HighImagePreparation::BestEffortInstall,
+            connection: HighGuestConnection::Ssh { guest_port: 22 },
+        }
+    }
 }
 
 /// Common High deployment contract used by all OS adapters.
@@ -289,6 +349,8 @@ pub struct HighVmDeployment {
     pub external_service_port: u16,
     #[serde(default = "HighOsProfile::ubuntu_ssh")]
     pub profile: HighOsProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_source: Option<HighImageSource>,
 }
 
 impl From<HighUbuntuDeployment> for HighVmDeployment {
@@ -299,6 +361,7 @@ impl From<HighUbuntuDeployment> for HighVmDeployment {
             base_image: value.base_image,
             external_service_port: value.external_ssh_port,
             profile: HighOsProfile::ubuntu_ssh(),
+            image_source: None,
         }
     }
 }
@@ -523,9 +586,12 @@ mod tests {
     fn high_profiles_round_trip_without_losing_adapter_contract() {
         for profile in [
             HighOsProfile::ubuntu_ssh(),
+            HighOsProfile::debian_ssh(),
             HighOsProfile::arch_linux_ssh(),
             HighOsProfile::windows_rdp(),
             HighOsProfile::windows_rdp_legacy_iso(),
+            HighOsProfile::custom_linux_qcow2_ssh(),
+            HighOsProfile::custom_linux_iso_ssh(),
         ] {
             let encoded = serde_json::to_vec(&profile).unwrap();
             assert_eq!(
@@ -549,5 +615,31 @@ mod tests {
         assert_eq!(generic.base_image, legacy.base_image);
         assert_eq!(generic.external_service_port, legacy.external_ssh_port);
         assert_eq!(generic.profile, HighOsProfile::ubuntu_ssh());
+        assert!(generic.image_source.is_none());
+    }
+
+    #[test]
+    fn custom_image_source_round_trip_preserves_integrity_contract() {
+        let deployment = HighVmDeployment {
+            command_id: Uuid::new_v4(),
+            trap_id: Uuid::new_v4(),
+            base_image: String::new(),
+            external_service_port: 2222,
+            profile: HighOsProfile::debian_ssh(),
+            image_source: Some(HighImageSource {
+                url: "https://images.example.invalid/debian.qcow2".into(),
+                sha256: "a".repeat(64),
+                format: HighImageFormat::Qcow2,
+                architecture: HighImageArchitecture::X86_64,
+            }),
+        };
+        let encoded = serde_json::to_vec(&deployment).unwrap();
+        let decoded: HighVmDeployment = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.image_source, deployment.image_source);
+        assert_eq!(decoded.profile, HighOsProfile::debian_ssh());
+
+        let unsupported: HighImageArchitecture =
+            serde_json::from_str("\"sparc64\"").unwrap();
+        assert_eq!(unsupported, HighImageArchitecture::Unknown);
     }
 }

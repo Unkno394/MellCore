@@ -235,7 +235,13 @@ class MultiOsRecipeTests(unittest.TestCase):
                 names = {member.name.split("/", 1)[0] for member in bundle.getmembers()}
             self.assertEqual(
                 names,
-                {"high-ubuntu-ssh", "high-arch-ssh", "high-windows-rdp"},
+                {
+                    "high-ubuntu-ssh",
+                    "high-debian-ssh",
+                    "high-arch-ssh",
+                    "high-windows-rdp",
+                    "high-custom-iso",
+                },
             )
 
 

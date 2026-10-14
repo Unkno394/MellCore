@@ -53,7 +53,8 @@ for filename, tag in [('low.tar', 'honeyforge-low:local'),
 
 with tarfile.open(root / 'hf-high-ubuntu-ssh.tar.gz') as archive:
     members = archive.getmembers()
-    allowed_roots = ('high-ubuntu-ssh', 'high-arch-ssh', 'high-windows-rdp')
+    allowed_roots = ('high-ubuntu-ssh', 'high-debian-ssh', 'high-arch-ssh',
+                     'high-windows-rdp', 'high-custom-iso')
     if not members or any(
         not any(member.name == recipe or member.name.startswith(recipe + '/') for recipe in allowed_roots)
         for member in members
@@ -68,8 +69,12 @@ with tarfile.open(root / 'hf-high-ubuntu-ssh.tar.gz') as archive:
         'high-ubuntu-ssh/scripts/create-overlay.sh', 'high-ubuntu-ssh/cloud-init/user-data',
         'high-arch-ssh/scripts/launch.sh', 'high-arch-ssh/scripts/download-base-image.sh',
         'high-arch-ssh/cloud-init/user-data',
+        'high-debian-ssh/scripts/launch.sh', 'high-debian-ssh/scripts/download-base-image.sh',
+        'high-debian-ssh/cloud-init/user-data',
         'high-windows-rdp/scripts/launch.sh', 'high-windows-rdp/scripts/download-base-image.sh',
         'high-windows-rdp/autounattend.xml',
+        'high-custom-iso/scripts/launch-iso.sh',
+        'high-custom-iso/scripts/check-ssh-isolated.sh',
     }
     if not required_recipe.issubset({member.name for member in members}):
         raise SystemExit('В High archive отсутствуют файлы recipe')

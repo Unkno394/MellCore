@@ -5,7 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hf_core::{HighGuestConnection, HighGuestOs, HighOsProfile};
+use hf_core::{
+    HighGuestConnection, HighGuestOs, HighImagePreparation, HighImageSource, HighOsProfile,
+};
 use uuid::Uuid;
 
 pub const DEFAULT_UBUNTU_24_04_IMAGE: &str =
@@ -13,6 +15,8 @@ pub const DEFAULT_UBUNTU_24_04_IMAGE: &str =
 
 const DEFAULT_ARCH_LINUX_IMAGE: &str =
     "/var/lib/honeyforge/images/arch-linux-x86_64-cloudimg.qcow2";
+const DEFAULT_DEBIAN_IMAGE: &str =
+    "/var/lib/honeyforge/images/debian-12-genericcloud-amd64.qcow2";
 const DEFAULT_WINDOWS_PREPARED_IMAGE: &str =
     "/var/lib/honeyforge/images/windows-server-prepared.qcow2";
 const DEFAULT_WINDOWS_SERVER_ISO: &str = "/var/lib/honeyforge/images/windows-server-eval.iso";
@@ -23,8 +27,15 @@ pub fn default_image_for(profile: HighOsProfile) -> &'static str {
     }
     match profile.guest_os {
         HighGuestOs::Ubuntu => DEFAULT_UBUNTU_24_04_IMAGE,
+        HighGuestOs::Debian => DEFAULT_DEBIAN_IMAGE,
         HighGuestOs::ArchLinux => DEFAULT_ARCH_LINUX_IMAGE,
         HighGuestOs::Windows => DEFAULT_WINDOWS_PREPARED_IMAGE,
+        HighGuestOs::CustomLinux => match profile.image_preparation {
+            HighImagePreparation::BestEffortInstall => {
+                "/var/lib/honeyforge/images/custom-source-required.iso"
+            }
+            _ => "/var/lib/honeyforge/images/custom-source-required.qcow2",
+        },
     }
 }
 
@@ -35,6 +46,7 @@ pub struct HighVm {
     pub base_image: PathBuf,
     pub external_service_port: u16,
     pub profile: HighOsProfile,
+    pub image_source: Option<HighImageSource>,
 }
 
 impl HighVm {
@@ -49,6 +61,23 @@ impl HighVm {
             base_image,
             external_service_port,
             profile,
+            image_source: None,
+        }
+    }
+
+    pub fn with_source(
+        instance_id: Uuid,
+        base_image: PathBuf,
+        external_service_port: u16,
+        profile: HighOsProfile,
+        image_source: Option<HighImageSource>,
+    ) -> Self {
+        Self {
+            instance_id,
+            base_image,
+            external_service_port,
+            profile,
+            image_source,
         }
     }
 
@@ -162,6 +191,25 @@ const WINDOWS_PREPARED_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
     ],
 };
 
+const BEST_EFFORT_ISO_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
+    download: "reject-managed-image.sh",
+    launch: "launch-iso.sh",
+    publish: "discover-ssh-isolated.sh",
+    check_publication: "check-ssh-isolated.sh",
+    stop: "stop.sh",
+    reset: "reset.sh",
+    required: &[
+        "launch-iso.sh",
+        "create-network.sh",
+        "firewall-common.sh",
+        "discover-ssh-isolated.sh",
+        "check-ssh-isolated.sh",
+        "stop.sh",
+        "reset.sh",
+        "reject-managed-image.sh",
+    ],
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HighDomainState {
     Missing,
@@ -201,6 +249,16 @@ impl LibvirtSandboxManager {
                     scripts: UBUNTU_SCRIPTS,
                 },
                 HighOsAdapter {
+                    profile: HighOsProfile::debian_ssh(),
+                    recipe_dir: recipes_root.join("high-debian-ssh"),
+                    default_image: default_image_for(HighOsProfile::debian_ssh()),
+                    readiness_timeout: Duration::from_secs(90),
+                    dhcp_wait_attempts: 18,
+                    verify_cached_managed_image: true,
+                    publication: HighPublication::Required,
+                    scripts: GENERIC_SCRIPTS,
+                },
+                HighOsAdapter {
                     profile: HighOsProfile::arch_linux_ssh(),
                     recipe_dir: recipes_root.join("high-arch-ssh"),
                     default_image: default_image_for(HighOsProfile::arch_linux_ssh()),
@@ -230,6 +288,26 @@ impl LibvirtSandboxManager {
                     publication: HighPublication::Required,
                     scripts: GENERIC_SCRIPTS,
                 },
+                HighOsAdapter {
+                    profile: HighOsProfile::custom_linux_qcow2_ssh(),
+                    recipe_dir: recipes_root.join("high-debian-ssh"),
+                    default_image: default_image_for(HighOsProfile::custom_linux_qcow2_ssh()),
+                    readiness_timeout: Duration::from_secs(120),
+                    dhcp_wait_attempts: 24,
+                    verify_cached_managed_image: true,
+                    publication: HighPublication::Required,
+                    scripts: GENERIC_SCRIPTS,
+                },
+                HighOsAdapter {
+                    profile: HighOsProfile::custom_linux_iso_ssh(),
+                    recipe_dir: recipes_root.join("high-custom-iso"),
+                    default_image: default_image_for(HighOsProfile::custom_linux_iso_ssh()),
+                    readiness_timeout: Duration::from_secs(600),
+                    dhcp_wait_attempts: 120,
+                    verify_cached_managed_image: true,
+                    publication: HighPublication::Disabled,
+                    scripts: BEST_EFFORT_ISO_SCRIPTS,
+                },
             ],
             high_root: high_root.into(),
         }
@@ -253,6 +331,9 @@ impl LibvirtSandboxManager {
                 );
             }
         }
+        if let Some(source) = &vm.image_source {
+            crate::high_image::verify_cached_image(source, vm.profile, &vm.base_image)?;
+        }
         let managed_image = vm.base_image == Path::new(adapter.default_image);
         if !vm.base_image.is_file() || (managed_image && adapter.verify_cached_managed_image) {
             if managed_image {
@@ -260,7 +341,10 @@ impl LibvirtSandboxManager {
                     vm.profile,
                     adapter.scripts.download,
                     &[adapter.default_image],
-                )?;
+                )
+                .map_err(|failure| {
+                    lifecycle_error("IMAGE_DOWNLOAD_FAILED", "download", failure)
+                })?;
             } else {
                 anyhow::bail!(
                     "High {} base image does not exist: {}",
@@ -287,7 +371,17 @@ impl LibvirtSandboxManager {
                 &instance_id,
                 &port,
             ],
-        )?;
+        )
+        .map_err(|failure| {
+            let (code, stage) = match vm.profile.image_preparation {
+                HighImagePreparation::UnattendedInstall
+                | HighImagePreparation::BestEffortInstall => {
+                    ("INSTALLATION_FAILED", "installation")
+                }
+                _ => ("VM_BOOT_FAILED", "boot"),
+            };
+            lifecycle_error(code, stage, failure)
+        })?;
         if let Err(error) = self.prepare_access_and_wait(vm) {
             let cleanup = self.run(vm.profile, adapter.scripts.reset, &[&instance_id]);
             if let Err(cleanup_error) = cleanup {
@@ -433,7 +527,10 @@ impl LibvirtSandboxManager {
         let adapter = self.adapter_for(vm.profile)?;
         let instance_id = vm.instance_id.to_string();
         let port = vm.external_service_port.to_string();
-        self.run(vm.profile, adapter.scripts.publish, &[&instance_id, &port])?;
+        self.run(vm.profile, adapter.scripts.publish, &[&instance_id, &port])
+            .map_err(|failure| {
+                lifecycle_error("ACCESS_POLICY_FAILED", "network", failure)
+            })?;
         self.wait_until_ready(vm)
     }
 
@@ -449,9 +546,19 @@ impl LibvirtSandboxManager {
             }
             std::thread::sleep(Duration::from_secs(2));
         }
-        anyhow::bail!(
-            "High VM did not reach guest service and access-policy readiness before timeout"
-        )
+        let (code, stage) = match vm.profile.image_preparation {
+            HighImagePreparation::UnattendedInstall | HighImagePreparation::BestEffortInstall => {
+                ("INSTALLATION_INCOMPLETE", "installation")
+            }
+            _ => ("GUEST_SERVICE_UNAVAILABLE", "readiness"),
+        };
+        Err(lifecycle_error(
+            code,
+            stage,
+            anyhow::anyhow!(
+                "guest service did not become reachable before the profile timeout"
+            ),
+        ))
     }
 
     fn has_published_service(&self, vm: &HighVm) -> bool {
@@ -589,8 +696,13 @@ fn reconcile_action(state: HighDomainState, matches_profile: bool) -> ReconcileA
 pub fn profile_recipe_name(profile: HighOsProfile) -> &'static str {
     match profile.guest_os {
         HighGuestOs::Ubuntu => "high-ubuntu-ssh",
+        HighGuestOs::Debian => "high-debian-ssh",
         HighGuestOs::ArchLinux => "high-arch-ssh",
         HighGuestOs::Windows => "high-windows-rdp",
+        HighGuestOs::CustomLinux => match profile.image_preparation {
+            HighImagePreparation::BestEffortInstall => "high-custom-iso",
+            _ => "high-custom-linux",
+        },
     }
 }
 
@@ -600,16 +712,24 @@ pub fn profile_manifest_kind(profile: HighOsProfile) -> &'static str {
     }
     match profile.guest_os {
         HighGuestOs::Ubuntu => "high_ubuntu_ssh",
+        HighGuestOs::Debian => "high_debian_ssh",
         HighGuestOs::ArchLinux => "high_arch_ssh",
         HighGuestOs::Windows => "high_windows_rdp_prepared",
+        HighGuestOs::CustomLinux => match profile.image_preparation {
+            HighImagePreparation::BestEffortInstall => "high_custom_linux_iso",
+            _ => "high_custom_linux_qcow2",
+        },
     }
 }
 
 pub fn is_supported_profile(profile: HighOsProfile) -> bool {
     profile == HighOsProfile::ubuntu_ssh()
+        || profile == HighOsProfile::debian_ssh()
         || profile == HighOsProfile::arch_linux_ssh()
         || profile == HighOsProfile::windows_rdp()
         || profile == HighOsProfile::windows_rdp_legacy_iso()
+        || profile == HighOsProfile::custom_linux_qcow2_ssh()
+        || profile == HighOsProfile::custom_linux_iso_ssh()
 }
 
 fn domain_xml_matches_security_profile(
@@ -630,8 +750,22 @@ fn domain_xml_matches_security_profile(
                     && xml.contains("listen='127.0.0.1'")
                     && !xml.contains("listen='0.0.0.0'")
             }
-            HighGuestOs::Ubuntu | HighGuestOs::ArchLinux => xml.matches("<graphics ").count() == 0,
+            HighGuestOs::CustomLinux
+                if profile.image_preparation == HighImagePreparation::BestEffortInstall =>
+            {
+                xml.matches("<graphics ").count() == 1
+                    && xml.contains("listen='127.0.0.1'")
+                    && !xml.contains("listen='0.0.0.0'")
+            }
+            HighGuestOs::Ubuntu
+            | HighGuestOs::Debian
+            | HighGuestOs::ArchLinux
+            | HighGuestOs::CustomLinux => xml.matches("<graphics ").count() == 0,
         }
+}
+
+fn lifecycle_error(code: &'static str, stage: &'static str, failure: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!("HF_HIGH_ERROR code={code} stage={stage}: {failure}")
 }
 
 fn high_running_health(
@@ -746,15 +880,26 @@ mod tests {
             .unwrap();
         let ubuntu = manager.adapter_for(HighOsProfile::ubuntu_ssh()).unwrap();
         let windows = manager.adapter_for(HighOsProfile::windows_rdp()).unwrap();
+        let debian = manager.adapter_for(HighOsProfile::debian_ssh()).unwrap();
+        let custom_qcow2 = manager
+            .adapter_for(HighOsProfile::custom_linux_qcow2_ssh())
+            .unwrap();
+        let custom_iso = manager
+            .adapter_for(HighOsProfile::custom_linux_iso_ssh())
+            .unwrap();
         let legacy = manager
             .adapter_for(HighOsProfile::windows_rdp_legacy_iso())
             .unwrap();
         assert!(arch.verify_cached_managed_image);
+        assert!(debian.verify_cached_managed_image);
         assert!(!ubuntu.verify_cached_managed_image);
         assert!(windows.verify_cached_managed_image);
         assert_eq!(windows.publication, HighPublication::Disabled);
         assert!(!legacy.verify_cached_managed_image);
         assert_eq!(legacy.publication, HighPublication::Required);
+        assert_eq!(custom_qcow2.publication, HighPublication::Required);
+        assert_eq!(custom_iso.publication, HighPublication::Disabled);
+        assert_ne!(custom_iso.scripts.publish, "publish-service.sh");
     }
 
     #[test]

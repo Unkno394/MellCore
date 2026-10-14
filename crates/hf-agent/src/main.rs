@@ -9,6 +9,7 @@ use std::{
 };
 
 mod emergency;
+mod high_image;
 #[cfg(unix)]
 mod high_telemetry;
 mod sandbox;
@@ -382,11 +383,12 @@ impl ComposeProjectStore {
     }
 
     fn high_vm(deployment: &HighVmDeployment) -> HighVm {
-        HighVm::with_profile(
+        HighVm::with_source(
             deployment.trap_id,
             PathBuf::from(&deployment.base_image),
             deployment.external_service_port,
             deployment.profile,
+            deployment.image_source.clone(),
         )
     }
 
@@ -398,16 +400,30 @@ impl ComposeProjectStore {
 
     fn deploy_high(
         &self,
-        deployment: HighVmDeployment,
+        mut deployment: HighVmDeployment,
         allow_existing_ubuntu_image: bool,
     ) -> anyhow::Result<()> {
         Self::validate_high_deployment(&deployment, allow_existing_ubuntu_image)?;
+        if let Some(source) = &deployment.image_source {
+            let state_dir = self
+                .root
+                .parent()
+                .unwrap_or(Path::new(DEFAULT_STATE_DIR));
+            deployment.base_image = high_image::materialize_image(
+                source,
+                deployment.profile,
+                &state_dir.join("images").join("custom"),
+            )?
+            .to_string_lossy()
+            .into_owned();
+        }
         let changed = self
             .load_high_manifest(deployment.trap_id)?
             .is_some_and(|current| {
                 current.deployment.base_image != deployment.base_image
                     || current.deployment.external_service_port != deployment.external_service_port
                     || current.deployment.profile != deployment.profile
+                    || current.deployment.image_source != deployment.image_source
             });
         let mut manifest = HighRuntimeManifest {
             version: 1,
@@ -444,20 +460,40 @@ impl ComposeProjectStore {
     ) -> anyhow::Result<()> {
         if deployment.trap_id.is_nil()
             || (deployment.external_service_port == 0
-                && deployment.profile != HighOsProfile::windows_rdp())
-            || deployment.base_image.trim().is_empty()
+                && deployment.profile != HighOsProfile::windows_rdp()
+                && deployment.profile != HighOsProfile::custom_linux_iso_ssh())
         {
-            anyhow::bail!("invalid High VM deployment command");
+            anyhow::bail!(
+                "HF_HIGH_ERROR code=DEPLOYMENT_INVALID stage=validation: trap id or service port is invalid"
+            );
         }
         if !is_supported_profile(deployment.profile) {
-            anyhow::bail!("unsupported High OS profile");
+            anyhow::bail!(
+                "HF_HIGH_ERROR code=PROFILE_UNSUPPORTED stage=validation: this High OS profile is not registered"
+            );
         }
         if allow_existing_ubuntu_image && deployment.profile != HighOsProfile::ubuntu_ssh() {
             anyhow::bail!("legacy High deployment supports only Ubuntu SSH");
         }
-        if !allow_existing_ubuntu_image && deployment.base_image != default_image_for(deployment.profile) {
+        if (deployment.profile == HighOsProfile::custom_linux_qcow2_ssh()
+            || deployment.profile == HighOsProfile::custom_linux_iso_ssh())
+            && deployment.image_source.is_none()
+        {
             anyhow::bail!(
-                "High {} uses the agent-managed image path {}; arbitrary images are not supported",
+                "HF_HIGH_ERROR code=IMAGE_SOURCE_REQUIRED stage=validation: custom OS profiles require image_source"
+            );
+        }
+        if deployment.base_image.trim().is_empty() && deployment.image_source.is_none() {
+            anyhow::bail!(
+                "HF_HIGH_ERROR code=IMAGE_PATH_REQUIRED stage=validation: deployment has neither an agent-managed image path nor image_source"
+            );
+        }
+        if !allow_existing_ubuntu_image
+            && deployment.image_source.is_none()
+            && deployment.base_image != default_image_for(deployment.profile)
+        {
+            anyhow::bail!(
+                "HF_HIGH_ERROR code=IMAGE_SOURCE_UNMANAGED stage=validation: High {} uses the agent-managed image path {}; provide image_source for a custom image",
                 profile_recipe_name(deployment.profile),
                 default_image_for(deployment.profile)
             );
@@ -601,6 +637,7 @@ impl ComposeProjectStore {
                     && manifest.deployment.external_service_port
                         == deployment.external_service_port
                     && manifest.deployment.profile == deployment.profile
+                    && manifest.deployment.image_source == deployment.image_source
                     && self
                         .high_manager()
                         .healthy(&Self::high_vm(&manifest.deployment))?)
@@ -773,13 +810,13 @@ impl ComposeProjectStore {
             }
             AgentCommand::DeployHighVm(deployment) => {
                 Self::validate_high_deployment(&deployment, false)?;
-                ensure_high_vm_runtime(deployment.profile)?;
+                ensure_high_vm_runtime(deployment.profile, deployment.image_source.is_some())?;
                 self.deploy_high(deployment, false)
             }
             AgentCommand::DeployHighUbuntu(deployment) => {
                 let deployment: HighVmDeployment = deployment.into();
                 Self::validate_high_deployment(&deployment, true)?;
-                ensure_high_vm_runtime(HighOsProfile::ubuntu_ssh())?;
+                ensure_high_vm_runtime(HighOsProfile::ubuntu_ssh(), false)?;
                 self.deploy_high(deployment, true)
             }
             AgentCommand::ResetHighVm { trap_id, .. }
@@ -2140,7 +2177,7 @@ fn install_docker_ce_with_dnf() -> anyhow::Result<()> {
 }
 
 /// KVM/libvirt dependencies are separate from Docker because High runs a real guest VM.
-fn high_vm_required_tools(profile: HighOsProfile) -> Vec<&'static str> {
+fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'static str> {
     let mut required_tools = vec![
         "virsh",
         "virt-install",
@@ -2159,8 +2196,19 @@ fn high_vm_required_tools(profile: HighOsProfile) -> Vec<&'static str> {
         hf_core::HighImagePreparation::UnattendedInstall => required_tools.push("xorriso"),
         hf_core::HighImagePreparation::Sysprep => required_tools.push("xorriso"),
         hf_core::HighImagePreparation::OfflineGuestPreparation => {}
+        hf_core::HighImagePreparation::BestEffortInstall => required_tools.push("xorriso"),
     }
-    if profile == HighOsProfile::arch_linux_ssh() || profile == HighOsProfile::windows_rdp() {
+    if custom_image {
+        required_tools.extend(["virt-inspector", "xorriso"]);
+    }
+    if matches!(
+        profile.guest_os,
+        hf_core::HighGuestOs::Debian
+            | hf_core::HighGuestOs::ArchLinux
+            | hf_core::HighGuestOs::Windows
+            | hf_core::HighGuestOs::CustomLinux
+    ) || custom_image
+    {
         required_tools.push("setfacl");
     }
     required_tools
@@ -2168,8 +2216,8 @@ fn high_vm_required_tools(profile: HighOsProfile) -> Vec<&'static str> {
 
 /// Install only the host tools needed by the selected adapter.  In particular, existing Ubuntu
 /// deployments do not acquire Windows ISO tooling as a side effect.
-fn ensure_high_vm_runtime(profile: HighOsProfile) -> anyhow::Result<()> {
-    let required_tools = high_vm_required_tools(profile);
+fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow::Result<()> {
+    let required_tools = high_vm_required_tools(profile, custom_image);
     let tools_ready = required_tools
         .iter()
         .all(|program| Command::new(program).arg("--version").output().is_ok());
@@ -2198,10 +2246,15 @@ fn ensure_high_vm_runtime(profile: HighOsProfile) -> anyhow::Result<()> {
                     hf_core::HighImagePreparation::UnattendedInstall => packages.push("xorriso"),
                     hf_core::HighImagePreparation::Sysprep => packages.push("xorriso"),
                     hf_core::HighImagePreparation::OfflineGuestPreparation => {}
+                    hf_core::HighImagePreparation::BestEffortInstall => packages.push("xorriso"),
                 }
-                if profile == HighOsProfile::arch_linux_ssh()
-                    || profile == HighOsProfile::windows_rdp()
-                {
+                if custom_image && !packages.contains(&"libguestfs-tools") {
+                    packages.push("libguestfs-tools");
+                    if !packages.contains(&"xorriso") {
+                        packages.push("xorriso");
+                    }
+                }
+                if required_tools.contains(&"setfacl") {
                     packages.push("acl");
                 }
                 run_program("apt-get", &packages)?;
@@ -2228,10 +2281,15 @@ fn ensure_high_vm_runtime(profile: HighOsProfile) -> anyhow::Result<()> {
                     hf_core::HighImagePreparation::UnattendedInstall => packages.push("xorriso"),
                     hf_core::HighImagePreparation::Sysprep => packages.push("xorriso"),
                     hf_core::HighImagePreparation::OfflineGuestPreparation => {}
+                    hf_core::HighImagePreparation::BestEffortInstall => packages.push("xorriso"),
                 }
-                if profile == HighOsProfile::arch_linux_ssh()
-                    || profile == HighOsProfile::windows_rdp()
-                {
+                if custom_image {
+                    packages.push("libguestfs-tools-c");
+                    if !packages.contains(&"xorriso") {
+                        packages.push("xorriso");
+                    }
+                }
+                if required_tools.contains(&"setfacl") {
                     packages.push("acl");
                 }
                 run_program("dnf", &packages)?;
@@ -2260,10 +2318,17 @@ fn ensure_high_vm_runtime(profile: HighOsProfile) -> anyhow::Result<()> {
                     }
                     hf_core::HighImagePreparation::Sysprep => packages.push("libisoburn"),
                     hf_core::HighImagePreparation::OfflineGuestPreparation => {}
+                    hf_core::HighImagePreparation::BestEffortInstall => {
+                        packages.push("libisoburn")
+                    }
                 }
-                if profile == HighOsProfile::arch_linux_ssh()
-                    || profile == HighOsProfile::windows_rdp()
-                {
+                if custom_image {
+                    packages.push("libguestfs");
+                    if !packages.contains(&"libisoburn") {
+                        packages.push("libisoburn");
+                    }
+                }
+                if required_tools.contains(&"setfacl") {
                     packages.push("acl");
                 }
                 run_program("pacman", &packages)?;
@@ -2674,20 +2739,25 @@ mod tests {
 
     #[test]
     fn high_runtime_dependencies_follow_the_selected_profile() {
-        let ubuntu = high_vm_required_tools(HighOsProfile::ubuntu_ssh());
+        let ubuntu = high_vm_required_tools(HighOsProfile::ubuntu_ssh(), false);
         assert!(ubuntu.contains(&"cloud-localds"));
         assert!(ubuntu.contains(&"python3"));
         assert!(!ubuntu.contains(&"xorriso"));
         assert!(!ubuntu.contains(&"setfacl"));
 
-        let arch = high_vm_required_tools(HighOsProfile::arch_linux_ssh());
+        let arch = high_vm_required_tools(HighOsProfile::arch_linux_ssh(), false);
         assert!(arch.contains(&"cloud-localds"));
         assert!(arch.contains(&"setfacl"));
 
-        let windows = high_vm_required_tools(HighOsProfile::windows_rdp());
+        let windows = high_vm_required_tools(HighOsProfile::windows_rdp(), false);
         assert!(windows.contains(&"xorriso"));
         assert!(windows.contains(&"setfacl"));
         assert!(!windows.contains(&"cloud-localds"));
+
+        let custom = high_vm_required_tools(HighOsProfile::debian_ssh(), true);
+        assert!(custom.contains(&"virt-inspector"));
+        assert!(custom.contains(&"xorriso"));
+        assert!(custom.contains(&"setfacl"));
     }
 
     #[test]
@@ -2704,12 +2774,13 @@ mod tests {
                     base_image: "/tmp/untrusted-arch.qcow2".into(),
                     external_service_port: 2222,
                     profile: HighOsProfile::arch_linux_ssh(),
+                    image_source: None,
                 },
                 false,
             )
             .unwrap_err();
 
-        assert!(error.to_string().contains("arbitrary images are not supported"));
+        assert!(error.to_string().contains("code=IMAGE_SOURCE_UNMANAGED"));
         assert!(!store.high_manifest_path(trap_id).exists());
     }
 
@@ -2721,6 +2792,7 @@ mod tests {
             base_image: default_image_for(HighOsProfile::windows_rdp()).into(),
             external_service_port: 0,
             profile: HighOsProfile::windows_rdp(),
+            image_source: None,
         };
         ComposeProjectStore::validate_high_deployment(&deployment, false).unwrap();
 
@@ -2728,6 +2800,27 @@ mod tests {
         legacy.profile = HighOsProfile::windows_rdp_legacy_iso();
         legacy.base_image = default_image_for(legacy.profile).into();
         assert!(ComposeProjectStore::validate_high_deployment(&legacy, false).is_err());
+    }
+
+    #[test]
+    fn custom_iso_is_host_only_and_requires_a_verified_source() {
+        let mut deployment = HighVmDeployment {
+            command_id: Uuid::new_v4(),
+            trap_id: Uuid::new_v4(),
+            base_image: String::new(),
+            external_service_port: 0,
+            profile: HighOsProfile::custom_linux_iso_ssh(),
+            image_source: Some(hf_core::HighImageSource {
+                url: "https://images.example.invalid/installer.iso".into(),
+                sha256: "a".repeat(64),
+                format: hf_core::HighImageFormat::Iso,
+                architecture: hf_core::HighImageArchitecture::X86_64,
+            }),
+        };
+        ComposeProjectStore::validate_high_deployment(&deployment, false).unwrap();
+        deployment.image_source = None;
+        let error = ComposeProjectStore::validate_high_deployment(&deployment, false).unwrap_err();
+        assert!(error.to_string().contains("code=IMAGE_SOURCE_REQUIRED"));
     }
 
     #[test]

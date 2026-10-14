@@ -9,5 +9,5 @@ output=${1:?usage: package-recipe.sh /path/to/hf-high-ubuntu-ssh.tar.gz}
 parent_dir=$(dirname "$recipe_dir")
 
 # macOS otherwise injects AppleDouble `._*` entries that the Linux artifact validator rejects.
-COPYFILE_DISABLE=1 tar -C "$parent_dir" -czf "$output" high-ubuntu-ssh high-arch-ssh high-windows-rdp
+COPYFILE_DISABLE=1 tar -C "$parent_dir" -czf "$output" high-ubuntu-ssh high-debian-ssh high-arch-ssh high-windows-rdp high-custom-iso
 printf '%s\n' "created $output"

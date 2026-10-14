@@ -1,0 +1,45 @@
+#cloud-config
+users:
+  - name: analyst
+    groups: [adm, systemd-journal]
+    shell: /bin/bash
+    lock_passwd: false
+    passwd: '@@ANALYST_PASSWORD_HASH@@'
+ssh_pwauth: true
+disable_root: false
+write_files:
+  - path: /usr/local/lib/honeyforge/high-telemetry-sensor
+    owner: root:root
+    permissions: '0755'
+    encoding: b64
+    content: '@@SENSOR_B64@@'
+  - path: /etc/systemd/system/honeyforge-high-telemetry.service
+    owner: root:root
+    permissions: '0644'
+    encoding: b64
+    content: '@@SENSOR_SERVICE_B64@@'
+  - path: /usr/local/lib/honeyforge/high_telemetry_audit.py
+    owner: root:root
+    permissions: '0644'
+    encoding: b64
+    content: '@@AUDIT_SENSOR_B64@@'
+  - path: /etc/audit/rules.d/90-honeyforge.rules
+    owner: root:root
+    permissions: '0600'
+    encoding: b64
+    content: '@@AUDIT_RULES_B64@@'
+  - path: /etc/ssh/sshd_config.d/90-honeyforge.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      PasswordAuthentication yes
+      PermitRootLogin prohibit-password
+      X11Forwarding no
+runcmd:
+  - test -x /usr/bin/python3
+  - test -x /usr/sbin/sshd
+  - systemctl daemon-reload
+  - sh -c 'if command -v auditctl >/dev/null 2>&1; then augenrules --load && systemctl enable --now auditd; fi'
+  - sh -c 'if systemctl list-unit-files | grep -q "^qemu-guest-agent"; then systemctl enable --now qemu-guest-agent; fi'
+  - systemctl enable --now ssh
+  - systemctl enable --now honeyforge-high-telemetry.service
