@@ -172,7 +172,7 @@ const GENERIC_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
 };
 
 const WINDOWS_PREPARED_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
-    download: "verify-prepared-image.sh",
+    download: "ensure-prepared-image.sh",
     launch: "launch-prepared.sh",
     publish: "discover-rdp.sh",
     check_publication: "check-rdp-isolated.sh",
@@ -187,6 +187,7 @@ const WINDOWS_PREPARED_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
         "check-rdp-isolated.sh",
         "stop.sh",
         "reset.sh",
+        "ensure-prepared-image.sh",
         "verify-prepared-image.sh",
     ],
 };

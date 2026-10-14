@@ -134,6 +134,52 @@ class PreparedWindowsRecipeTests(unittest.TestCase):
         self.assertNotIn("external-ssh-port\" >", launch + discover)
         self.assertIn("listen=127.0.0.1", launch)
 
+    def test_missing_prepared_image_invokes_builder_with_approved_catalog(self):
+        ensure = (SCRIPTS / "ensure-prepared-image.sh").read_text(encoding="utf-8")
+        self.assertIn("/usr/local/lib/honeyforge/hf-image-builder/hf-image-builder", ensure)
+        self.assertIn("/etc/honeyforge/image-sources/windows-server-2022.json", ensure)
+        self.assertIn('"$builder" --catalog "$catalog" build', ensure)
+        self.assertIn("incomplete prepared Windows image publication", ensure)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            image = root / "windows-server-prepared.qcow2"
+            catalog = root / "catalog.json"
+            catalog.write_text("{}\n")
+            arguments = root / "builder.args"
+            executable(
+                fake_bin / "qemu-img",
+                "#!/bin/sh\n"
+                "[ \"$1\" = info ] && { printf '%s\\n' '{\"format\":\"qcow2\"}'; exit; }\n"
+                "[ \"$1\" = check ] && exit 0\n"
+                "exit 2\n",
+            )
+            executable(
+                root / "builder",
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" > \"$HF_TEST_ARGS\"\n"
+                "printf prepared > \"$HF_TEST_IMAGE\"\n"
+                "sha256sum \"$HF_TEST_IMAGE\" > \"$HF_TEST_IMAGE.sha256\"\n",
+            )
+            environment = dict(
+                os.environ,
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                HF_HIGH_IMAGE_BUILDER=str(root / "builder"),
+                HF_HIGH_WINDOWS_SOURCE_CATALOG=str(catalog),
+                HF_TEST_ARGS=str(arguments),
+                HF_TEST_IMAGE=str(image),
+            )
+            subprocess.run(
+                ["sh", str(SCRIPTS / "ensure-prepared-image.sh"), str(image)],
+                check=True,
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(arguments.read_text().strip(), f"--catalog {catalog} build")
+
     def test_isolation_probe_rejects_an_rdp_dnat_rule(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

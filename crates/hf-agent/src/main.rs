@@ -2204,6 +2204,16 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
     if profile == HighOsProfile::arch_linux_ssh() {
         required_tools.push("virt-customize");
     }
+    if profile == HighOsProfile::windows_rdp() {
+        required_tools.extend([
+            "packer",
+            "qemu-system-x86_64",
+            "virt-inspector",
+            "virt-cat",
+            "virt-ls",
+            "wimlib-imagex",
+        ]);
+    }
     if matches!(
         profile.guest_os,
         hf_core::HighGuestOs::Debian
@@ -2255,6 +2265,9 @@ fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow:
                     && !packages.contains(&"libguestfs-tools")
                 {
                     packages.push("libguestfs-tools");
+                }
+                if profile == HighOsProfile::windows_rdp() {
+                    packages.extend(["qemu-system-x86", "libguestfs-tools", "wimtools"]);
                 }
                 if custom_image {
                     if !packages.contains(&"xorriso") {
@@ -2767,6 +2780,9 @@ mod tests {
         let windows = high_vm_required_tools(HighOsProfile::windows_rdp(), false);
         assert!(windows.contains(&"xorriso"));
         assert!(windows.contains(&"setfacl"));
+        assert!(windows.contains(&"packer"));
+        assert!(windows.contains(&"wimlib-imagex"));
+        assert!(windows.contains(&"virt-inspector"));
         assert!(!windows.contains(&"cloud-localds"));
 
         let custom = high_vm_required_tools(HighOsProfile::debian_ssh(), true);

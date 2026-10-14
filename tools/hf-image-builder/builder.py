@@ -21,6 +21,7 @@ import sys
 import tempfile
 import urllib.parse
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from typing import Optional
 
 
@@ -31,6 +32,10 @@ MIN_FREE_DISK = 55 * GIB
 EXPECTED_BUILD = "20348"
 ALLOWED_EDITIONS = {"ServerStandardEval", "ServerDatacenterEval"}
 OUTPUT_NAME = "windows-server-prepared.qcow2"
+DEFAULT_CATALOG_PATH = pathlib.Path(
+    "/etc/honeyforge/image-sources/windows-server-2022.json"
+)
+DEFAULT_APPROVED_SOURCE_DIR = pathlib.Path("/var/lib/honeyforge/image-builder/sources")
 REQUIRED_TOOLS = (
     "curl",
     "packer",
@@ -61,17 +66,28 @@ class ArtifactSource:
     sha256: str
     allowed_hosts: tuple[str, ...]
     cache_name: str
+    local_path: Optional[pathlib.Path] = None
 
     def validate(self) -> None:
-        parsed = urllib.parse.urlsplit(self.url)
-        if parsed.scheme.lower() != "https" or not parsed.hostname:
-            raise BuildError(f"{self.name}: source must be an HTTPS URL")
-        if parsed.username or parsed.password or parsed.fragment:
-            raise BuildError(f"{self.name}: credentials and fragments are forbidden in source URL")
-        host = parsed.hostname.lower().rstrip(".")
-        allowed = {item.lower().rstrip(".") for item in self.allowed_hosts if item}
-        if host not in allowed:
-            raise BuildError(f"{self.name}: HTTPS host {host!r} is not in its approved host list")
+        if self.local_path is not None:
+            if self.url:
+                raise BuildError(f"{self.name}: source cannot be both local and remote")
+            if not self.local_path.is_absolute():
+                raise BuildError(f"{self.name}: approved local source path must be absolute")
+        else:
+            parsed = urllib.parse.urlsplit(self.url)
+            if parsed.scheme.lower() != "https" or not parsed.hostname:
+                raise BuildError(f"{self.name}: source must be an HTTPS URL")
+            if parsed.username or parsed.password or parsed.fragment:
+                raise BuildError(
+                    f"{self.name}: credentials and fragments are forbidden in source URL"
+                )
+            host = parsed.hostname.lower().rstrip(".")
+            allowed = {item.lower().rstrip(".") for item in self.allowed_hosts if item}
+            if host not in allowed:
+                raise BuildError(
+                    f"{self.name}: HTTPS host {host!r} is not in its approved host list"
+                )
         if not re.fullmatch(r"[0-9a-fA-F]{64}", self.sha256):
             raise BuildError(f"{self.name}: trusted SHA-256 must contain exactly 64 hex characters")
         if pathlib.PurePath(self.cache_name).name != self.cache_name:
@@ -95,6 +111,80 @@ class Config:
     @property
     def output_path(self) -> pathlib.Path:
         return self.image_dir / OUTPUT_NAME
+
+    @classmethod
+    def from_catalog(cls, path: pathlib.Path) -> "Config":
+        require_regular_file(path, "approved source catalog")
+        info = path.stat()
+        if info.st_uid not in {0, os.geteuid()} or info.st_mode & 0o022:
+            raise BuildError(
+                "approved source catalog must be owned by root/the invoking account and not "
+                "group/world writable"
+            )
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise BuildError(f"cannot read approved source catalog: {path}") from exc
+        if document.get("version") != 1 or document.get("profile") != "windows-server-2022-eval-x64":
+            raise BuildError("unsupported approved source catalog version or profile")
+        approval = document.get("approval", {})
+        if approval.get("microsoft_evaluation_license_accepted") is not True:
+            raise BuildError("approved source catalog has no Microsoft Evaluation license acceptance")
+        if not approval.get("approved_by") or not approval.get("approved_at"):
+            raise BuildError("approved source catalog has incomplete administrator approval")
+
+        def source(name: str, key: str, default_hosts: tuple[str, ...] = ()) -> ArtifactSource:
+            value = document.get("sources", {}).get(key, {})
+            sha256 = str(value.get("sha256", "")).lower()
+            local_path = value.get("local_path")
+            url = str(value.get("url", ""))
+            allowed_hosts = tuple(str(item) for item in value.get("allowed_hosts", default_hosts))
+            artifact = ArtifactSource(
+                name=name,
+                url=url,
+                sha256=sha256,
+                allowed_hosts=allowed_hosts,
+                cache_name=str(value.get("cache_name", "")),
+                local_path=pathlib.Path(local_path) if local_path else None,
+            )
+            artifact.validate()
+            return artifact
+
+        image = document.get("image", {})
+        try:
+            image_index = int(image["index"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BuildError("approved source catalog image.index must be a positive integer") from exc
+        if image_index <= 0:
+            raise BuildError("approved source catalog image.index must be a positive integer")
+        edition_id = str(image.get("edition_id", ""))
+        if edition_id not in ALLOWED_EDITIONS:
+            raise BuildError("approved source catalog contains an unsupported Windows edition")
+        image_name = str(image.get("name", "")).strip()
+        if not image_name:
+            raise BuildError("approved source catalog image.name is missing")
+        directories = document.get("directories", {})
+        config = cls(
+            windows_iso=source("Windows Server ISO", "windows_iso", DEFAULT_WINDOWS_HOSTS),
+            virtio_iso=source("VirtIO driver ISO", "virtio_iso"),
+            cloudbase_msi=source("Cloudbase-Init MSI", "cloudbase_msi"),
+            image_index=image_index,
+            image_name=image_name,
+            edition_id=edition_id,
+            cache_dir=pathlib.Path(
+                directories.get("cache", "/var/cache/honeyforge/hf-image-builder")
+            ),
+            image_dir=pathlib.Path(directories.get("images", "/var/lib/honeyforge/images")),
+            work_dir=pathlib.Path(
+                directories.get("work", "/var/lib/honeyforge/image-builder")
+            ),
+            log_dir=pathlib.Path(directories.get("logs", "/var/log/honeyforge")),
+            cleanup_sources=False,
+        )
+        for directory in (config.cache_dir, config.image_dir, config.work_dir, config.log_dir):
+            if not directory.is_absolute():
+                raise BuildError(f"builder directory must be absolute: {directory}")
+        return config
 
     @classmethod
     def from_env(cls, env: Optional[dict[str, str]] = None) -> "Config":
@@ -290,27 +380,39 @@ def download_to_cache(source: ArtifactSource, cache_dir: pathlib.Path) -> pathli
     temporary = pathlib.Path(tmp_name)
     try:
         os.chmod(temporary, 0o600)
-        logging.info("downloading %s from approved HTTPS host %s", source.name, urllib.parse.urlsplit(source.url).hostname)
-        run(
-            [
-                "curl",
-                "--fail",
-                "--location",
-                "--proto",
-                "=https",
-                "--proto-redir",
-                "=https",
-                "--tlsv1.2",
-                "--retry",
-                "3",
-                "--silent",
-                "--show-error",
-                "--output",
-                str(temporary),
-                source.url,
-            ],
-            description=f"download {source.name}",
-        )
+        if source.local_path is not None:
+            verify_checksum(source.local_path, source.sha256, f"approved local {source.name}")
+            logging.info("importing approved local source: %s", source.name)
+            with source.local_path.open("rb") as input_stream, temporary.open("wb") as output_stream:
+                shutil.copyfileobj(input_stream, output_stream, 4 * MIB)
+                output_stream.flush()
+                os.fsync(output_stream.fileno())
+        else:
+            logging.info(
+                "downloading %s from approved HTTPS host %s",
+                source.name,
+                urllib.parse.urlsplit(source.url).hostname,
+            )
+            run(
+                [
+                    "curl",
+                    "--fail",
+                    "--location",
+                    "--proto",
+                    "=https",
+                    "--proto-redir",
+                    "=https",
+                    "--tlsv1.2",
+                    "--retry",
+                    "3",
+                    "--silent",
+                    "--show-error",
+                    "--output",
+                    str(temporary),
+                    source.url,
+                ],
+                description=f"download {source.name}",
+            )
         verify_checksum(temporary, source.sha256, source.name)
         try:
             os.link(temporary, target)
@@ -631,6 +733,128 @@ def cleanup_cached_sources(config: Config) -> None:
             logging.info("removed cached source: %s", source.name)
 
 
+def register_approved_catalog(args: argparse.Namespace) -> pathlib.Path:
+    if not args.accept_microsoft_evaluation_license:
+        raise BuildError(
+            "administrator must pass --accept-microsoft-evaluation-license after reviewing "
+            "the Microsoft Evaluation terms"
+        )
+    if not args.catalog.is_absolute() or not args.source_dir.is_absolute():
+        raise BuildError("catalog and approved source directory must be absolute paths")
+    if not args.approved_by.strip():
+        raise BuildError("--approved-by must identify the approving administrator")
+    windows_iso = args.windows_iso.resolve(strict=True)
+    windows_sha256 = args.windows_sha256.lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", windows_sha256):
+        raise BuildError("--windows-sha256 must contain exactly 64 hexadecimal characters")
+    verify_checksum(windows_iso, windows_sha256, "administrator-provided Windows Server ISO")
+    if args.image_index <= 0:
+        raise BuildError("--image-index must be a positive integer")
+    if args.edition_id not in ALLOWED_EDITIONS:
+        raise BuildError("--edition-id must be ServerStandardEval or ServerDatacenterEval")
+
+    dependencies = (
+        ArtifactSource(
+            "VirtIO driver ISO",
+            args.virtio_url,
+            args.virtio_sha256.lower(),
+            tuple(args.virtio_allowed_host),
+            f"virtio-win-{args.virtio_sha256[:12].lower()}.iso",
+        ),
+        ArtifactSource(
+            "Cloudbase-Init MSI",
+            args.cloudbase_url,
+            args.cloudbase_sha256.lower(),
+            tuple(args.cloudbase_allowed_host),
+            f"cloudbase-init-{args.cloudbase_sha256[:12].lower()}.msi",
+        ),
+    )
+    for dependency in dependencies:
+        dependency.validate()
+
+    args.source_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    approved_iso = args.source_dir / f"windows-server-2022-eval-{windows_sha256[:12]}.iso"
+    if approved_iso.exists() or approved_iso.is_symlink():
+        verify_checksum(approved_iso, windows_sha256, "previously approved Windows Server ISO")
+    else:
+        fd, temporary_name = tempfile.mkstemp(prefix=".windows-server-2022.", dir=args.source_dir)
+        os.close(fd)
+        temporary = pathlib.Path(temporary_name)
+        try:
+            os.chmod(temporary, 0o600)
+            with windows_iso.open("rb") as input_stream, temporary.open("wb") as output_stream:
+                shutil.copyfileobj(input_stream, output_stream, 4 * MIB)
+                output_stream.flush()
+                os.fsync(output_stream.fileno())
+            verify_checksum(temporary, windows_sha256, "staged Windows Server ISO")
+            try:
+                os.link(temporary, approved_iso)
+            except FileExistsError:
+                verify_checksum(
+                    approved_iso, windows_sha256, "concurrently approved Windows Server ISO"
+                )
+            _fsync_dir(args.source_dir)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    catalog = {
+        "version": 1,
+        "profile": "windows-server-2022-eval-x64",
+        "approval": {
+            "microsoft_evaluation_license_accepted": True,
+            "approved_by": args.approved_by,
+            "approved_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "image": {
+            "index": args.image_index,
+            "name": args.image_name,
+            "edition_id": args.edition_id,
+        },
+        "sources": {
+            "windows_iso": {
+                "local_path": str(approved_iso),
+                "sha256": windows_sha256,
+                "cache_name": f"windows-server-2022-{windows_sha256[:12]}.iso",
+            },
+            "virtio_iso": {
+                "url": dependencies[0].url,
+                "sha256": dependencies[0].sha256,
+                "allowed_hosts": list(dependencies[0].allowed_hosts),
+                "cache_name": dependencies[0].cache_name,
+            },
+            "cloudbase_msi": {
+                "url": dependencies[1].url,
+                "sha256": dependencies[1].sha256,
+                "allowed_hosts": list(dependencies[1].allowed_hosts),
+                "cache_name": dependencies[1].cache_name,
+            },
+        },
+    }
+    args.catalog.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if args.catalog.exists() or args.catalog.is_symlink():
+        raise BuildError(f"approved source catalog already exists; refusing overwrite: {args.catalog}")
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{args.catalog.name}.", dir=args.catalog.parent)
+    temporary = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(catalog, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        try:
+            os.link(temporary, args.catalog)
+        except FileExistsError as exc:
+            raise BuildError(
+                f"approved source catalog appeared concurrently: {args.catalog}"
+            ) from exc
+        _fsync_dir(args.catalog.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+    Config.from_catalog(args.catalog)
+    return args.catalog
+
+
 @contextlib.contextmanager
 def build_lock(path: pathlib.Path):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -680,6 +904,12 @@ def build(config: Config) -> str:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--catalog",
+        type=pathlib.Path,
+        default=pathlib.Path(os.environ.get("HF_IMAGE_BUILDER_CATALOG", DEFAULT_CATALOG_PATH)),
+        help="root-protected approved source catalog",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     build_parser = subparsers.add_parser("build", help="build and atomically publish the image")
     build_parser.add_argument(
@@ -692,6 +922,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--image", default=f"/var/lib/honeyforge/images/{OUTPUT_NAME}", type=pathlib.Path
     )
     subparsers.add_parser("cleanup-sources", help="delete only configured cached source artifacts")
+    register = subparsers.add_parser(
+        "register-sources",
+        help="one-time administrator approval of Windows media and dependency trust anchors",
+    )
+    register.add_argument("--windows-iso", required=True, type=pathlib.Path)
+    register.add_argument("--windows-sha256", required=True)
+    register.add_argument("--image-index", required=True, type=int)
+    register.add_argument("--image-name", required=True)
+    register.add_argument(
+        "--edition-id", choices=sorted(ALLOWED_EDITIONS), default="ServerDatacenterEval"
+    )
+    register.add_argument("--virtio-url", required=True)
+    register.add_argument("--virtio-sha256", required=True)
+    register.add_argument("--virtio-allowed-host", required=True, action="append")
+    register.add_argument("--cloudbase-url", required=True)
+    register.add_argument("--cloudbase-sha256", required=True)
+    register.add_argument("--cloudbase-allowed-host", required=True, action="append")
+    register.add_argument("--approved-by", required=True)
+    register.add_argument("--accept-microsoft-evaluation-license", action="store_true")
+    register.add_argument(
+        "--source-dir", type=pathlib.Path, default=DEFAULT_APPROVED_SOURCE_DIR
+    )
     return parser.parse_args(argv)
 
 
@@ -711,7 +963,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             verify_checksum(args.image, first, "published image")
             print(f"verified: {args.image}")
             return 0
-        config = Config.from_env()
+        if args.command == "register-sources":
+            catalog = register_approved_catalog(args)
+            print(f"approved source catalog: {catalog}")
+            return 0
+        if args.catalog.is_file():
+            config = Config.from_catalog(args.catalog)
+        elif os.environ.get("HF_WINDOWS_ISO_URL"):
+            # Compatibility for existing administrators. New deployments use the approved catalog.
+            config = Config.from_env()
+        else:
+            raise BuildError(
+                f"approved source catalog is missing: {args.catalog}; an administrator must run "
+                "register-sources once before the first Windows deployment"
+            )
         configure_logging(config)
         if args.command == "cleanup-sources":
             cleanup_cached_sources(config)

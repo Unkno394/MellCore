@@ -23,6 +23,48 @@ def source(url="https://download.microsoft.com/windows.iso", digest="a" * 64):
     )
 
 
+def catalog_document(root, windows_digest):
+    return {
+        "version": 1,
+        "profile": "windows-server-2022-eval-x64",
+        "approval": {
+            "microsoft_evaluation_license_accepted": True,
+            "approved_by": "test-admin",
+            "approved_at": "2026-01-01T00:00:00+00:00",
+        },
+        "image": {
+            "index": 4,
+            "name": "Windows Server 2022 SERVERDATACENTER",
+            "edition_id": "ServerDatacenterEval",
+        },
+        "sources": {
+            "windows_iso": {
+                "local_path": str(root / "approved.iso"),
+                "sha256": windows_digest,
+                "cache_name": "windows.iso",
+            },
+            "virtio_iso": {
+                "url": "https://virtio.example/virtio.iso",
+                "sha256": "b" * 64,
+                "allowed_hosts": ["virtio.example"],
+                "cache_name": "virtio.iso",
+            },
+            "cloudbase_msi": {
+                "url": "https://cloudbase.example/setup.msi",
+                "sha256": "c" * 64,
+                "allowed_hosts": ["cloudbase.example"],
+                "cache_name": "cloudbase.msi",
+            },
+        },
+        "directories": {
+            "cache": str(root / "cache"),
+            "images": str(root / "images"),
+            "work": str(root / "work"),
+            "logs": str(root / "logs"),
+        },
+    }
+
+
 def config(root, **overrides):
     values = dict(
         windows_iso=source(),
@@ -91,6 +133,63 @@ class SourceTests(unittest.TestCase):
             self.assertIn("=https", commands[0])
             self.assertIn("--proto-redir", commands[0])
 
+    def test_protected_catalog_removes_end_user_url_and_hash_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            approved = root / "approved.iso"
+            approved.write_bytes(b"approved Microsoft media")
+            digest = hashlib.sha256(approved.read_bytes()).hexdigest()
+            catalog = root / "windows.json"
+            catalog.write_text(json.dumps(catalog_document(root, digest)), encoding="utf-8")
+            catalog.chmod(0o600)
+            cfg = builder.Config.from_catalog(catalog)
+            self.assertEqual(cfg.windows_iso.local_path, approved)
+            self.assertEqual(cfg.windows_iso.sha256, digest)
+
+    def test_local_approved_iso_is_verified_and_imported_without_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            approved = root / "approved.iso"
+            approved.write_bytes(b"approved")
+            artifact = builder.ArtifactSource(
+                "Windows ISO", "", hashlib.sha256(b"approved").hexdigest(), (),
+                "windows.iso", approved,
+            )
+            with mock.patch.object(builder, "run") as command:
+                cached = builder.download_to_cache(artifact, root / "cache")
+            self.assertEqual(cached.read_bytes(), b"approved")
+            command.assert_not_called()
+
+    def test_one_time_registration_stages_iso_and_writes_no_replace_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            iso = root / "input.iso"
+            iso.write_bytes(b"Microsoft evaluation media")
+            digest = hashlib.sha256(iso.read_bytes()).hexdigest()
+            catalog = root / "etc" / "windows.json"
+            source_dir = root / "sources"
+            argv = [
+                "--catalog", str(catalog), "register-sources",
+                "--windows-iso", str(iso), "--windows-sha256", digest,
+                "--image-index", "4", "--image-name", "Windows Server 2022 SERVERDATACENTER",
+                "--virtio-url", "https://virtio.example/virtio.iso",
+                "--virtio-sha256", "b" * 64, "--virtio-allowed-host", "virtio.example",
+                "--cloudbase-url", "https://cloudbase.example/setup.msi",
+                "--cloudbase-sha256", "c" * 64,
+                "--cloudbase-allowed-host", "cloudbase.example",
+                "--approved-by", "test-admin", "--accept-microsoft-evaluation-license",
+                "--source-dir", str(source_dir),
+            ]
+            args = builder.parse_args(argv)
+            builder.register_approved_catalog(args)
+            document = json.loads(catalog.read_text(encoding="utf-8"))
+            staged = pathlib.Path(document["sources"]["windows_iso"]["local_path"])
+            self.assertEqual(staged.read_bytes(), iso.read_bytes())
+            self.assertEqual(document["sources"]["windows_iso"]["sha256"], digest)
+            self.assertEqual(catalog.stat().st_mode & 0o777, 0o600)
+            with self.assertRaisesRegex(builder.BuildError, "refusing overwrite"):
+                builder.register_approved_catalog(args)
+
 
 class WimTests(unittest.TestCase):
     def _metadata(self, root, *, index="4", name="Windows Server 2022 SERVERDATACENTER", edition="ServerDatacenterEval", install="Server", build="20348"):
@@ -132,7 +231,7 @@ class TemplateTests(unittest.TestCase):
     def test_packer_exposes_only_loopback_winrm_and_no_rdp(self):
         text = (ROOT / "windows-server-2022.pkr.hcl").read_text(encoding="utf-8")
         self.assertIn('source  = "github.com/hashicorp/qemu"', text)
-        self.assertIn('version = "= 1.1.7"', text)
+        self.assertIn('version = "= 1.1.3"', text)
         self.assertIn("hostfwd=tcp:127.0.0.1:", text)
         self.assertIn("restrict=on", text)
         self.assertIn('vnc_bind_address  = "127.0.0.1"', text)

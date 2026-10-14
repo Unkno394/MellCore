@@ -7,6 +7,11 @@ immutable files:
 * `windows-server-prepared.qcow2`
 * `windows-server-prepared.qcow2.sha256` (the first field is the 64-character SHA-256)
 
+If both files are absent, the adapter invokes the installed `hf-image-builder`. It uses the
+administrator-approved catalog at `/etc/honeyforge/image-sources/windows-server-2022.json`; no
+source URL or checksum is accepted from the end-user deployment command. A partially published
+image/manifest pair is never rebuilt or replaced automatically.
+
 Publish the image with an atomic no-replace operation, then publish the checksum manifest last as
 the readiness marker. Never overwrite or remove a published base: existing per-trap overlays
 retain its pathname as their backing file. Before every new overlay the agent verifies the
