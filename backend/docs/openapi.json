@@ -3250,19 +3250,19 @@
           "cpu_cores": {
             "type": "number",
             "format": "double",
-            "maximum": 1,
+            "maximum": 2,
             "minimum": 0.05
           },
           "memory_mb": {
             "type": "integer",
             "format": "int32",
-            "maximum": 512,
+            "maximum": 2048,
             "minimum": 32
           },
           "pids": {
             "type": "integer",
             "format": "int32",
-            "maximum": 256,
+            "maximum": 512,
             "minimum": 16
           }
         },
@@ -4094,6 +4094,16 @@
           "host": {
             "type": "string"
           },
+          "host_inventory": {
+            "description": "Latest typed inventory reported by the authenticated agent. The JSON schema version is\ncarried inside this object so the panel can evolve independently."
+          },
+          "inventory_updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
           "name": {
             "type": "string"
           },
@@ -4474,7 +4484,8 @@
         "type": "string",
         "enum": [
           "low",
-          "medium"
+          "medium",
+          "high"
         ]
       },
       "TrapPage": {

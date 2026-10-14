@@ -6,7 +6,7 @@
 
 use std::{net::IpAddr, time::Duration};
 
-use hf_core::{AgentCommand, HfspCodecError, HfspFrame, HfspMessageKind};
+use hf_core::{AgentCommand, HfspCodecError, HfspFrame, HfspMessageKind, HostInventory};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -77,6 +77,10 @@ pub struct Acknowledgement {
 pub struct AgentStatus {
     pub hostname: String,
     pub active_trap_count: u32,
+    /// Added to the existing heartbeat so inventory uses the authenticated, durable HFSP path.
+    /// Missing values keep heartbeats from older agents valid during rolling upgrades.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_inventory: Option<HostInventory>,
 }
 
 /// Normalized event emitted by any trap source. `payload` remains source-specific;
@@ -226,6 +230,7 @@ mod tests {
                 status: AgentStatus {
                     hostname: "vps".into(),
                     active_trap_count: 1,
+                    host_inventory: None,
                 },
             },
         );
@@ -237,5 +242,15 @@ mod tests {
             KazikEnvelope::decode_hfsp(&bad),
             Err(KazikCodecError::KindMismatch)
         ));
+    }
+
+    #[test]
+    fn heartbeat_without_inventory_remains_compatible() {
+        let status: AgentStatus = serde_json::from_value(json!({
+            "hostname": "older-agent",
+            "active_trap_count": 2
+        }))
+        .unwrap();
+        assert_eq!(status.host_inventory, None);
     }
 }

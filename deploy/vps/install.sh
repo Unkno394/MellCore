@@ -85,6 +85,8 @@ for binary in hf-center hf-agent hf-dispatcher honeyforge-backend; do
 done
 install -d -m 0755 /usr/local/lib/honeyforge
 tar --no-same-owner -xzf /opt/mellcore/artifacts/hf-high-ubuntu-ssh.tar.gz -C /usr/local/lib/honeyforge
+chmod 0755 /usr/local/lib/honeyforge/hf-image-builder/hf-image-builder \
+    /usr/local/lib/honeyforge/hf-image-builder/builder.py
 install -d -m 0700 /root/mellcore-backups
 cp -p /etc/hysteria/config.yaml "/root/mellcore-backups/hysteria-$(date +%Y%m%d-%H%M%S).yaml"
 systemctl stop hf-agent hf-center 2>/dev/null || true

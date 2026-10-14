@@ -115,6 +115,13 @@ impl ProfileInput {
         if self.honeypot_type == "pritvoryashka" {
             crate::pritvoryashka::validate_profile(self.level, &self.service_type, &self.config)?;
         }
+        if self.honeypot_type == "high-debian-ssh"
+            && (self.level != TrapLevel::High || self.service_type != "ssh")
+        {
+            return Err(AppError::invalid(
+                "Debian High profile must use high level and SSH service",
+            ));
+        }
         Ok(())
     }
 
@@ -122,6 +129,11 @@ impl ProfileInput {
         self.resources.unwrap_or_else(|| match self.level {
             TrapLevel::Low => crate::resources::ContainerResourceLimits::low_default(),
             TrapLevel::Medium => crate::resources::ContainerResourceLimits::middle_default(),
+            TrapLevel::High => crate::resources::ContainerResourceLimits {
+                cpu_cores: 2.0,
+                memory_mb: 2048,
+                pids: 512,
+            },
         })
     }
 }

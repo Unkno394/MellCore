@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use hf_core::HostInventory;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -51,6 +52,22 @@ impl BackendRegistry {
         self.client.post(endpoint).bearer_auth(&self.token)
             .json(&json!({"agent_id":agent_id,"trap_id":trap_id}))
             .send().await?.error_for_status()?;
+        Ok(())
+    }
+
+    pub async fn update_inventory(
+        &self,
+        agent_id: Uuid,
+        inventory: &HostInventory,
+    ) -> anyhow::Result<()> {
+        let endpoint = self.endpoint.replace("/traps", "/agents/inventory");
+        self.client
+            .post(endpoint)
+            .bearer_auth(&self.token)
+            .json(&json!({"agent_id": agent_id, "inventory": inventory}))
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 }

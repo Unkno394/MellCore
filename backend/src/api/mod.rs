@@ -207,6 +207,10 @@ pub fn router_with_state(state: AppState) -> Router {
             "/internal/v1/center/traps/removed",
             post(center_registry::mark_removed),
         )
+        .route(
+            "/internal/v1/center/agents/inventory",
+            post(center_registry::update_inventory),
+        )
         .route("/api/v1/auth/register", post(auth::register))
         .route("/api/v1/auth/verify-email", post(auth::verify_email))
         .route(

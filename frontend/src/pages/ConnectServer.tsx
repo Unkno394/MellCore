@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { ApiError, apiErrorMessage } from '../api/client'
 import type { MellCoreApi } from '../api/services'
 import type { ServerInput } from '../api/types'

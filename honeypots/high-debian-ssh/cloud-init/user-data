@@ -35,11 +35,24 @@ write_files:
       PasswordAuthentication yes
       PermitRootLogin prohibit-password
       X11Forwarding no
+  - path: /etc/systemd/system/qemu-guest-agent.service.d/10-honeyforge.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Service]
+      Restart=always
+      RestartSec=2
 runcmd:
   - test -x /usr/bin/python3
   - test -x /usr/sbin/sshd
+  - test -x /usr/sbin/qemu-ga
+  - test -x /usr/sbin/auditd
   - systemctl daemon-reload
-  - sh -c 'if command -v auditctl >/dev/null 2>&1; then augenrules --load && systemctl enable --now auditd; fi'
-  - sh -c 'if systemctl list-unit-files | grep -q "^qemu-guest-agent"; then systemctl enable --now qemu-guest-agent; fi'
+  - augenrules --load
+  - systemctl enable --now auditd
+  - sh -c 'systemctl enable qemu-guest-agent.service >/dev/null 2>&1 || true'
+  - systemctl restart qemu-guest-agent.service
+  - systemctl is-active --quiet qemu-guest-agent.service
   - systemctl enable --now ssh
   - systemctl enable --now honeyforge-high-telemetry.service
+  - systemctl is-active --quiet honeyforge-high-telemetry.service

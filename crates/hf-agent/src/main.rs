@@ -12,6 +12,7 @@ mod emergency;
 mod high_image;
 #[cfg(unix)]
 mod high_telemetry;
+mod host_inventory;
 mod sandbox;
 mod security_monitor;
 mod security_policy;
@@ -47,7 +48,7 @@ struct Args {
     #[arg(
         long,
         env = "HF_CENTER_URL",
-        required_unless_present = "standalone_high"
+        required_unless_present_any = ["standalone_high", "host_inventory", "host_inventory_json"]
     )]
     center_url: Option<String>,
     #[arg(
@@ -63,6 +64,12 @@ struct Args {
     /// Kazik. A dedicated non-production --state-dir is mandatory.
     #[arg(long, conflicts_with = "center_url")]
     standalone_high: bool,
+    /// Print a best-effort Linux host inventory and exit without registration.
+    #[arg(long, conflicts_with = "host_inventory_json")]
+    host_inventory: bool,
+    /// Print the typed Linux host inventory as JSON and exit without registration.
+    #[arg(long, conflicts_with = "host_inventory")]
+    host_inventory_json: bool,
     /// Initialize identity, apply an optional command and stop. Omit in systemd so telemetry runs.
     #[arg(long)]
     once: bool,
@@ -810,13 +817,13 @@ impl ComposeProjectStore {
             }
             AgentCommand::DeployHighVm(deployment) => {
                 Self::validate_high_deployment(&deployment, false)?;
-                ensure_high_vm_runtime(deployment.profile, deployment.image_source.is_some())?;
+                ensure_high_vm_runtime(deployment.profile, deployment.image_source.as_ref())?;
                 self.deploy_high(deployment, false)
             }
             AgentCommand::DeployHighUbuntu(deployment) => {
                 let deployment: HighVmDeployment = deployment.into();
                 Self::validate_high_deployment(&deployment, true)?;
-                ensure_high_vm_runtime(HighOsProfile::ubuntu_ssh(), false)?;
+                ensure_high_vm_runtime(HighOsProfile::ubuntu_ssh(), None)?;
                 self.deploy_high(deployment, true)
             }
             AgentCommand::ResetHighVm { trap_id, .. }
@@ -1378,6 +1385,15 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    if args.host_inventory || args.host_inventory_json {
+        let inventory = host_inventory::collect_once()?;
+        if args.host_inventory_json {
+            println!("{}", serde_json::to_string_pretty(&inventory)?);
+        } else {
+            println!("{}", host_inventory::render_human(&inventory));
+        }
+        return Ok(());
+    }
     if args.standalone_high {
         validate_standalone_high_args(&args)?;
     }
@@ -1576,6 +1592,7 @@ async fn run_kazik_hysteria_loop(
     let mut outbox_retry = tokio::time::interval(Duration::from_secs(5));
     let mut outbox = SqliteKazikOutbox::open(state_dir.join("kazik-outbox.sqlite"))?;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+    let mut host_inventory = host_inventory::HostInventoryCollector::new();
     let mut telemetry_poll = tokio::time::interval(telemetry::batch_wait());
     let mut emergency_tick = tokio::time::interval(Duration::from_secs(1));
     let existing_incident = emergency::pending(state_dir)?;
@@ -1878,9 +1895,20 @@ async fn run_kazik_hysteria_loop(
                     Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "trap telemetry collection failed"),
                 }
-                // High guest telemetry intentionally remains only in high-telemetry.sqlite.
-                // The current Center `Accepted` ACK confirms protocol acceptance, not durable
-                // storage, so it is not safe to enqueue or delete High source batches yet.
+                match high_telemetry::queue_pending_for_center(
+                    state_dir,
+                    &identity,
+                    &mut outbox,
+                ) {
+                    Ok(count) if count > 0 => {
+                        queued = true;
+                        tracing::info!(events = count, "High guest telemetry queued for Center");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "High guest telemetry remains in its durable SQLite queue")
+                    }
+                }
                 if queued {
                     if let Some(sender) = sender.as_ref() {
                         if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
@@ -1895,6 +1923,10 @@ async fn run_kazik_hysteria_loop(
                     .map(|duration| duration.as_millis() as i64)
                     .unwrap_or_default();
                 let active_trap_count = projects.active_trap_count();
+                let current_host_inventory = host_inventory.collect_for_transport();
+                if current_host_inventory.is_none() {
+                    tracing::warn!("host inventory exceeded the safe heartbeat size and was omitted");
+                }
                 outbox.enqueue(KazikEnvelope::new(
                     identity.agent_id,
                     identity.transport_credential.clone(),
@@ -1902,6 +1934,7 @@ async fn run_kazik_hysteria_loop(
                     KazikBody::Heartbeat { status: AgentStatus {
                         hostname: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
                         active_trap_count,
+                        host_inventory: current_host_inventory,
                     }},
                 ))?;
                 if let Some(sender) = sender.as_ref() {
@@ -1925,6 +1958,21 @@ async fn run_kazik_hysteria_loop(
                                     if incident_message_id == Some(ack.acknowledged_message_id) {
                                         emergency::record_alert_ack(state_dir, ack.acknowledged_message_id)?;
                                         missing_alert = None;
+                                    }
+                                    match high_telemetry::acknowledge_center_batch(
+                                        state_dir,
+                                        ack.acknowledged_message_id,
+                                    ) {
+                                        Ok(true) => tracing::debug!(
+                                            message_id = %ack.acknowledged_message_id,
+                                            "High source batch acknowledged after Center persistence"
+                                        ),
+                                        Ok(false) => {}
+                                        Err(error) => {
+                                            tracing::warn!(%error, message_id = %ack.acknowledged_message_id,
+                                                "could not finalize High source ACK; envelope will be retried");
+                                            continue;
+                                        }
                                     }
                                     outbox.acknowledge(ack.acknowledged_message_id)?;
                                     if pending_emergency.as_ref().is_some_and(|pending| pending.message_id == ack.acknowledged_message_id) {
@@ -2201,7 +2249,9 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
     if custom_image {
         required_tools.extend(["virt-inspector", "xorriso"]);
     }
-    if profile == HighOsProfile::arch_linux_ssh() {
+    if profile == HighOsProfile::arch_linux_ssh()
+        || profile == HighOsProfile::debian_ssh()
+    {
         required_tools.push("virt-customize");
     }
     if profile == HighOsProfile::windows_rdp() {
@@ -2229,7 +2279,11 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
 
 /// Install only the host tools needed by the selected adapter.  In particular, existing Ubuntu
 /// deployments do not acquire Windows ISO tooling as a side effect.
-fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow::Result<()> {
+fn ensure_high_vm_runtime(
+    profile: HighOsProfile,
+    image_source: Option<&hf_core::HighImageSource>,
+) -> anyhow::Result<()> {
+    let custom_image = image_source.is_some();
     let required_tools = high_vm_required_tools(profile, custom_image);
     let tools_ready = required_tools
         .iter()
@@ -2261,7 +2315,9 @@ fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow:
                     hf_core::HighImagePreparation::OfflineGuestPreparation => {}
                     hf_core::HighImagePreparation::BestEffortInstall => packages.push("xorriso"),
                 }
-                if (custom_image || profile == HighOsProfile::arch_linux_ssh())
+                if (custom_image
+                    || profile == HighOsProfile::arch_linux_ssh()
+                    || profile == HighOsProfile::debian_ssh())
                     && !packages.contains(&"libguestfs-tools")
                 {
                     packages.push("libguestfs-tools");
@@ -2306,7 +2362,9 @@ fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow:
                 if custom_image {
                     packages.push("libguestfs-tools-c");
                 }
-                if profile == HighOsProfile::arch_linux_ssh() {
+                if profile == HighOsProfile::arch_linux_ssh()
+                    || profile == HighOsProfile::debian_ssh()
+                {
                     packages.push("guestfs-tools");
                 }
                 if custom_image {
@@ -2347,7 +2405,10 @@ fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow:
                         packages.push("libisoburn")
                     }
                 }
-                if custom_image || profile == HighOsProfile::arch_linux_ssh() {
+                if custom_image
+                    || profile == HighOsProfile::arch_linux_ssh()
+                    || profile == HighOsProfile::debian_ssh()
+                {
                     packages.push("libguestfs");
                 }
                 if custom_image {
@@ -2374,6 +2435,11 @@ fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow:
         Path::new("/dev/kvm").exists(),
         "KVM is unavailable; this VPS/provider does not permit High VM traps"
     );
+    host_inventory::validate_high_vm_host(
+        profile,
+        image_source,
+        &host_inventory::current_static(),
+    )?;
     Ok(())
 }
 
@@ -2777,6 +2843,9 @@ mod tests {
         assert!(arch.contains(&"setfacl"));
         assert!(arch.contains(&"virt-customize"));
 
+        let debian = high_vm_required_tools(HighOsProfile::debian_ssh(), false);
+        assert!(debian.contains(&"virt-customize"));
+
         let windows = high_vm_required_tools(HighOsProfile::windows_rdp(), false);
         assert!(windows.contains(&"xorriso"));
         assert!(windows.contains(&"setfacl"));
@@ -3017,6 +3086,14 @@ mod tests {
         assert!(args.standalone_high);
         assert!(args.center_url.is_none());
         assert_eq!(args.state_dir, state_dir);
+    }
+
+    #[test]
+    fn host_inventory_cli_does_not_require_center_registration() {
+        let args = Args::try_parse_from(["hf-agent", "--host-inventory-json"]).unwrap();
+        assert!(args.host_inventory_json);
+        assert!(args.center_url.is_none());
+        assert!(!args.standalone_high);
     }
 
     #[test]

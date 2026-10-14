@@ -1,7 +1,10 @@
 //! Stable domain contracts. Network transports and infrastructure live outside this crate.
 
+pub mod host_inventory;
 pub mod math;
 pub mod security;
+
+pub use host_inventory::*;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

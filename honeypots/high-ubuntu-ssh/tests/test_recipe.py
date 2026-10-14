@@ -242,6 +242,7 @@ class MultiOsRecipeTests(unittest.TestCase):
                     "high-arch-ssh",
                     "high-windows-rdp",
                     "high-custom-iso",
+                    "hf-image-builder",
                 },
             )
 

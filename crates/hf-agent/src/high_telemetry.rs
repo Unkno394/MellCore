@@ -12,11 +12,63 @@ use crate::sandbox::{
 };
 use hf_core::{HighGuestConnection, HighOsProfile};
 use hf_services::high_telemetry::{
-    HighTelemetryStore, SharedHighTelemetryStore, receive_high_telemetry_connection,
+    DEFAULT_MAX_PENDING_HIGH_EVENTS, HighTelemetryStore, SharedHighTelemetryStore,
+    receive_high_telemetry_connection,
 };
+use hf_services::kazik_outbox::SqliteKazikOutbox;
+use kazik_protocol::{DurableOutbox, MAX_TELEMETRY_BATCH_EVENTS, MAX_TELEMETRY_PACKET_BYTES};
 use serde::{Deserialize, Serialize};
 use tokio::{net::UnixStream, task::JoinHandle};
 use uuid::Uuid;
+
+use crate::AgentIdentity;
+
+/// Move one stable High batch into the ordinary durable Kazik outbox.  Source rows remain in
+/// high-telemetry.sqlite until Center confirms that this exact message was durably persisted.
+pub fn queue_pending_for_center(
+    state_dir: &Path,
+    identity: &AgentIdentity,
+    outbox: &mut SqliteKazikOutbox,
+) -> anyhow::Result<usize> {
+    let path = state_dir.join("high-telemetry.sqlite");
+    if !path.is_file() {
+        return Ok(0);
+    }
+    let mut store = HighTelemetryStore::open(&path, DEFAULT_MAX_PENDING_HIGH_EVENTS)?;
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    let Some(batch) = store.prepare_kazik_batch(
+        MAX_TELEMETRY_BATCH_EVENTS,
+        MAX_TELEMETRY_PACKET_BYTES / 2,
+        created_at,
+    )? else {
+        return Ok(0);
+    };
+    let count = batch.events.len();
+    let envelope = batch.kazik_envelope(
+        identity.agent_id,
+        identity.transport_credential.clone(),
+    );
+    crate::telemetry::ensure_packet_size(&envelope)?;
+    outbox.enqueue(envelope)?;
+    Ok(count)
+}
+
+/// Apply a semantic Center ACK to the High source queue. Unknown message IDs are intentionally
+/// ignored because Low/Middle/heartbeat envelopes share the same Kazik outbox.
+pub fn acknowledge_center_batch(state_dir: &Path, message_id: Uuid) -> anyhow::Result<bool> {
+    let path = state_dir.join("high-telemetry.sqlite");
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let mut store = HighTelemetryStore::open(path, DEFAULT_MAX_PENDING_HIGH_EVENTS)?;
+    if !store.has_kazik_batch(message_id)? {
+        return Ok(false);
+    }
+    store.acknowledge_durable_kazik_batch(message_id)?;
+    Ok(true)
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct DomainCounters {
@@ -549,6 +601,59 @@ mod tests {
         assert!(snapshot.guest_service_ready && snapshot.dnat_ready);
         assert!(!snapshot.ssh_ready);
         assert_eq!(snapshot.guest_connection, "rdp");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn high_batch_is_stable_until_center_ack_then_source_rows_are_deleted() {
+        let root = std::env::temp_dir().join(format!("hf-high-forward-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let trap_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut source = HighTelemetryStore::open(root.join("high-telemetry.sqlite"), 10).unwrap();
+        source
+            .ingest(
+                agent_id,
+                trap_id,
+                hf_services::high_telemetry::GuestHighEvent {
+                    version: hf_services::high_telemetry::HIGH_TELEMETRY_VERSION,
+                    guest_event_id: Uuid::new_v4(),
+                    guest_sequence: 1,
+                    occurred_at_unix_ms: 1_760_000_000_000,
+                    event_type: "process.exec".into(),
+                    session_id: Some("audit:1".into()),
+                    source_ip: None,
+                    source_port: None,
+                    destination_ip: None,
+                    destination_port: None,
+                    event_origin: "kernel_audit".into(),
+                    event_confidence: "observed".into(),
+                    transport: Some("local".into()),
+                    payload: serde_json::json!({"executable":"/usr/bin/id"}),
+                },
+                1_760_000_000_100,
+            )
+            .unwrap();
+        drop(source);
+
+        let identity = AgentIdentity {
+            agent_id,
+            transport_credential: "test-credential".into(),
+            hysteria: None,
+        };
+        let mut outbox = SqliteKazikOutbox::open(root.join("kazik.sqlite")).unwrap();
+        assert_eq!(queue_pending_for_center(&root, &identity, &mut outbox).unwrap(), 1);
+        let first = outbox.ready_to_send(10).unwrap();
+        assert_eq!(first.len(), 1);
+        let message_id = first[0].envelope.message_id;
+
+        assert_eq!(queue_pending_for_center(&root, &identity, &mut outbox).unwrap(), 1);
+        assert_eq!(outbox.ready_to_send(10).unwrap()[0].envelope.message_id, message_id);
+        assert!(acknowledge_center_batch(&root, message_id).unwrap());
+        let source = HighTelemetryStore::open(root.join("high-telemetry.sqlite"), 10).unwrap();
+        assert_eq!(source.pending_count().unwrap(), 0);
+        drop(source);
+        assert!(!acknowledge_center_batch(&root, message_id).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 }

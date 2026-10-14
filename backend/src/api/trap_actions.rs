@@ -6,7 +6,7 @@ use crate::{
     resources::{self, Trap},
 };
 use axum::{Extension, Json, extract::{Path, State}, http::StatusCode};
-use hf_core::{AgentCommand, PritvoryashkaDeployment};
+use hf_core::{AgentCommand, HighOsProfile, HighVmDeployment, PritvoryashkaDeployment};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use utoipa::ToSchema;
@@ -39,6 +39,20 @@ struct QueuedCommand { message_id: Uuid }
 
 #[derive(Deserialize)]
 struct CenterCommandStatus { status: String, detail: Option<String> }
+
+const DEBIAN_HIGH_IMAGE: &str =
+    "/var/lib/honeyforge/images/debian-12-genericcloud-amd64.qcow2";
+
+fn debian_high_deployment(trap_id: Uuid, external_service_port: u16) -> AgentCommand {
+    AgentCommand::DeployHighVm(HighVmDeployment {
+        command_id: Uuid::new_v4(),
+        trap_id,
+        base_image: DEBIAN_HIGH_IMAGE.into(),
+        external_service_port,
+        profile: HighOsProfile::debian_ssh(),
+        image_source: None,
+    })
+}
 
 #[utoipa::path(post, path="/api/v1/traps/{trap_id}/actions", tag="traps", security(("bearer"=[])), params(("trap_id"=Uuid, Path)), request_body=TrapActionRequest, responses((status=202, body=TrapActionProgress), (status=401, body=crate::errors::ErrorResponse), (status=404, body=crate::errors::ErrorResponse), (status=409, body=crate::errors::ErrorResponse), (status=503, body=crate::errors::ErrorResponse)))]
 pub async fn start(
@@ -138,13 +152,46 @@ fn commands_for(action: TrapAction, trap: &Trap) -> Result<Vec<AgentCommand>, Ap
                     resources: trap.resources.into(),
                 }))
             }
+            "high-debian-ssh" => {
+                let port = trap.ports.first().ok_or_else(AppError::internal)?;
+                let external_service_port =
+                    u16::try_from(port.host_port).map_err(|_| AppError::internal())?;
+                Ok(debian_high_deployment(trap.trap_id, external_service_port))
+            }
             _ => Err(AppError::conflict("No deployment recipe is available for this trap")),
         }
     };
     match action {
         TrapAction::Start => Ok(vec![deploy()?]),
         TrapAction::Stop => Ok(vec![stop()]),
+        TrapAction::Restart
+            if trap.profile_snapshot.honeypot_type == "high-debian-ssh" =>
+        {
+            Ok(vec![AgentCommand::ResetHighVm {
+                command_id: Uuid::new_v4(),
+                trap_id: trap.trap_id,
+            }])
+        }
         TrapAction::Restart => Ok(vec![stop(), deploy()?]),
         TrapAction::Remove => Ok(vec![remove()]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debian_panel_action_uses_managed_profile_image_and_external_port() {
+        let trap_id = Uuid::new_v4();
+        let AgentCommand::DeployHighVm(deployment) = debian_high_deployment(trap_id, 22221)
+        else {
+            panic!("expected generic High deployment")
+        };
+        assert_eq!(deployment.trap_id, trap_id);
+        assert_eq!(deployment.external_service_port, 22221);
+        assert_eq!(deployment.base_image, DEBIAN_HIGH_IMAGE);
+        assert_eq!(deployment.profile, HighOsProfile::debian_ssh());
+        assert!(deployment.image_source.is_none());
     }
 }

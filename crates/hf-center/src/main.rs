@@ -765,7 +765,7 @@ async fn register_existing_trap(
 ) -> Result<Json<ExistingTrapResponse>, StatusCode> {
     authorize_control(&state, &headers)?;
     if input.trap_id.is_nil() || input.host_port == 0
-        || !matches!(input.tier.as_str(), "low" | "middle") {
+        || !matches!(input.tier.as_str(), "low" | "middle" | "high-debian-ssh") {
         return Err(StatusCode::BAD_REQUEST);
     }
     let registry = state.backend_registry.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
@@ -833,6 +833,26 @@ async fn queue_command(
                 .map_err(|error| { warn!(%error, "could not persist trap ownership"); StatusCode::INTERNAL_SERVER_ERROR })?;
         }
         AgentCommand::DeployHighVm(deployment) => {
+            if deployment.profile == hf_core::HighOsProfile::debian_ssh() {
+                if let Some(registry) = state.backend_registry.as_ref() {
+                    let (target, ssh_port) =
+                        security.target(&agent_id).ok_or(StatusCode::CONFLICT)?;
+                    registry
+                        .register(
+                            agent_id,
+                            deployment.trap_id,
+                            target,
+                            ssh_port,
+                            "high-debian-ssh",
+                            deployment.external_service_port,
+                        )
+                        .await
+                        .map_err(|error| {
+                            warn!(%error, "backend Debian High registration failed");
+                            StatusCode::BAD_GATEWAY
+                        })?;
+                }
+            }
             security.register_trap(agent_id, deployment.trap_id)
                 .map_err(|error| { warn!(%error, "could not persist High trap ownership"); StatusCode::INTERNAL_SERVER_ERROR })?;
         }
@@ -1214,7 +1234,20 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
                 AckDisposition::Accepted
                 }
             }
-            KazikBody::Heartbeat { .. } => AckDisposition::Accepted,
+            KazikBody::Heartbeat { status } => {
+                if let (Some(registry), Some(inventory)) =
+                    (&state.backend_registry, &status.host_inventory)
+                    && let Err(error) = registry
+                        .update_inventory(envelope.agent_id, inventory)
+                        .await
+                {
+                    // Inventory is refreshed on every heartbeat.  A backend outage must not
+                    // block command delivery or accumulate unbounded heartbeat retries.
+                    tracing::warn!(%error, agent_id=%envelope.agent_id,
+                        "host inventory was not persisted by backend");
+                }
+                AckDisposition::Accepted
+            }
             KazikBody::Register(_) | KazikBody::Command { .. } | KazikBody::Error { .. } => {
                 AckDisposition::Rejected
             }
@@ -1290,7 +1323,7 @@ fn render_install_script(token: &str, center_url: &str) -> String {
         "#!/bin/sh\nset -eu\nif [ \"$(id -u)\" -eq 0 ]; then SUDO=''; else SUDO='sudo -n'; fi\nensure_docker() {{\n  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then return; fi\n  [ -r /etc/os-release ] || {{ echo 'Cannot identify Linux distribution' >&2; exit 1; }}\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        echo 'Regional Ubuntu mirror configured; switching to archive.ubuntu.com before package update' >&2\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 bpftrace nftables\n      $SUDO systemctl enable --now docker\n      ;;\n    fedora)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    rhel|centos|rocky|almalinux)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    arch|manjaro)\n      $SUDO pacman -Sy --noconfirm docker docker-compose\n      $SUDO systemctl enable --now docker\n      ;;\n    alpine)\n      $SUDO apk add docker docker-cli-compose\n      $SUDO rc-update add docker default\n      $SUDO service docker start\n      ;;\n    *) echo \"Unsupported Linux distribution: $ID\" >&2; exit 1 ;;\n  esac\n  docker compose version >/dev/null\n}}\nif ! command -v bpftrace >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1; then\n  if [ ! -r /etc/os-release ]; then echo 'Cannot identify Linux distribution' >&2; exit 1; fi\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y bpftrace nftables\n      ;;\n    *) echo 'Install bpftrace and nftables for HoneyForge security monitoring' >&2 ;;\n  esac\nfi\n$SUDO install -d -m 0700 /etc/honeyforge\n$SUDO install -m 0755 /tmp/hf-agent-bootstrap /usr/local/bin/hf-agent\nif [ -f /tmp/hf-kozyavka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-kozyavka-image.tar\n  rm -f /tmp/hf-kozyavka-image.tar\nfi\nprintf '%s' '{token}' | $SUDO tee /etc/honeyforge/enrollment-token >/dev/null\nif command -v systemctl >/dev/null 2>&1; then\n  $SUDO tee /etc/systemd/system/hf-agent.service >/dev/null <<'UNIT'\n[Unit]\nDescription=HoneyForge agent\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nEnvironment=HF_CENTER_URL={center_url}\nEnvironment=HF_KOZYAVKA_IMAGE=honeyforge-low:local\nExecStart=/usr/local/bin/hf-agent\nRestart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\nUNIT\n  $SUDO systemctl daemon-reload\n  $SUDO systemctl enable --now hf-agent.service\nelif command -v rc-update >/dev/null 2>&1; then\n  $SUDO tee /etc/init.d/hf-agent >/dev/null <<'OPENRC'\n#!/sbin/openrc-run\nname=\"HoneyForge agent\"\ncommand=\"/usr/local/bin/hf-agent\"\ncommand_background=\"yes\"\npidfile=\"/run/hf-agent.pid\"\nexport HF_CENTER_URL={center_url}\nexport HF_KOZYAVKA_IMAGE=honeyforge-low:local\nOPENRC\n  $SUDO chmod 0755 /etc/init.d/hf-agent\n  $SUDO rc-update add hf-agent default\n  $SUDO rc-service hf-agent start\nelse\n  echo 'Unsupported init system: systemd or OpenRC is required' >&2\n  exit 1\nfi\nrm -f /tmp/hf-agent-bootstrap\n"
     );
     script.push_str(
-        "\nif [ -f /tmp/hf-high-ubuntu-ssh.tar.gz ]; then\n  $SUDO install -d -m 0755 /usr/local/lib/honeyforge\n  $SUDO tar -xzf /tmp/hf-high-ubuntu-ssh.tar.gz -C /usr/local/lib/honeyforge\n  for recipe in /usr/local/lib/honeyforge/high-*; do\n    [ -d \"$recipe\" ] || continue\n    [ -d \"$recipe/cloud-init\" ] && $SUDO chmod -R a-w \"$recipe/cloud-init\"\n    [ -d \"$recipe/scripts\" ] && $SUDO find \"$recipe/scripts\" -type f -exec chmod 0755 {} \\;\n  done\n  rm -f /tmp/hf-high-ubuntu-ssh.tar.gz\nfi\nif [ -f /tmp/hf-initial-command.json ]; then\n  $SUDO install -d -m 0700 /var/lib/honeyforge/inbox\n  $SUDO install -m 0600 /tmp/hf-initial-command.json /var/lib/honeyforge/inbox/initial-high.json\n  rm -f /tmp/hf-initial-command.json\nfi\n",
+        "\nif [ -f /tmp/hf-high-ubuntu-ssh.tar.gz ]; then\n  $SUDO install -d -m 0755 /usr/local/lib/honeyforge\n  $SUDO tar -xzf /tmp/hf-high-ubuntu-ssh.tar.gz -C /usr/local/lib/honeyforge\n  for recipe in /usr/local/lib/honeyforge/high-*; do\n    [ -d \"$recipe\" ] || continue\n    [ -d \"$recipe/cloud-init\" ] && $SUDO chmod -R a-w \"$recipe/cloud-init\"\n    [ -d \"$recipe/scripts\" ] && $SUDO find \"$recipe/scripts\" -type f -exec chmod 0755 {} \\;\n  done\n  if [ -d /usr/local/lib/honeyforge/hf-image-builder ]; then\n    $SUDO chmod 0755 /usr/local/lib/honeyforge/hf-image-builder/hf-image-builder /usr/local/lib/honeyforge/hf-image-builder/builder.py\n  fi\n  rm -f /tmp/hf-high-ubuntu-ssh.tar.gz\nfi\nif [ -f /tmp/hf-initial-command.json ]; then\n  $SUDO install -d -m 0700 /var/lib/honeyforge/inbox\n  $SUDO install -m 0600 /tmp/hf-initial-command.json /var/lib/honeyforge/inbox/initial-high.json\n  rm -f /tmp/hf-initial-command.json\nfi\n",
     );
     script.push_str("\nif [ -f /tmp/hysteria-bootstrap ]; then\n  $SUDO install -m 0755 /tmp/hysteria-bootstrap /usr/local/bin/hysteria\n  rm -f /tmp/hysteria-bootstrap\nfi\nif [ -f /tmp/hf-pritvoryashka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-pritvoryashka-image.tar\n  rm -f /tmp/hf-pritvoryashka-image.tar\nfi\n");
     script

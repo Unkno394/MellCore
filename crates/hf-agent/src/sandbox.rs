@@ -108,6 +108,8 @@ struct HighOsAdapter {
     /// This is required for immutable QCOW2 backing files: silently trusting an existing
     /// cache entry would let corruption propagate into every new overlay.
     verify_cached_managed_image: bool,
+    /// Profiles whose first-boot contract requires a responsive QEMU Guest Agent.
+    require_guest_agent: bool,
     publication: HighPublication,
     scripts: HighLifecycleScripts,
 }
@@ -246,6 +248,7 @@ impl LibvirtSandboxManager {
                     readiness_timeout: Duration::from_secs(60),
                     dhcp_wait_attempts: 12,
                     verify_cached_managed_image: false,
+                    require_guest_agent: false,
                     publication: HighPublication::Required,
                     scripts: UBUNTU_SCRIPTS,
                 },
@@ -256,6 +259,7 @@ impl LibvirtSandboxManager {
                     readiness_timeout: Duration::from_secs(90),
                     dhcp_wait_attempts: 18,
                     verify_cached_managed_image: true,
+                    require_guest_agent: true,
                     publication: HighPublication::Required,
                     scripts: GENERIC_SCRIPTS,
                 },
@@ -266,6 +270,7 @@ impl LibvirtSandboxManager {
                     readiness_timeout: Duration::from_secs(90),
                     dhcp_wait_attempts: 18,
                     verify_cached_managed_image: true,
+                    require_guest_agent: false,
                     publication: HighPublication::Required,
                     scripts: GENERIC_SCRIPTS,
                 },
@@ -276,6 +281,7 @@ impl LibvirtSandboxManager {
                     readiness_timeout: Duration::from_secs(300),
                     dhcp_wait_attempts: 180,
                     verify_cached_managed_image: true,
+                    require_guest_agent: false,
                     publication: HighPublication::Disabled,
                     scripts: WINDOWS_PREPARED_SCRIPTS,
                 },
@@ -286,6 +292,7 @@ impl LibvirtSandboxManager {
                     readiness_timeout: Duration::from_secs(900),
                     dhcp_wait_attempts: 180,
                     verify_cached_managed_image: false,
+                    require_guest_agent: false,
                     publication: HighPublication::Required,
                     scripts: GENERIC_SCRIPTS,
                 },
@@ -296,6 +303,7 @@ impl LibvirtSandboxManager {
                     readiness_timeout: Duration::from_secs(120),
                     dhcp_wait_attempts: 24,
                     verify_cached_managed_image: true,
+                    require_guest_agent: false,
                     publication: HighPublication::Required,
                     scripts: GENERIC_SCRIPTS,
                 },
@@ -306,6 +314,7 @@ impl LibvirtSandboxManager {
                     readiness_timeout: Duration::from_secs(600),
                     dhcp_wait_attempts: 120,
                     verify_cached_managed_image: true,
+                    require_guest_agent: false,
                     publication: HighPublication::Disabled,
                     scripts: BEST_EFFORT_ISO_SCRIPTS,
                 },
@@ -316,6 +325,11 @@ impl LibvirtSandboxManager {
 
     pub fn create_and_start(&self, vm: &HighVm) -> anyhow::Result<()> {
         let adapter = self.adapter_for(vm.profile)?;
+        crate::host_inventory::validate_high_vm_host(
+            vm.profile,
+            vm.image_source.as_ref(),
+            &crate::host_inventory::current_static(),
+        )?;
         if vm.external_service_port == 0 && adapter.publication == HighPublication::Required {
             anyhow::bail!(
                 "High {} VM needs an external service port",
@@ -443,11 +457,13 @@ impl LibvirtSandboxManager {
     }
 
     pub fn healthy(&self, vm: &HighVm) -> anyhow::Result<bool> {
+        let require_guest_agent = self.adapter_for(vm.profile)?.require_guest_agent;
         Ok(high_running_health(
             self.domain_state(vm.instance_id)?,
             self.domain_matches_security_profile(vm)?,
             self.has_published_service(vm),
-            self.guest_service_ready(vm),
+            self.guest_service_ready(vm)
+                && (!require_guest_agent || self.guest_agent_ready(vm.instance_id)),
         ))
     }
 
@@ -552,16 +568,31 @@ impl LibvirtSandboxManager {
     }
 
     fn wait_until_ready(&self, vm: &HighVm) -> anyhow::Result<()> {
-        let timeout = self.adapter_for(vm.profile)?.readiness_timeout;
+        let adapter = self.adapter_for(vm.profile)?;
+        let timeout = adapter.readiness_timeout;
         let deadline = Instant::now() + timeout;
+        let mut service_ready = false;
         while Instant::now() < deadline {
             if self.access_policy_ready(vm) && self.guest_service_ready(vm) {
-                if !self.guest_agent_ready(vm.instance_id) {
-                    tracing::warn!(trap_id = %vm.instance_id, "High VM service is ready but qemu-guest-agent is unavailable");
+                service_ready = true;
+                if self.guest_agent_ready(vm.instance_id) {
+                    return Ok(());
                 }
-                return Ok(());
+                if !adapter.require_guest_agent {
+                    tracing::warn!(trap_id = %vm.instance_id, "High VM service is ready but qemu-guest-agent is unavailable");
+                    return Ok(());
+                }
             }
             std::thread::sleep(Duration::from_secs(2));
+        }
+        if service_ready && adapter.require_guest_agent {
+            return Err(lifecycle_error(
+                "GUEST_AGENT_UNAVAILABLE",
+                "readiness",
+                anyhow::anyhow!(
+                    "guest service is reachable but qemu-guest-agent did not answer guest-ping"
+                ),
+            ));
         }
         let (code, stage) = match vm.profile.image_preparation {
             HighImagePreparation::UnattendedInstall | HighImagePreparation::BestEffortInstall => {
@@ -926,7 +957,9 @@ mod tests {
             .unwrap();
         assert!(arch.verify_cached_managed_image);
         assert!(debian.verify_cached_managed_image);
+        assert!(debian.require_guest_agent);
         assert!(!ubuntu.verify_cached_managed_image);
+        assert!(!ubuntu.require_guest_agent);
         assert!(windows.verify_cached_managed_image);
         assert_eq!(windows.publication, HighPublication::Disabled);
         assert!(!legacy.verify_cached_managed_image);

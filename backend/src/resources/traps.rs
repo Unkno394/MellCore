@@ -34,6 +34,19 @@ async fn snapshot(
         crate::pritvoryashka::validate_profile(profile.level, &profile.service_type, &effective)?;
         crate::pritvoryashka::validate_ports(&input.ports)?;
     }
+    if profile.honeypot_type == "high-debian-ssh" {
+        if profile.level != crate::models::TrapLevel::High
+            || profile.service_type != "ssh"
+            || input.ports.len() != 1
+            || input.ports[0].transport != Transport::Tcp
+            || input.ports[0].target_port != 22
+            || input.ports[0].route_mode != RouteMode::Direct
+        {
+            return Err(AppError::invalid(
+                "Debian High requires one direct TCP port targeting guest SSH port 22",
+            ));
+        }
+    }
     Ok((profile, effective, resources))
 }
 async fn reserve(

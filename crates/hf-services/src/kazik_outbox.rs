@@ -250,6 +250,7 @@ mod tests {
                 status: AgentStatus {
                     hostname: "test-vps".into(),
                     active_trap_count: 2,
+                    host_inventory: None,
                 },
             },
         )
