@@ -97,6 +97,64 @@ class ArchCloudInitTests(unittest.TestCase):
         self.assertIn("dhcp6: false", network)
         self.assertIn("accept-ra: false", network)
 
+    def test_networkd_dhcp_is_injected_only_into_per_instance_overlay(self):
+        unit = (RECIPE / "guest" / "05-honeyforge-high.network").read_text()
+        self.assertIn("Name=en* eth*", unit)
+        self.assertIn("DHCP=ipv4", unit)
+        self.assertIn("IPv6AcceptRA=no", unit)
+        self.assertIn("LinkLocalAddressing=no", unit)
+
+        script = (RECIPE / "scripts" / "create-overlay.sh").read_text()
+        self.assertIn('virt-customize \\\n  -a "$instance_dir/disk.qcow2"', script)
+        self.assertIn("--no-network", script)
+        self.assertIn("05-honeyforge-high.network:/etc/systemd/network/05-honeyforge-high.network", script)
+        self.assertNotIn('virt-customize -a "$base_image"', script)
+        self.assertLess(
+            script.index("qemu-img create"),
+            script.index("LIBGUESTFS_BACKEND=direct virt-customize"),
+        )
+
+    def test_overlay_generation_never_passes_base_image_to_virt_customize(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tools = root / "tools"
+            tools.mkdir()
+            for name, body in {
+                "qemu-img": '#!/bin/sh\n: > "$8"\n',
+                "cloud-localds": '#!/bin/sh\nshift\n: > "$1"\n',
+                "virt-customize": '#!/bin/sh\nprintf "%s\\n" "$@" > "$HF_TEST_VIRT_ARGS"\n',
+            }.items():
+                tool = tools / name
+                tool.write_text(body)
+                tool.chmod(tool.stat().st_mode | stat.S_IXUSR)
+
+            base = root / "verified-base.qcow2"
+            base.write_bytes(b"immutable verified base")
+            instance = root / "instance"
+            arguments = root / "virt-customize.args"
+            env = os.environ.copy()
+            env["PATH"] = f"{tools}:{env['PATH']}"
+            env["HF_TEST_VIRT_ARGS"] = str(arguments)
+            subprocess.run(
+                [
+                    "sh",
+                    str(RECIPE / "scripts" / "create-overlay.sh"),
+                    str(base),
+                    str(instance),
+                    "11111111-2222-4333-8444-555555555555",
+                ],
+                check=True,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
+            args = arguments.read_text().splitlines()
+            self.assertEqual(args[args.index("-a") + 1], str(instance / "disk.qcow2"))
+            self.assertIn("--no-network", args)
+            self.assertNotIn(str(base), args)
+            self.assertEqual(base.read_bytes(), b"immutable verified base")
+
     def test_template_has_unique_credentials_ssh_and_sensor_startup(self):
         user_data = (RECIPE / "cloud-init" / "user-data").read_text()
         self.assertIn("@@ANALYST_PASSWORD_HASH@@", user_data)

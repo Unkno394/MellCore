@@ -69,6 +69,7 @@ with tarfile.open(root / 'hf-high-ubuntu-ssh.tar.gz') as archive:
         'high-ubuntu-ssh/scripts/create-overlay.sh', 'high-ubuntu-ssh/cloud-init/user-data',
         'high-arch-ssh/scripts/launch.sh', 'high-arch-ssh/scripts/download-base-image.sh',
         'high-arch-ssh/cloud-init/user-data',
+        'high-arch-ssh/guest/05-honeyforge-high.network',
         'high-debian-ssh/scripts/launch.sh', 'high-debian-ssh/scripts/download-base-image.sh',
         'high-debian-ssh/cloud-init/user-data',
         'high-windows-rdp/scripts/launch.sh', 'high-windows-rdp/scripts/download-base-image.sh',

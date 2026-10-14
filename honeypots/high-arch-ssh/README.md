@@ -15,6 +15,11 @@ and qemu-guest-agent. `auditd` is optional: when absent, SSH/session and sensor 
 available, while audit-backed process/file/network events are not emitted. The isolated guest does
 not contact package mirrors during first boot.
 
-On Ubuntu the agent installs `acl` for this adapter and grants `libvirt-qemu` only the ACLs needed
-to traverse the private standalone state directory, read the verified base/seed, write the overlay,
-and create the telemetry socket. The generated password and rendered cloud-init remain root-only.
+The current image does not render the NoCloud v2 network configuration into a networkd unit early
+enough to obtain DHCP. The recipe therefore injects `05-honeyforge-high.network` with
+`virt-customize --no-network` into each new overlay. The verified base QCOW2 is never modified.
+
+On Ubuntu the agent installs `acl` and `libguestfs-tools` for this adapter and grants
+`libvirt-qemu` only the ACLs needed to traverse the private standalone state directory, read the
+verified base/seed, write the overlay, and create the telemetry socket. The generated password and
+rendered cloud-init remain root-only.

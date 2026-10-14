@@ -2201,6 +2201,9 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
     if custom_image {
         required_tools.extend(["virt-inspector", "xorriso"]);
     }
+    if profile == HighOsProfile::arch_linux_ssh() {
+        required_tools.push("virt-customize");
+    }
     if matches!(
         profile.guest_os,
         hf_core::HighGuestOs::Debian
@@ -2248,8 +2251,12 @@ fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow:
                     hf_core::HighImagePreparation::OfflineGuestPreparation => {}
                     hf_core::HighImagePreparation::BestEffortInstall => packages.push("xorriso"),
                 }
-                if custom_image && !packages.contains(&"libguestfs-tools") {
+                if (custom_image || profile == HighOsProfile::arch_linux_ssh())
+                    && !packages.contains(&"libguestfs-tools")
+                {
                     packages.push("libguestfs-tools");
+                }
+                if custom_image {
                     if !packages.contains(&"xorriso") {
                         packages.push("xorriso");
                     }
@@ -2285,6 +2292,11 @@ fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow:
                 }
                 if custom_image {
                     packages.push("libguestfs-tools-c");
+                }
+                if profile == HighOsProfile::arch_linux_ssh() {
+                    packages.push("guestfs-tools");
+                }
+                if custom_image {
                     if !packages.contains(&"xorriso") {
                         packages.push("xorriso");
                     }
@@ -2322,8 +2334,10 @@ fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow:
                         packages.push("libisoburn")
                     }
                 }
-                if custom_image {
+                if custom_image || profile == HighOsProfile::arch_linux_ssh() {
                     packages.push("libguestfs");
+                }
+                if custom_image {
                     if !packages.contains(&"libisoburn") {
                         packages.push("libisoburn");
                     }
@@ -2748,6 +2762,7 @@ mod tests {
         let arch = high_vm_required_tools(HighOsProfile::arch_linux_ssh(), false);
         assert!(arch.contains(&"cloud-localds"));
         assert!(arch.contains(&"setfacl"));
+        assert!(arch.contains(&"virt-customize"));
 
         let windows = high_vm_required_tools(HighOsProfile::windows_rdp(), false);
         assert!(windows.contains(&"xorriso"));

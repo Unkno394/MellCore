@@ -105,6 +105,7 @@ class MultiOsRecipeTests(unittest.TestCase):
             fake_bin.mkdir()
             executable(fake_bin / "qemu-img", "#!/bin/sh\n: > \"$8\"\n")
             executable(fake_bin / "cloud-localds", "#!/bin/sh\nshift\n: > \"$1\"\n")
+            executable(fake_bin / "virt-customize", "#!/bin/sh\nexit 0\n")
             base_image = root / "arch.qcow2"
             base_image.write_bytes(b"test base")
             instance = root / "instance"

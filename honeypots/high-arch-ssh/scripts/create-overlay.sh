@@ -10,6 +10,7 @@ shared_guest_dir=${HF_HIGH_COMMON_GUEST_DIR:-"$script_dir/../../high-ubuntu-ssh/
 validate_instance_id "$instance_id"
 command -v qemu-img >/dev/null
 command -v cloud-localds >/dev/null
+command -v virt-customize >/dev/null
 command -v openssl >/dev/null
 command -v base64 >/dev/null
 command -v python3 >/dev/null
@@ -18,6 +19,7 @@ command -v python3 >/dev/null
 [ -r "$shared_guest_dir/high_telemetry_audit.py" ]
 [ -r "$shared_guest_dir/90-honeyforge.rules" ]
 [ -r "$shared_guest_dir/high-telemetry.service" ]
+[ -r "$script_dir/../guest/05-honeyforge-high.network" ]
 mkdir -p "$instance_dir"
 recipe_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 python3 - "$shared_guest_dir/high_telemetry_sensor.py" "$shared_guest_dir/high_telemetry_audit.py" <<'PY'
@@ -45,5 +47,14 @@ if grep -q '@@[A-Z0-9_][A-Z0-9_]*@@' "$instance_dir/meta-data" "$instance_dir/us
   exit 1
 fi
 qemu-img create -f qcow2 -F qcow2 -b "$base_image" "$instance_dir/disk.qcow2" 20G
+# Arch's cloud-init package does not render the NoCloud v2 network-config early enough for
+# systemd-networkd. Inject DHCP configuration into this instance overlay only. The verified base
+# remains an immutable backing file, and libguestfs receives no network access.
+LIBGUESTFS_BACKEND=direct virt-customize \
+  -a "$instance_dir/disk.qcow2" \
+  --no-network \
+  --mkdir /etc/systemd/network \
+  --upload "$script_dir/../guest/05-honeyforge-high.network:/etc/systemd/network/05-honeyforge-high.network" \
+  --chmod 0644:/etc/systemd/network/05-honeyforge-high.network
 cloud-localds --network-config="$recipe_dir/cloud-init/network-config" "$instance_dir/seed.iso" "$instance_dir/user-data" "$instance_dir/meta-data"
 chmod 0600 "$instance_dir/disk.qcow2" "$instance_dir/seed.iso" "$instance_dir/user-data" "$password_file"
