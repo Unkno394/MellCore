@@ -10,6 +10,10 @@ script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 . "$script_dir/firewall-common.sh"
 bridge=$HF_HIGH_BRIDGE
 validate_instance_id "$instance_id"
+dhcp_diagnostic=${HF_HIGH_DIAGNOSE_DHCP:-0}
+case "$dhcp_diagnostic" in 0|1) ;; *) echo "invalid DHCP diagnostic mode" >&2; exit 1 ;; esac
+dhcp_failure_marker="$root_dir/$instance_id/dhcp-timeout"
+[ "$dhcp_diagnostic" -eq 0 ] || rm -f "$dhcp_failure_marker"
 
 case "$external_port" in
   ''|*[!0-9]*) echo "external SSH port must be numeric" >&2; exit 1 ;;
@@ -54,7 +58,15 @@ while [ "$attempt" -le "$dhcp_attempts" ]; do
   sleep 5
   attempt=$((attempt + 1))
 done
-[ -n "$guest_ip" ] || { echo "VM did not obtain an isolated DHCP lease" >&2; exit 1; }
+if [ -z "$guest_ip" ]; then
+  if [ "$dhcp_diagnostic" -eq 1 ]; then
+    umask 077
+    : > "$dhcp_failure_marker"
+  fi
+  echo "VM did not obtain an isolated DHCP lease" >&2
+  exit 1
+fi
+[ "$dhcp_diagnostic" -eq 0 ] || rm -f "$dhcp_failure_marker"
 python3 - "$guest_ip" <<'PY'
 import ipaddress
 import sys

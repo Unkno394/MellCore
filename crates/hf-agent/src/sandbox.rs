@@ -527,10 +527,26 @@ impl LibvirtSandboxManager {
         let adapter = self.adapter_for(vm.profile)?;
         let instance_id = vm.instance_id.to_string();
         let port = vm.external_service_port.to_string();
-        self.run(vm.profile, adapter.scripts.publish, &[&instance_id, &port])
-            .map_err(|failure| {
-                lifecycle_error("ACCESS_POLICY_FAILED", "network", failure)
-            })?;
+        if let Err(failure) = self.run(
+            vm.profile,
+            adapter.scripts.publish,
+            &[&instance_id, &port],
+        ) {
+            let dhcp_timeout = self
+                .high_root
+                .join(&instance_id)
+                .join("dhcp-timeout")
+                .is_file();
+            let (code, stage) = access_failure_kind(dhcp_timeout);
+            let failure = if dhcp_timeout {
+                anyhow::anyhow!(
+                    "guest did not obtain an IPv4 lease from hf-high-isolated before the DHCP timeout; DNAT publication was not attempted: {failure}"
+                )
+            } else {
+                failure
+            };
+            return Err(lifecycle_error(code, stage, failure));
+        }
         self.wait_until_ready(vm)
     }
 
@@ -768,6 +784,14 @@ fn lifecycle_error(code: &'static str, stage: &'static str, failure: anyhow::Err
     anyhow::anyhow!("HF_HIGH_ERROR code={code} stage={stage}: {failure}")
 }
 
+fn access_failure_kind(dhcp_timeout: bool) -> (&'static str, &'static str) {
+    if dhcp_timeout {
+        ("DHCP_LEASE_TIMEOUT", "dhcp")
+    } else {
+        ("ACCESS_POLICY_FAILED", "network")
+    }
+}
+
 fn high_running_health(
     state: HighDomainState,
     matches_security_profile: bool,
@@ -869,6 +893,15 @@ mod tests {
         assert_eq!(
             reconcile_action(HighDomainState::Running, false),
             ReconcileAction::Recreate
+        );
+    }
+
+    #[test]
+    fn dhcp_timeout_is_not_reported_as_a_firewall_or_dnat_failure() {
+        assert_eq!(access_failure_kind(true), ("DHCP_LEASE_TIMEOUT", "dhcp"));
+        assert_eq!(
+            access_failure_kind(false),
+            ("ACCESS_POLICY_FAILED", "network")
         );
     }
 

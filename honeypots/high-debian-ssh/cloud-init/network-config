@@ -1,9 +1,7 @@
-version: 2
-ethernets:
-  uplink:
-    match:
-      name: "e*"
-    dhcp4: true
-    dhcp6: false
-    accept-ra: false
-    link-local: []
+version: 1
+config:
+  - type: physical
+    name: eth0
+    mac_address: '@@MAC_ADDRESS@@'
+    subnets:
+      - type: dhcp4
