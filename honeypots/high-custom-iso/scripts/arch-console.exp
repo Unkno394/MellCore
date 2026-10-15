@@ -1,7 +1,8 @@
 #!/usr/bin/expect -f
 
 # ArchISO decorates both the login prompt and the shell prompt with ANSI cursor
-# control sequences. Do not anchor prompt expressions to the end of a line.
+# control sequences. The serial prompt may be only a coloured `#`, without the
+# usual root@archiso prefix.
 set install_timeout $env(HF_HIGH_INSTALL_TIMEOUT_SECONDS)
 set boot_timeout $env(HF_HIGH_ARCH_BOOT_TIMEOUT_SECONDS)
 set vm_name [lindex $argv 0]
@@ -50,7 +51,12 @@ proc fail_install {fd code message status} {
     exit $status
 }
 
-set root_prompt {root@archiso[^\r\n]{0,200}#}
+# Accept either the familiar root@archiso prompt or a bare root `#`, with common
+# ANSI CSI sequences around it. Requiring an otherwise empty terminal line keeps
+# hashes in kernel messages, progress output and comments from being treated as
+# an interactive shell prompt.
+set ansi_csi {\x1b\[[0-?]*[ -/]*[@-~]}
+set root_prompt [format {(^|\r\n|\n|\r)(?:%s)*[ \t]*(?:root@archiso[^\r\n#]{0,160})?#[ \t]*(?:(?:%s)[ \t]*)*(?:\r\n|\n|\r|$)} $ansi_csi $ansi_csi]
 log_user 0
 match_max 262144
 spawn virsh console $vm_name --force

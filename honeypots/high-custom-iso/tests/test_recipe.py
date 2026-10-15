@@ -339,18 +339,19 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 "import sys\n"
                 "def emit(value):\n"
                 "    sys.stdout.write(value); sys.stdout.flush()\n"
+                "ansi_prompt = '\\x1b[?2004h\\x1b[1;31m#\\x1b[0m '\n"
                 "emit('Connected to domain fixture-vm\\r\\n')\n"
                 "if sys.stdin.readline().strip(): raise SystemExit(10)\n"
-                "emit('root@archiso ~ # \\x1b[?2004h')\n"
+                "emit(ansi_prompt)\n"
                 "if not sys.stdin.readline().startswith('stty -echo'): raise SystemExit(11)\n"
-                "emit('HF_SERIAL_READY\\r\\nroot@archiso ~ # \\x1b[?2004h')\n"
+                "emit('HF_SERIAL_READY\\r\\n# ')\n"
                 "if not sys.stdin.readline().startswith('rm -f '): raise SystemExit(12)\n"
-                "emit('root@archiso ~ # \\x1b[?2004h')\n"
+                "emit(ansi_prompt)\n"
                 "chunks = 0\n"
                 "while True:\n"
                 "    line = sys.stdin.readline()\n"
                 "    if line.startswith(\"printf '%s' '\"):\n"
-                "        chunks += 1; emit('root@archiso ~ # \\x1b[?2004h'); continue\n"
+                "        chunks += 1; emit('# '); continue\n"
                 "    if line.startswith('base64 -d '): break\n"
                 "    raise SystemExit(13)\n"
                 "if chunks < 2: raise SystemExit(14)\n"
@@ -385,7 +386,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             diagnostic = console_log.read_text(encoding="utf-8")
             self.assertIn("Connected to domain", diagnostic)
-            self.assertIn("root@archiso", diagnostic)
+            self.assertIn("<ESC>[1;31m#<ESC>[0m", diagnostic)
             self.assertIn("<redacted-payload>", diagnostic)
             self.assertNotIn(payload_value, diagnostic)
             self.assertNotIn(payload_value[:768], diagnostic)
@@ -401,7 +402,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 fake_bin / "virsh",
                 "#!/usr/bin/env python3\n"
                 "import sys, time\n"
-                "sys.stdout.write('Booting ArchISO without login prompt\\r\\n'); sys.stdout.flush()\n"
+                "sys.stdout.write('Booting ArchISO: module #7\\r\\n# kernel diagnostic continues\\r\\n'); sys.stdout.flush()\n"
                 "time.sleep(10)\n",
             )
             payload = root / "payload.b64"
@@ -430,6 +431,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 3)
             self.assertIn("code=ARCH_SERIAL_ROOT_TIMEOUT", completed.stderr)
             self.assertIn("Booting ArchISO", console_log.read_text(encoding="utf-8"))
+            self.assertIn("# kernel diagnostic continues", console_log.read_text(encoding="utf-8"))
 
     def test_ubuntu_finalizer_requires_disk_boot_and_full_guest_readiness(self):
         finalizer = (RECIPE / "scripts" / "finalize-linux-install.sh").read_text()
