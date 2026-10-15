@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
     net::IpAddr,
@@ -15,6 +15,25 @@ pub struct Config {
     pub trap_id: Uuid,
     /// Optional persistent SSH host key. When omitted, a key is generated in memory.
     pub host_key_path: Option<PathBuf>,
+    pub auth_mode: LowAuthMode,
+    pub credentials: Vec<LowCredential>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LowAuthMode {
+    #[default]
+    CaptureCredentials,
+    Configured,
+    AnyPassword,
+    Passwordless,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LowCredential {
+    pub username: String,
+    pub password: String,
 }
 
 impl Default for Config {
@@ -26,6 +45,8 @@ impl Default for Config {
             // Stable development identity. Assign a unique UUID per deployed trap.
             trap_id: Uuid::from_u128(0x9a8a8262_556b_43c4_a73f_736c32556721),
             host_key_path: None,
+            auth_mode: LowAuthMode::CaptureCredentials,
+            credentials: Vec::new(),
         }
     }
 }
@@ -53,6 +74,27 @@ impl Config {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "trap_id must be a non-nil UUID",
+            ));
+        }
+        if self.auth_mode == LowAuthMode::Configured && self.credentials.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "configured login requires at least one credential",
+            ));
+        }
+        if self.credentials.len() > 32
+            || self.credentials.iter().any(|pair| {
+                pair.username.is_empty()
+                    || pair.username.len() > 32
+                    || pair.password.is_empty()
+                    || pair.password.len() > 128
+                    || pair.username.contains(|c: char| c.is_control())
+                    || pair.password.contains(|c: char| c.is_control())
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Low SSH credentials",
             ));
         }
         Ok(())
@@ -121,5 +163,13 @@ mod tests {
         );
         let error = result.unwrap_err().to_string();
         assert!(error.contains("unknown field `server_id`"), "{error}");
+    }
+
+    #[test]
+    fn configured_login_requires_credentials() {
+        let empty: Config = serde_json::from_str(r#"{"auth_mode":"configured"}"#).unwrap();
+        assert!(empty.validate().is_err());
+        let valid: Config = serde_json::from_str(r#"{"auth_mode":"configured","credentials":[{"username":"admin","password":"secret"}]}"#).unwrap();
+        valid.validate().unwrap();
     }
 }

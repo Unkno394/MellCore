@@ -98,7 +98,7 @@ pub fn start(
     agent_id: Uuid,
     max_pending_events: usize,
     operational_interval: Duration,
-) -> anyhow::Result<JoinHandle<()>> {
+) -> anyhow::Result<(SharedHighTelemetryStore, JoinHandle<()>)> {
     if operational_interval < Duration::from_secs(5) {
         anyhow::bail!("High operational polling interval must be at least five seconds");
     }
@@ -109,7 +109,8 @@ pub fn start(
         state_dir.join("high-telemetry.sqlite"),
         max_pending_events,
     )?));
-    Ok(tokio::spawn(async move {
+    let task_store = store.clone();
+    let task = tokio::spawn(async move {
         let operational_store = store.clone();
         tokio::join!(
             discover_channels(high_root, agent_id, store),
@@ -119,7 +120,19 @@ pub fn start(
                 operational_interval
             )
         );
-    }))
+    });
+    Ok((task_store, task))
+}
+
+pub fn acknowledge_center_batch(
+    store: &SharedHighTelemetryStore,
+    message_id: Uuid,
+) -> anyhow::Result<()> {
+    store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("High telemetry store mutex poisoned"))?
+        .acknowledge_durable_kazik_batch(message_id)?;
+    Ok(())
 }
 
 async fn run_operational_monitor(

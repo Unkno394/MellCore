@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet, VecDeque},
     fs,
     io::Write,
     net::SocketAddr,
@@ -24,18 +24,20 @@ use hf_core::{
     AgentCommand, AgentRegistration, CommandResult, CoreError, HighOsProfile, HighVmDeployment,
     HysteriaConnection, KozyavkaDeployment, PacketTransport, PritvoryashkaDeployment,
     RegisteredAgent, RegistrationTransport, SHARED_SSH_IDENTIFICATION, SharedTcpTrapKind,
-    TcpPortGroup, TrapSpec,
+    TcpPortGroup, TrapSpec, HighVmRuntimeMode,
 };
 use hf_services::{
     FailoverSender, HysteriaSocks5UdpTransport,
     kazik_outbox::{SqliteKazikOutbox, send_pending_once},
 };
+#[cfg(unix)]
+use hf_services::high_telemetry::SharedHighTelemetryStore;
 use kazik_protocol::{
     AckDisposition, Acknowledgement, AgentStatus, DurableOutbox, KazikBody, KazikEnvelope,
 };
 use sandbox::{
-    HighDomainState, HighVm, LibvirtSandboxManager, default_image_for, default_recipe_dir,
-    is_supported_profile, profile_manifest_kind, profile_recipe_name,
+    HighAcceleration, HighDomainState, HighVm, LibvirtSandboxManager, default_image_for,
+    default_recipe_dir, is_supported_profile, profile_manifest_kind, profile_recipe_name,
 };
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
@@ -66,6 +68,9 @@ struct Args {
     /// Kazik. A dedicated non-production --state-dir is mandatory.
     #[arg(long, conflicts_with = "center_url")]
     standalone_high: bool,
+    /// High VM acceleration: auto/kvm select only KVM; tcg is restricted to standalone tests.
+    #[arg(long, env = "HF_HIGH_ACCELERATION", value_enum, default_value = "auto")]
+    high_acceleration: HighAcceleration,
     /// Initialize identity, apply an optional command and stop. Omit in systemd so telemetry runs.
     #[arg(long)]
     once: bool,
@@ -94,7 +99,7 @@ struct Args {
     /// Center's loopback UDP Kazik receiver as reached through Hysteria.
     #[arg(long, env = "HF_KAZIK_CENTER_UDP")]
     kazik_center_udp: Option<SocketAddr>,
-    /// Upper bound for High events waiting on this host for future Kazik delivery.
+    /// Upper bound for High events waiting for a durable Center acknowledgement.
     #[arg(
         long,
         env = "HF_HIGH_TELEMETRY_MAX_PENDING",
@@ -130,6 +135,8 @@ struct StandaloneHighIdentity {
 struct ComposeProjectStore {
     root: PathBuf,
     mutation_lock: Arc<std::sync::Mutex<()>>,
+    high_acceleration: HighAcceleration,
+    allow_tcg_test_mode: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -357,7 +364,19 @@ impl ComposeProjectStore {
         Self {
             root: state_dir.join("traps"),
             mutation_lock: Arc::new(std::sync::Mutex::new(())),
+            high_acceleration: HighAcceleration::Auto,
+            allow_tcg_test_mode: false,
         }
+    }
+
+    fn with_high_runtime(
+        mut self,
+        acceleration: HighAcceleration,
+        allow_tcg_test_mode: bool,
+    ) -> Self {
+        self.high_acceleration = acceleration;
+        self.allow_tcg_test_mode = allow_tcg_test_mode;
+        self
     }
 
     fn shared_ssh_identity_path(&self, listener_port: u16) -> PathBuf {
@@ -520,7 +539,42 @@ impl ComposeProjectStore {
             .root
             .parent()
             .unwrap_or(Path::new("/var/lib/honeyforge"));
-        LibvirtSandboxManager::with_high_root(default_recipe_dir(), state_dir.join("high"))
+        LibvirtSandboxManager::with_high_root_and_acceleration(
+            default_recipe_dir(),
+            state_dir.join("high"),
+            self.high_acceleration,
+            self.allow_tcg_test_mode,
+        )
+    }
+
+    fn high_manager_for_mode(&self, mode: HighVmRuntimeMode) -> LibvirtSandboxManager {
+        let state_dir = self
+            .root
+            .parent()
+            .unwrap_or(Path::new("/var/lib/honeyforge"));
+        let (acceleration, allow_tcg_test_mode) = self.acceleration_for_mode(mode);
+        LibvirtSandboxManager::with_high_root_and_acceleration(
+            default_recipe_dir(),
+            state_dir.join("high"),
+            acceleration,
+            allow_tcg_test_mode,
+        )
+    }
+
+    fn acceleration_for_mode(&self, mode: HighVmRuntimeMode) -> (HighAcceleration, bool) {
+        match mode {
+            HighVmRuntimeMode::PublicKvm => {
+                (self.high_acceleration, self.allow_tcg_test_mode)
+            }
+            HighVmRuntimeMode::PrivateTcgTest => (HighAcceleration::Tcg, true),
+        }
+    }
+
+    fn high_manager_for_deployment(
+        &self,
+        deployment: &HighVmDeployment,
+    ) -> LibvirtSandboxManager {
+        self.high_manager_for_mode(deployment.runtime_mode)
     }
 
     fn high_manifest_path(&self, trap_id: uuid::Uuid) -> PathBuf {
@@ -650,7 +704,9 @@ impl ComposeProjectStore {
                     || current.deployment.external_service_port != deployment.external_service_port
                     || current.deployment.profile != deployment.profile
                     || current.deployment.image_source != deployment.image_source
+                    || current.deployment.runtime_mode != deployment.runtime_mode
             });
+        let high_manager = self.high_manager_for_deployment(&deployment);
         let mut manifest = HighRuntimeManifest {
             version: 1,
             kind: profile_manifest_kind(deployment.profile).into(),
@@ -661,18 +717,14 @@ impl ComposeProjectStore {
         };
         self.save_high_manifest(&manifest)?;
         if changed {
-            if let Err(error) = self
-                .high_manager()
-                .reset(&Self::high_vm(&deployment))
+            if let Err(error) = high_manager.reset(&Self::high_vm(&deployment))
             {
                 manifest.last_error = Some(error.to_string());
                 self.save_high_manifest(&manifest)?;
                 return Err(error);
             }
         }
-        let result = self
-            .high_manager()
-            .reconcile(&Self::high_vm(&deployment), true);
+        let result = high_manager.reconcile(&Self::high_vm(&deployment), true);
         if let Err(error) = &result {
             manifest.last_error = Some(error.to_string());
             self.save_high_manifest(&manifest)?;
@@ -684,13 +736,17 @@ impl ComposeProjectStore {
         deployment: &HighVmDeployment,
         allow_existing_ubuntu_image: bool,
     ) -> anyhow::Result<()> {
+        let private_tcg = deployment.runtime_mode == HighVmRuntimeMode::PrivateTcgTest;
+        let host_only_profile = deployment.profile == HighOsProfile::custom_linux_iso_ssh();
+        let private_tcg_profile = deployment.profile == HighOsProfile::ubuntu_ssh()
+            || deployment.profile == HighOsProfile::debian_ssh()
+            || deployment.profile == HighOsProfile::arch_linux_ssh();
         if deployment.trap_id.is_nil()
-            || (deployment.external_service_port == 0
-                && deployment.profile != HighOsProfile::windows_rdp()
-                && deployment.profile != HighOsProfile::custom_linux_iso_ssh())
+            || (private_tcg && (!private_tcg_profile || deployment.external_service_port != 0))
+            || (!private_tcg && deployment.external_service_port == 0 && !host_only_profile)
         {
             anyhow::bail!(
-                "HF_HIGH_ERROR code=DEPLOYMENT_INVALID stage=validation: trap id or service port is invalid"
+                "HF_HIGH_ERROR code=DEPLOYMENT_INVALID stage=validation: trap id, runtime mode, or service port is invalid"
             );
         }
         if !is_supported_profile(deployment.profile) {
@@ -734,17 +790,14 @@ impl ComposeProjectStore {
         manifest.desired_state = HighDesiredState::Running;
         manifest.last_error = None;
         self.save_high_manifest(&manifest)?;
-        if let Err(error) = self
-            .high_manager()
-            .reset(&Self::high_vm(&manifest.deployment))
+        let high_manager = self.high_manager_for_deployment(&manifest.deployment);
+        if let Err(error) = high_manager.reset(&Self::high_vm(&manifest.deployment))
         {
             manifest.last_error = Some(error.to_string());
             self.save_high_manifest(&manifest)?;
             return Err(error);
         }
-        let result = self
-            .high_manager()
-            .reconcile(&Self::high_vm(&manifest.deployment), true);
+        let result = high_manager.reconcile(&Self::high_vm(&manifest.deployment), true);
         if let Err(error) = &result {
             manifest.last_error = Some(error.to_string());
             self.save_high_manifest(&manifest)?;
@@ -760,7 +813,7 @@ impl ComposeProjectStore {
         manifest.last_error = None;
         self.save_high_manifest(&manifest)?;
         let result = self
-            .high_manager()
+            .high_manager_for_deployment(&manifest.deployment)
             .stop(&Self::high_vm(&manifest.deployment));
         if let Err(error) = &result {
             manifest.last_error = Some(error.to_string());
@@ -780,7 +833,7 @@ impl ComposeProjectStore {
         manifest.last_error = None;
         self.save_high_manifest(&manifest)?;
         if let Err(error) = self
-            .high_manager()
+            .high_manager_for_deployment(&manifest.deployment)
             .remove(&Self::high_vm(&manifest.deployment))
         {
             manifest.last_error = Some(error.to_string());
@@ -818,7 +871,7 @@ impl ComposeProjectStore {
             };
             if manifest.desired_state == HighDesiredState::Removing {
                 match self
-                    .high_manager()
+                    .high_manager_for_deployment(&manifest.deployment)
                     .remove(&Self::high_vm(&manifest.deployment))
                     .and_then(|()| fs::remove_dir_all(entry.path()).map_err(anyhow::Error::from))
                 {
@@ -833,7 +886,7 @@ impl ComposeProjectStore {
             }
             let desired_running = manifest.desired_state == HighDesiredState::Running;
             match self
-                .high_manager()
+                .high_manager_for_deployment(&manifest.deployment)
                 .reconcile(
                     &Self::high_vm(&manifest.deployment),
                     desired_running,
@@ -864,8 +917,9 @@ impl ComposeProjectStore {
                         == deployment.external_service_port
                     && manifest.deployment.profile == deployment.profile
                     && manifest.deployment.image_source == deployment.image_source
+                    && manifest.deployment.runtime_mode == deployment.runtime_mode
                     && self
-                        .high_manager()
+                        .high_manager_for_deployment(&manifest.deployment)
                         .healthy(&Self::high_vm(&manifest.deployment))?)
             }
             AgentCommand::DeployHighUbuntu(deployment) => {
@@ -877,7 +931,7 @@ impl ComposeProjectStore {
                     && manifest.deployment.external_service_port == deployment.external_ssh_port
                     && manifest.deployment.profile == HighOsProfile::ubuntu_ssh()
                     && self
-                        .high_manager()
+                        .high_manager_for_deployment(&manifest.deployment)
                         .healthy(&Self::high_vm(&manifest.deployment))?)
             }
             AgentCommand::ResetHighVm { trap_id, .. }
@@ -887,16 +941,15 @@ impl ComposeProjectStore {
                 };
                 Ok(manifest.desired_state == HighDesiredState::Running
                     && self
-                        .high_manager()
+                        .high_manager_for_deployment(&manifest.deployment)
                         .healthy(&Self::high_vm(&manifest.deployment))?)
             }
             AgentCommand::StopTrap { trap_id, .. } => {
                 if let Some(manifest) = self.load_high_manifest(*trap_id)? {
+                    let manager = self.high_manager_for_deployment(&manifest.deployment);
                     Ok(manifest.desired_state == HighDesiredState::Stopped
-                        && self.high_manager().domain_state(*trap_id)? == HighDomainState::Stopped
-                        && !self
-                            .high_manager()
-                            .service_is_published(&Self::high_vm(&manifest.deployment)))
+                        && manager.domain_state(*trap_id)? == HighDomainState::Stopped
+                        && !manager.service_is_published(&Self::high_vm(&manifest.deployment)))
                 } else if self.has_high_runtime(*trap_id) {
                     Ok(
                         self.high_manager().domain_state(*trap_id)? == HighDomainState::Stopped
@@ -931,7 +984,10 @@ impl ComposeProjectStore {
                     return false;
                 };
                 match self.load_high_manifest(trap_id) {
-                    Ok(Some(_)) => self.high_manager().is_running(trap_id).unwrap_or(false),
+                    Ok(Some(manifest)) => self
+                        .high_manager_for_deployment(&manifest.deployment)
+                        .is_running(trap_id)
+                        .unwrap_or(false),
                     Ok(None) => entry.path().join("manifest.json").is_file(),
                     Err(_) => false,
                 }
@@ -1057,13 +1113,27 @@ impl ComposeProjectStore {
             }
             AgentCommand::DeployHighVm(deployment) => {
                 Self::validate_high_deployment(&deployment, false)?;
-                ensure_high_vm_runtime(deployment.profile, deployment.image_source.is_some())?;
+                let (acceleration, allow_tcg_test_mode) =
+                    self.acceleration_for_mode(deployment.runtime_mode);
+                ensure_high_vm_runtime(
+                    deployment.profile,
+                    deployment.image_source.is_some(),
+                    acceleration,
+                    allow_tcg_test_mode,
+                )?;
                 self.deploy_high(deployment, false)
             }
             AgentCommand::DeployHighUbuntu(deployment) => {
                 let deployment: HighVmDeployment = deployment.into();
                 Self::validate_high_deployment(&deployment, true)?;
-                ensure_high_vm_runtime(HighOsProfile::ubuntu_ssh(), false)?;
+                let (acceleration, allow_tcg_test_mode) =
+                    self.acceleration_for_mode(deployment.runtime_mode);
+                ensure_high_vm_runtime(
+                    HighOsProfile::ubuntu_ssh(),
+                    false,
+                    acceleration,
+                    allow_tcg_test_mode,
+                )?;
                 self.deploy_high(deployment, true)
             }
             AgentCommand::ResetHighVm { trap_id, .. }
@@ -1261,6 +1331,8 @@ impl ComposeProjectStore {
             "bind_address": "0.0.0.0",
             "port": deployment.container_port,
             "banner": deployment.banner,
+            "auth_mode": if deployment.auth_mode.is_empty() { "capture_credentials" } else { deployment.auth_mode.as_str() },
+            "credentials": deployment.credentials,
             "trap_id": deployment.trap_id,
             "host_key_path": "/var/lib/honeyforge-low/host_ed25519",
         });
@@ -1268,13 +1340,14 @@ impl ComposeProjectStore {
             &project_dir.join("config.json"),
             &serde_json::to_vec_pretty(&container_config)?,
         )?;
-        // This public banner configuration must be readable by the image's UID 65532.
+        // Credentials can be present in this configuration. Only the container UID may read it.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            std::os::unix::fs::chown(project_dir.join("config.json"), Some(65532), Some(65532))?;
             fs::set_permissions(
                 project_dir.join("config.json"),
-                fs::Permissions::from_mode(0o644),
+                fs::Permissions::from_mode(0o600),
             )?;
         }
         let runtime_volume = match shared_identity {
@@ -2039,6 +2112,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    validate_high_acceleration_args(&args)?;
     if args.standalone_high {
         validate_standalone_high_args(&args)?;
     }
@@ -2102,7 +2176,8 @@ async fn main() -> anyhow::Result<()> {
         }
         identity
     };
-    let compose_projects = ComposeProjectStore::new(&args.state_dir);
+    let compose_projects = ComposeProjectStore::new(&args.state_dir)
+        .with_high_runtime(args.high_acceleration, args.standalone_high);
     fs::create_dir_all(&compose_projects.root)?;
     if emergency::pending(&args.state_dir)?.is_none() {
         let reconciliation_projects = compose_projects.clone();
@@ -2150,7 +2225,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     #[cfg(unix)]
-    let _high_telemetry = high_telemetry::start(
+    let (high_telemetry_store, _high_telemetry) = high_telemetry::start(
         &args.state_dir,
         identity.agent_id,
         args.high_telemetry_max_pending,
@@ -2203,6 +2278,8 @@ async fn main() -> anyhow::Result<()> {
             identity,
             socks,
             center_udp,
+            #[cfg(unix)]
+            high_telemetry_store,
         )
         .await;
     }
@@ -2230,6 +2307,8 @@ async fn run_kazik_hysteria_loop(
     identity: AgentIdentity,
     socks: SocketAddr,
     center_udp: SocketAddr,
+    #[cfg(unix)]
+    high_telemetry_store: SharedHighTelemetryStore,
 ) -> anyhow::Result<()> {
     let mut transport: Option<Arc<HysteriaSocks5UdpTransport>> = None;
     let mut sender: Option<FailoverSender> = None;
@@ -2283,6 +2362,9 @@ async fn run_kazik_hysteria_loop(
     let validation_slots = Arc::new(tokio::sync::Semaphore::new(4));
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<CommandJob>(32);
     let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<CommandExecution>(32);
+    let mut active_command_ids = HashSet::new();
+    let mut completed_command_ids = HashSet::new();
+    let mut completed_command_order = VecDeque::new();
     match projects.recover_quarantines() {
         Ok(events) => {
             for event in events {
@@ -2540,6 +2622,15 @@ async fn run_kazik_hysteria_loop(
                         detail=detail.as_deref().unwrap_or("unknown"), "agent command rejected");
                 }
                 enqueue_ack(&mut outbox, &identity, execution.message_id, disposition, detail)?;
+                active_command_ids.remove(&execution.message_id);
+                if completed_command_ids.insert(execution.message_id) {
+                    completed_command_order.push_back(execution.message_id);
+                    if completed_command_order.len() > 512 {
+                        if let Some(expired) = completed_command_order.pop_front() {
+                            completed_command_ids.remove(&expired);
+                        }
+                    }
+                }
                 if let Some(sender) = sender.as_ref() {
                     if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
                         tracing::warn!(%error, "command result ACK remains in SQLite outbox");
@@ -2561,9 +2652,19 @@ async fn run_kazik_hysteria_loop(
                     Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "trap telemetry collection failed"),
                 }
-                // High guest telemetry intentionally remains only in high-telemetry.sqlite.
-                // The current Center `Accepted` ACK confirms protocol acceptance, not durable
-                // storage, so it is not safe to enqueue or delete High source batches yet.
+                #[cfg(unix)]
+                match enqueue_next_high_telemetry_batch(
+                    &high_telemetry_store,
+                    &identity,
+                    &mut outbox,
+                ) {
+                    Ok(Some(events)) => {
+                        queued = true;
+                        tracing::info!(events, "High guest telemetry queued for Center");
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(%error, "High guest telemetry batch remains in its durable source store"),
+                }
                 if queued {
                     if let Some(sender) = sender.as_ref() {
                         if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
@@ -2622,6 +2723,15 @@ async fn run_kazik_hysteria_loop(
                                         emergency::record_alert_ack(state_dir, ack.acknowledged_message_id)?;
                                         missing_alert = None;
                                     }
+                                    #[cfg(unix)]
+                                    if let Err(error) = high_telemetry::acknowledge_center_batch(
+                                        &high_telemetry_store,
+                                        ack.acknowledged_message_id,
+                                    ) {
+                                        tracing::warn!(%error, message_id = %ack.acknowledged_message_id,
+                                            "durable Center ACK received but High source batch remains queued for retry");
+                                        continue;
+                                    }
                                     outbox.acknowledge(ack.acknowledged_message_id)?;
                                     if pending_emergency.as_ref().is_some_and(|pending| pending.message_id == ack.acknowledged_message_id) {
                                         match emergency::start(state_dir) {
@@ -2631,7 +2741,12 @@ async fn run_kazik_hysteria_loop(
                                     }
                                 }
                             KazikBody::Command { command } => {
-                                if incident_active || command_tx.try_send(CommandJob { message_id: envelope.message_id, command }).is_err() {
+                                if active_command_ids.contains(&envelope.message_id)
+                                    || completed_command_ids.contains(&envelope.message_id)
+                                {
+                                    // Center retransmits commands until it receives the result.
+                                    // The durable ACK already handles completed commands.
+                                } else if incident_active || command_tx.try_send(CommandJob { message_id: envelope.message_id, command }).is_err() {
                                     enqueue_ack(
                                         &mut outbox,
                                         &identity,
@@ -2639,6 +2754,8 @@ async fn run_kazik_hysteria_loop(
                                         AckDisposition::Rejected,
                                         Some("agent is handling a confirmed security incident, or command queue is unavailable".into()),
                                     )?;
+                                } else {
+                                    active_command_ids.insert(envelope.message_id);
                                 }
                             }
                             KazikBody::Ack(_) => {}
@@ -2682,6 +2799,34 @@ struct CommandExecution {
     removed_trap: Option<uuid::Uuid>,
     completion: Option<tokio::sync::oneshot::Sender<()>>,
     result: anyhow::Result<CommandResult>,
+}
+
+#[cfg(unix)]
+fn enqueue_next_high_telemetry_batch(
+    store: &SharedHighTelemetryStore,
+    identity: &AgentIdentity,
+    outbox: &mut SqliteKazikOutbox,
+) -> anyhow::Result<Option<usize>> {
+    let created_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    let batch = store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("High telemetry store mutex poisoned"))?
+        .prepare_kazik_batch(
+            kazik_protocol::MAX_TELEMETRY_BATCH_EVENTS,
+            kazik_protocol::MAX_TELEMETRY_PACKET_BYTES - 2 * 1024,
+            created_at_unix_ms,
+        )?;
+    let Some(batch) = batch else {
+        return Ok(None);
+    };
+    let event_count = batch.events.len();
+    let envelope = batch.kazik_envelope(identity.agent_id, identity.transport_credential.clone());
+    telemetry::ensure_packet_size(&envelope)?;
+    outbox.enqueue(envelope)?;
+    Ok(Some(event_count))
 }
 
 fn enqueue_ack(
@@ -2883,6 +3028,7 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
         "virsh",
         "virt-install",
         "qemu-img",
+        "qemu-system-x86_64",
         "iptables",
         "ss",
         "openssl",
@@ -2905,16 +3051,9 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
     if profile == HighOsProfile::arch_linux_ssh() {
         required_tools.push("virt-customize");
     }
-    if profile == HighOsProfile::windows_rdp() {
-        required_tools.extend([
-            "packer",
-            "qemu-system-x86_64",
-            "virt-inspector",
-            "virt-cat",
-            "virt-ls",
-            "wimlib-imagex",
-        ]);
-    }
+    // Packer and the libguestfs/WIM inspection tools are only needed while creating a missing
+    // prepared image. The recipe's image builder performs that preflight itself; a previously
+    // approved and cached QCOW2 must still boot without Packer installed.
     if matches!(
         profile.guest_os,
         hf_core::HighGuestOs::Debian
@@ -2928,21 +3067,73 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
     required_tools
 }
 
-/// Install only the host tools needed by the selected adapter.  In particular, existing Ubuntu
-/// deployments do not acquire Windows ISO tooling as a side effect.
-fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow::Result<()> {
-    let required_tools = high_vm_required_tools(profile, custom_image);
-    let tools_ready = required_tools
+fn missing_high_vm_tools(required_tools: &[&'static str]) -> Vec<&'static str> {
+    required_tools
         .iter()
-        .all(|program| Command::new(program).arg("--version").output().is_ok());
-    if !tools_ready {
+        .copied()
+        .filter(|program| Command::new(program).arg("--version").output().is_err())
+        .collect()
+}
+
+fn run_high_apt_get(args: &[&str]) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        let output = Command::new("apt-get")
+            .args(["-o", "DPkg::Lock::Timeout=30", "-o", "Acquire::Retries=2"])
+            .args(args)
+            .env("DEBIAN_FRONTEND", "noninteractive")
+            .output()
+            .context("could not start apt-get for High VM dependencies")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let detail = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let apt_busy = detail.contains("Could not get lock")
+            || detail.contains("Unable to acquire the dpkg frontend lock")
+            || detail.contains("Unable to lock directory");
+        if apt_busy && std::time::Instant::now() < deadline {
+            tracing::warn!("APT is busy; waiting before installing High VM dependencies");
+            std::thread::sleep(Duration::from_secs(10));
+            continue;
+        }
+        let reason = detail
+            .lines()
+            .rev()
+            .filter(|line| !line.trim().is_empty())
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::bail!("apt-get {} failed: {reason}", args.join(" "));
+    }
+}
+
+/// Install only the QEMU/libvirt host tools needed by the selected adapter. In particular,
+/// existing Ubuntu deployments do not acquire Windows ISO tooling as a side effect.
+fn ensure_high_vm_runtime(
+    profile: HighOsProfile,
+    custom_image: bool,
+    acceleration: HighAcceleration,
+    allow_tcg_test_mode: bool,
+) -> anyhow::Result<()> {
+    acceleration.resolve(allow_tcg_test_mode)?;
+    let required_tools = high_vm_required_tools(profile, custom_image);
+    if !missing_high_vm_tools(&required_tools).is_empty() {
         match detect_platform()? {
             Platform::Debian => {
-                run_program("apt-get", &["update"])?;
+                run_high_apt_get(&["update"])?;
                 let mut packages = vec![
                     "install",
                     "-y",
-                    "qemu-kvm",
+                    // qemu-kvm is virtual on Ubuntu 26.04; use its concrete provider.
+                    "qemu-system-x86",
+                    "qemu-utils",
                     "libvirt-daemon-system",
                     "libvirt-clients",
                     "virtinst",
@@ -2968,7 +3159,7 @@ fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow:
                     packages.push("libguestfs-tools");
                 }
                 if profile == HighOsProfile::windows_rdp() {
-                    packages.extend(["qemu-system-x86", "libguestfs-tools", "wimtools"]);
+                    packages.extend(["libguestfs-tools", "wimtools"]);
                 }
                 if custom_image {
                     if !packages.contains(&"xorriso") {
@@ -2978,8 +3169,7 @@ fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow:
                 if required_tools.contains(&"setfacl") {
                     packages.push("acl");
                 }
-                run_program("apt-get", &packages)?;
-                run_program("systemctl", &["enable", "--now", "libvirtd"])?;
+                run_high_apt_get(&packages)?;
             }
             Platform::Fedora | Platform::Rhel => {
                 let mut packages = vec![
@@ -3019,7 +3209,6 @@ fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow:
                     packages.push("acl");
                 }
                 run_program("dnf", &packages)?;
-                run_program("systemctl", &["enable", "--now", "libvirtd"])?;
             }
             Platform::Arch => {
                 let mut packages = vec![
@@ -3060,20 +3249,29 @@ fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow:
                     packages.push("acl");
                 }
                 run_program("pacman", &packages)?;
-                run_program("systemctl", &["enable", "--now", "libvirtd"])?;
             }
             Platform::Alpine => anyhow::bail!("High VM runtime is not supported on Alpine yet"),
         }
     }
+    let missing = missing_high_vm_tools(&required_tools);
     anyhow::ensure!(
-        required_tools
-            .iter()
-            .all(|program| Command::new(program).arg("--version").output().is_ok()),
-        "High VM runtime installation did not provide every required tool"
+        missing.is_empty(),
+        "High VM runtime installation did not provide: {}",
+        missing.join(", ")
     );
+    let libvirt_active = Command::new("systemctl")
+        .args(["is-active", "--quiet", "libvirtd"])
+        .status()
+        .is_ok_and(|status| status.success());
+    if !libvirt_active {
+        run_program("systemctl", &["enable", "--now", "libvirtd"])?;
+    }
     anyhow::ensure!(
-        Path::new("/dev/kvm").exists(),
-        "KVM is unavailable; this VPS/provider does not permit High VM traps"
+        Command::new("systemctl")
+            .args(["is-active", "--quiet", "libvirtd"])
+            .status()
+            .is_ok_and(|status| status.success()),
+        "libvirtd is not active after High VM runtime setup"
     );
     Ok(())
 }
@@ -3286,6 +3484,14 @@ fn load_identity(path: &Path) -> anyhow::Result<Option<AgentIdentity>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+fn validate_high_acceleration_args(args: &Args) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.high_acceleration != HighAcceleration::Tcg || args.standalone_high,
+        "TCG acceleration is test-only; run with --standalone-high and a dedicated --state-dir"
+    );
+    Ok(())
 }
 
 fn validate_standalone_high_args(args: &Args) -> anyhow::Result<()> {
@@ -3639,9 +3845,9 @@ mod tests {
         let windows = high_vm_required_tools(HighOsProfile::windows_rdp(), false);
         assert!(windows.contains(&"xorriso"));
         assert!(windows.contains(&"setfacl"));
-        assert!(windows.contains(&"packer"));
-        assert!(windows.contains(&"wimlib-imagex"));
-        assert!(windows.contains(&"virt-inspector"));
+        assert!(!windows.contains(&"packer"));
+        assert!(!windows.contains(&"wimlib-imagex"));
+        assert!(!windows.contains(&"virt-inspector"));
         assert!(!windows.contains(&"cloud-localds"));
 
         let custom = high_vm_required_tools(HighOsProfile::debian_ssh(), true);
@@ -3665,6 +3871,7 @@ mod tests {
                     external_service_port: 2222,
                     profile: HighOsProfile::arch_linux_ssh(),
                     image_source: None,
+                    runtime_mode: HighVmRuntimeMode::PublicKvm,
                 },
                 false,
             )
@@ -3675,20 +3882,26 @@ mod tests {
     }
 
     #[test]
-    fn prepared_windows_accepts_host_only_rdp_without_an_external_port() {
+    fn prepared_windows_requires_an_external_rdp_port() {
         let deployment = HighVmDeployment {
             command_id: Uuid::new_v4(),
             trap_id: Uuid::new_v4(),
             base_image: default_image_for(HighOsProfile::windows_rdp()).into(),
-            external_service_port: 0,
+            external_service_port: 3389,
             profile: HighOsProfile::windows_rdp(),
             image_source: None,
+            runtime_mode: HighVmRuntimeMode::PublicKvm,
         };
         ComposeProjectStore::validate_high_deployment(&deployment, false).unwrap();
+
+        let mut unpublished = deployment.clone();
+        unpublished.external_service_port = 0;
+        assert!(ComposeProjectStore::validate_high_deployment(&unpublished, false).is_err());
 
         let mut legacy = deployment;
         legacy.profile = HighOsProfile::windows_rdp_legacy_iso();
         legacy.base_image = default_image_for(legacy.profile).into();
+        legacy.external_service_port = 0;
         assert!(ComposeProjectStore::validate_high_deployment(&legacy, false).is_err());
     }
 
@@ -3706,6 +3919,7 @@ mod tests {
                 format: hf_core::HighImageFormat::Iso,
                 architecture: hf_core::HighImageArchitecture::X86_64,
             }),
+            runtime_mode: HighVmRuntimeMode::PublicKvm,
         };
         ComposeProjectStore::validate_high_deployment(&deployment, false).unwrap();
         deployment.image_source = None;

@@ -19,6 +19,14 @@ pub struct ConnectionEvent {
     pub client_ip: IpAddr,
     pub client_port: u16,
     pub trap_port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 impl ConnectionEvent {
@@ -32,7 +40,19 @@ impl ConnectionEvent {
             client_ip: client.ip(),
             client_port: client.port(),
             trap_port: local.port(),
+            username: None,
+            password: None,
+            accepted: None,
+            command: None,
         }
+    }
+
+    pub fn activity(&self, kind: &'static str) -> Self {
+        let mut event = self.clone();
+        event.event_id = Uuid::new_v4();
+        event.event_type = kind;
+        event.timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        event
     }
 
     pub fn write_json_line(&self, mut writer: impl Write) -> io::Result<()> {

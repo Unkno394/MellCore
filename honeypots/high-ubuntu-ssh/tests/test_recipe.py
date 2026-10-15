@@ -91,10 +91,17 @@ class CloudInitGenerationTests(unittest.TestCase):
             self.assertIn("ProtectSystem=strict", unit)
             self.assertIn("UMask=0077", unit)
 
-    def test_high_kazik_pump_remains_disabled_until_durable_ack_exists(self):
+    def test_high_kazik_pump_uses_durable_center_ack(self):
         agent_main = (RECIPE.parents[1] / "crates/hf-agent/src/main.rs").read_text(encoding="utf-8")
-        self.assertNotIn("high_telemetry_store.prepare_kazik_batch", agent_main)
-        self.assertNotIn("high_telemetry_store.acknowledge_durable_kazik_batch", agent_main)
+        high_agent = (RECIPE.parents[1] / "crates/hf-agent/src/high_telemetry.rs").read_text(encoding="utf-8")
+        center_main = (RECIPE.parents[1] / "crates/hf-center/src/main.rs").read_text(encoding="utf-8")
+        center_store = (RECIPE.parents[1] / "crates/hf-center/src/telemetry_store.rs").read_text(encoding="utf-8")
+        self.assertIn("enqueue_next_high_telemetry_batch", agent_main)
+        self.assertIn("acknowledge_center_batch", agent_main)
+        self.assertIn("prepare_kazik_batch", agent_main)
+        self.assertIn("acknowledge_durable_kazik_batch", high_agent)
+        self.assertIn(".persist(envelope.agent_id, events)", center_main)
+        self.assertIn("self.file.sync_data()", center_store)
 
 
 class MultiOsRecipeTests(unittest.TestCase):

@@ -1,11 +1,12 @@
 use crate::{
-    config::Config,
+    config::{Config, LowAuthMode},
     telemetry::{ConnectionEvent, EventSink},
 };
 use russh::{
-    MethodKind, MethodSet, Preferred, cipher, kex, mac,
+    Channel, ChannelId, MethodKind, MethodSet, Preferred, Pty, cipher, kex,
     keys::{Algorithm, PrivateKey, load_secret_key},
-    server::{self, Auth},
+    mac,
+    server::{self, Auth, ChannelOpenHandle, Msg, Session},
 };
 use std::{borrow::Cow, future::Future, io, path::Path, sync::Arc, time::Duration};
 use tokio::{
@@ -60,8 +61,8 @@ fn reject_auth() -> Auth {
 }
 
 /// Serve a caller-owned listener; stop when `shutdown` resolves.
-/// Each connection performs SSH identification and key exchange, then rejects
-/// authentication. There is no shell, command execution, or credential storage.
+/// Each connection uses the configured authentication policy and an isolated
+/// in-memory shell. No host command is ever executed.
 pub async fn serve(
     listener: TcpListener,
     config: Config,
@@ -77,12 +78,26 @@ pub async fn serve(
     };
     let ssh_config = Arc::new(server::Config {
         server_id: russh::SshId::Standard(config.banner.clone().into()),
-        methods: advertised_auth_methods(),
+        methods: if config.auth_mode == LowAuthMode::Passwordless {
+            [
+                MethodKind::None,
+                MethodKind::PublicKey,
+                MethodKind::Password,
+            ]
+            .as_slice()
+            .into()
+        } else {
+            advertised_auth_methods()
+        },
         keys: vec![host_key],
         preferred,
         max_auth_attempts: 6,
         auth_rejection_time: Duration::from_millis(750),
-        inactivity_timeout: Some(HANDSHAKE_TIMEOUT),
+        inactivity_timeout: Some(if config.auth_mode == LowAuthMode::CaptureCredentials {
+            HANDSHAKE_TIMEOUT
+        } else {
+            Duration::from_secs(600)
+        }),
         maximum_packet_size: 32 * 1024,
         window_size: 256 * 1024,
         ..server::Config::default()
@@ -106,12 +121,15 @@ pub async fn serve(
                 let event = ConnectionEvent::new(config.trap_id, client, stream.local_addr()?);
                 let ssh_config = Arc::clone(&ssh_config);
                 let sink = Arc::clone(&sink);
+                let policy = config.auth_mode;
+                let credentials = config.credentials.clone();
                 connections.spawn(async move {
                     if let Err(error) = sink.emit(&event) {
                         tracing::error!(%error, %client, "failed to emit connection event");
                     }
-                    let result = timeout(HANDSHAKE_TIMEOUT, async move {
-                        let session = server::run_stream(ssh_config, stream, LowHandler).await?;
+                    let result = timeout(if policy == LowAuthMode::CaptureCredentials { HANDSHAKE_TIMEOUT } else { Duration::from_secs(600) }, async move {
+                        let handler = LowHandler { policy, credentials, sink, event, user: None, input: String::new(), shell_started: false };
+                        let session = server::run_stream(ssh_config, stream, handler).await?;
                         session.await
                     }).await;
                     match result {
@@ -190,25 +208,214 @@ fn generate_host_key() -> io::Result<PrivateKey> {
     PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).map_err(io::Error::other)
 }
 
-struct LowHandler;
+struct LowHandler {
+    policy: LowAuthMode,
+    credentials: Vec<crate::config::LowCredential>,
+    sink: Arc<dyn EventSink>,
+    event: ConnectionEvent,
+    user: Option<String>,
+    input: String,
+    shell_started: bool,
+}
+
+impl LowHandler {
+    fn accepts(&self, user: &str, password: &str) -> bool {
+        match self.policy {
+            LowAuthMode::CaptureCredentials => false,
+            LowAuthMode::Configured => self
+                .credentials
+                .iter()
+                .any(|pair| pair.username == user && pair.password == password),
+            LowAuthMode::AnyPassword | LowAuthMode::Passwordless => true,
+        }
+    }
+
+    fn record(&self, event: &ConnectionEvent) {
+        if let Err(error) = self.sink.emit(event) {
+            tracing::error!(%error, "failed to emit Low SSH event");
+        }
+    }
+
+    fn response(&self, line: &str) -> String {
+        let command = line.trim();
+        match command {
+            "" => String::new(),
+            "whoami" => self.user.clone().unwrap_or_else(|| "root".into()),
+            "hostname" => "srv-app-01".into(),
+            "pwd" => format!("/home/{}", self.user.as_deref().unwrap_or("root")),
+            "id" => format!(
+                "uid=1000({0}) gid=1000({0}) groups=1000({0})",
+                self.user.as_deref().unwrap_or("root")
+            ),
+            "ls" | "ls -la" => "README.txt".into(),
+            "cat README.txt" => "Welcome to srv-app-01".into(),
+            _ if command.starts_with("echo ") => {
+                command[5..].trim_matches('"').trim_matches('\'').into()
+            }
+            _ => format!(
+                "bash: {}: command not found",
+                command.split_whitespace().next().unwrap_or("")
+            ),
+        }
+    }
+
+    fn prompt(&self) -> String {
+        format!("{}@srv-app-01:~$ ", self.user.as_deref().unwrap_or("root"))
+    }
+
+    fn record_command(&self, command: &str) {
+        let mut event = self.event.activity("command.executed");
+        event.username = self.user.clone();
+        event.command = Some(command.chars().take(4096).collect());
+        self.record(&event);
+    }
+}
 
 impl server::Handler for LowHandler {
     type Error = russh::Error;
 
-    async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
-        Ok(reject_auth())
+    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
+        let accepted = self.policy == LowAuthMode::Passwordless;
+        let mut event = self.event.activity("auth.attempted");
+        event.username = Some(user.to_owned());
+        event.accepted = Some(accepted);
+        self.record(&event);
+        if accepted {
+            self.user = Some(user.to_owned());
+            Ok(Auth::Accept)
+        } else {
+            Ok(reject_auth())
+        }
     }
 
-    async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
-        // Deliberately do not retain or log supplied credentials.
-        Ok(reject_auth())
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        let accepted = self.accepts(user, password);
+        let mut event = self.event.activity("auth.attempted");
+        event.username = Some(user.chars().take(32).collect());
+        event.password = Some(password.chars().take(128).collect());
+        event.accepted = Some(accepted);
+        self.record(&event);
+        if accepted {
+            self.user = Some(user.to_owned());
+            Ok(Auth::Accept)
+        } else {
+            Ok(reject_auth())
+        }
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        _channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if self.user.is_some() {
+            reply.accept().await;
+        }
+        Ok(())
+    }
+
+    async fn pty_request(
+        &mut self,
+        channel: ChannelId,
+        _term: &str,
+        _col_width: u32,
+        _row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(Pty, u32)],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_success(channel)?;
+        Ok(())
+    }
+
+    async fn shell_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.shell_started = true;
+        let mut event = self.event.activity("session.started");
+        event.username = self.user.clone();
+        self.record(&event);
+        session.channel_success(channel)?;
+        session.data(
+            channel,
+            format!("Ubuntu 22.04.4 LTS srv-app-01\r\n\r\n{}", self.prompt()).into_bytes(),
+        )?;
+        Ok(())
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let command = String::from_utf8_lossy(&data[..data.len().min(4096)]);
+        self.record_command(&command);
+        session.channel_success(channel)?;
+        session.data(
+            channel,
+            format!("{}\n", self.response(&command)).into_bytes(),
+        )?;
+        session.exit_status_request(channel, 0)?;
+        session.eof(channel)?;
+        session.close(channel)?;
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if !self.shell_started {
+            return Ok(());
+        }
+        for &byte in data {
+            match byte {
+                b'\r' | b'\n' => {
+                    session.data(channel, b"\r\n".to_vec())?;
+                    let line = std::mem::take(&mut self.input);
+                    if line.trim() == "exit" || line.trim() == "logout" {
+                        let mut event = self.event.activity("session.ended");
+                        event.username = self.user.clone();
+                        self.record(&event);
+                        session.close(channel)?;
+                        return Ok(());
+                    }
+                    self.record_command(&line);
+                    let output = self.response(&line);
+                    if !output.is_empty() {
+                        session.data(channel, format!("{output}\r\n").into_bytes())?;
+                    }
+                    session.data(channel, self.prompt().into_bytes())?;
+                }
+                8 | 127 => {
+                    self.input.pop();
+                }
+                32..=126 if self.input.len() < 4096 => {
+                    self.input.push(byte as char);
+                    session.data(channel, vec![byte])?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     async fn auth_publickey_offered(
         &mut self,
-        _user: &str,
+        user: &str,
         _public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<Auth, Self::Error> {
+        let mut event = self.event.activity("auth.attempted");
+        event.username = Some(user.chars().take(32).collect());
+        event.accepted = Some(false);
+        self.record(&event);
         Ok(reject_auth())
     }
 
@@ -224,6 +431,7 @@ impl server::Handler for LowHandler {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn low_advertises_only_password_and_public_key() {
@@ -248,6 +456,36 @@ mod auth_tests {
             }
             _ => panic!("rejected auth must preserve the advertised methods"),
         }
+    }
+
+    #[test]
+    fn low_auth_policies_match_configured_credentials() {
+        let event = ConnectionEvent::new(
+            Uuid::new_v4(),
+            "127.0.0.1:30000".parse().unwrap(),
+            "127.0.0.1:2222".parse().unwrap(),
+        );
+        let mut handler = LowHandler {
+            policy: LowAuthMode::CaptureCredentials,
+            credentials: vec![crate::config::LowCredential {
+                username: "admin".into(),
+                password: "secret".into(),
+            }],
+            sink: Arc::new(crate::telemetry::StdoutSink),
+            event,
+            user: None,
+            input: String::new(),
+            shell_started: false,
+        };
+        assert!(!handler.accepts("admin", "secret"));
+        handler.policy = LowAuthMode::Configured;
+        assert!(handler.accepts("admin", "secret"));
+        assert!(!handler.accepts("admin", "wrong"));
+        assert!(!handler.accepts("other", "secret"));
+        handler.policy = LowAuthMode::AnyPassword;
+        assert!(handler.accepts("other", "anything"));
+        handler.policy = LowAuthMode::Passwordless;
+        assert!(handler.accepts("other", ""));
     }
 }
 

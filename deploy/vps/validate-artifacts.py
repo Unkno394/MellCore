@@ -54,7 +54,7 @@ for filename, tag in [('low.tar', 'honeyforge-low:local'),
 with tarfile.open(root / 'hf-high-ubuntu-ssh.tar.gz') as archive:
     members = archive.getmembers()
     allowed_roots = ('high-ubuntu-ssh', 'high-debian-ssh', 'high-arch-ssh',
-                     'high-windows-rdp', 'high-custom-iso')
+                     'high-windows-rdp', 'high-custom-iso', 'hf-image-builder')
     if not members or any(
         not any(member.name == recipe or member.name.startswith(recipe + '/') for recipe in allowed_roots)
         for member in members
@@ -74,10 +74,24 @@ with tarfile.open(root / 'hf-high-ubuntu-ssh.tar.gz') as archive:
         'high-debian-ssh/cloud-init/user-data',
         'high-windows-rdp/scripts/launch.sh', 'high-windows-rdp/scripts/download-base-image.sh',
         'high-windows-rdp/autounattend.xml',
+        'high-windows-rdp/scripts/launch-prepared.sh',
+        'high-windows-rdp/scripts/ensure-prepared-image.sh',
+        'high-windows-rdp/scripts/publish-service.sh',
+        'high-windows-rdp/scripts/check-publication.sh',
         'high-custom-iso/scripts/launch-iso.sh',
         'high-custom-iso/scripts/check-ssh-isolated.sh',
+        'hf-image-builder/hf-image-builder', 'hf-image-builder/builder.py',
+        'hf-image-builder/windows-server-2022.pkr.hcl',
+        'hf-image-builder/templates/Autounattend.xml',
+        'hf-image-builder/windows/bootstrap.ps1',
+        'hf-image-builder/windows/configure.ps1',
+        'hf-image-builder/windows/finalize.ps1',
+        'hf-image-builder/windows/verify.ps1',
     }
     if not required_recipe.issubset({member.name for member in members}):
         raise SystemExit('В High archive отсутствуют файлы recipe')
+    builder_entry = next((member for member in members if member.name == 'hf-image-builder/hf-image-builder'), None)
+    if builder_entry is None or not builder_entry.mode & 0o111:
+        raise SystemExit('В High archive нет исполняемого Windows image builder')
 
 print(f'Артефакты проверены: {root}')

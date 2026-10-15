@@ -49,6 +49,7 @@ impl TelemetryStore {
                 }
             }
         }
+        let telemetry_file_was_missing = !path.exists();
         let mut options = OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
@@ -58,6 +59,9 @@ impl TelemetryStore {
             .with_context(|| format!("open telemetry file {}", path.display()))?;
         #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        if telemetry_file_was_missing {
+            sync_parent_directory(&path)?;
+        }
         let mut rejected_seen = HashSet::new();
         if let Ok(file) = File::open(path.with_extension("rejected.jsonl")) {
             for line in BufReader::new(file).lines().flatten() {
@@ -78,11 +82,14 @@ impl TelemetryStore {
     /// The exact event is kept for operator reconciliation and manual replay.
     pub fn reject(&mut self, agent_id: Uuid, events: &[TrapEvent]) -> anyhow::Result<usize> {
         let path = self.path.with_extension("rejected.jsonl");
+        let rejected_file_was_missing = !path.exists();
         let mut options = OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
         options.mode(0o600);
         let mut file = options.open(&path)?;
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         let received_at_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
         let mut count = 0;
         let mut pending = HashSet::new();
@@ -105,6 +112,9 @@ impl TelemetryStore {
         }
         file.flush()?;
         file.sync_data()?;
+        if rejected_file_was_missing {
+            sync_parent_directory(&path)?;
+        }
         self.rejected_seen.extend(pending);
         Ok(count)
     }
@@ -143,6 +153,15 @@ impl TelemetryStore {
         }
         Ok(pending.len())
     }
+}
+
+fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]

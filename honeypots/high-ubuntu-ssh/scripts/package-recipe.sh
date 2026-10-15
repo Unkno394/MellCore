@@ -7,7 +7,15 @@ set -eu
 recipe_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 output=${1:?usage: package-recipe.sh /path/to/hf-high-ubuntu-ssh.tar.gz}
 parent_dir=$(dirname "$recipe_dir")
+repo_root=$(dirname "$parent_dir")
 
 # macOS otherwise injects AppleDouble `._*` entries that the Linux artifact validator rejects.
-COPYFILE_DISABLE=1 tar -C "$parent_dir" -czf "$output" high-ubuntu-ssh high-debian-ssh high-arch-ssh high-windows-rdp high-custom-iso
+# The Windows adapter invokes this administrator-controlled builder on the agent host when its
+# immutable prepared image is not cached. Ship only its runtime files, never its tests or caches.
+COPYFILE_DISABLE=1 tar -C "$parent_dir" -czf "$output" \
+  high-ubuntu-ssh high-debian-ssh high-arch-ssh high-windows-rdp high-custom-iso \
+  -C "$repo_root/tools" \
+  hf-image-builder/hf-image-builder hf-image-builder/builder.py \
+  hf-image-builder/windows-server-2022.pkr.hcl hf-image-builder/templates \
+  hf-image-builder/windows
 printf '%s\n' "created $output"

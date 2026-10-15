@@ -143,8 +143,9 @@ telemetry. Несовместимый набор остановит устано
 * Agent: `hf-agent.service`, постоянная identity и SQLite outbox в
   `/var/lib/honeyforge/mellcore-local-agent`; команды доставляются через Hysteria.
   Агент собирает события Low из Docker stdout и Middle из `runtime/events.jsonl`,
-  отправляет их через Kazik внутри Hysteria с durable ACK. Центр пишет принятые события
-  в `/var/lib/honeyforge/telemetry/events.jsonl`, а затем в ClickHouse.
+  отправляет их через Kazik внутри Hysteria с durable ACK. High guest events из Ubuntu, Debian
+  и Arch проходят через отдельный SQLite batch store и тот же ACK-путь. Центр пишет принятые
+  события в `/var/lib/honeyforge/telemetry/events.jsonl`, а затем в ClickHouse.
 * Hysteria: существующий QUIC/UDP 443 и ACME cache сохраняются. Статический пароль,
   выданный предыдущим скриптом, добавляется в credential store для совместимости.
 * nginx: HTTPS/TCP 443 на том же домене, операторская панель защищена HTTP Basic. Control token
@@ -299,8 +300,18 @@ shell и запуска команд в Low нет. Middle принимает SS
 Отправка SMTP-писем требует SMTP settings; без них восстановление пароля и
 подтверждение email недоступны. Полноценный frontend регистрации/управления
 пользователями и WebSocket отсутствуют в репозитории.
-High Ubuntu recipe подготовлен для удалённого KVM-capable VPS. Этот хост без
-`/dev/kvm` не может запустить High VM; установка не создаёт её автоматически.
+Публичные High VM запускаются только через KVM. Если `/dev/kvm` отсутствует, режим `auto`
+не переключается на TCG. Для High-профиля `high_vm` в панели можно явно выбрать приватную
+лабораторию `private_tcg_test`: агент запускает VM через QEMU TCG в закрытой сети без публичного
+SSH-порта и передаёт телеметрию в Center. Доступ к гостю возможен с самого сервера по его частному
+IP. TCG не считается границей изоляции для публичной ловушки.
+
+Локальный автономный тест по-прежнему можно запустить отдельно:
+
+Пример запуска локального агента для функциональной проверки без `/dev/kvm`:
+
+    sudo /usr/local/bin/hf-agent --standalone-high --high-acceleration tcg \
+      --state-dir /var/lib/honeyforge-tcg-test
 
 ## Диагностика
 

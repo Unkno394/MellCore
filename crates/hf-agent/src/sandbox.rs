@@ -95,6 +95,58 @@ impl HighVm {
 pub struct LibvirtSandboxManager {
     adapters: Vec<HighOsAdapter>,
     high_root: PathBuf,
+    acceleration: HighAcceleration,
+    allow_tcg_test_mode: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum HighAcceleration {
+    Auto,
+    Kvm,
+    Tcg,
+}
+
+impl HighAcceleration {
+    pub fn resolve(self, allow_tcg_test_mode: bool) -> anyhow::Result<Self> {
+        let kvm_available = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/kvm")
+                .is_ok()
+        };
+        match self {
+            Self::Auto if kvm_available() => Ok(Self::Kvm),
+            Self::Auto => anyhow::bail!(
+                "KVM is unavailable; public High traps require KVM. Select private_tcg_test explicitly for an isolated lab trap"
+            ),
+            Self::Kvm if kvm_available() => Ok(Self::Kvm),
+            Self::Kvm => anyhow::bail!("KVM acceleration was requested but /dev/kvm is unavailable"),
+            Self::Tcg if allow_tcg_test_mode => Ok(Self::Tcg),
+            Self::Tcg => anyhow::bail!(
+                "TCG may run only for an explicitly selected private TCG test deployment; public High traps require KVM"
+            ),
+        }
+    }
+
+    fn expected_libvirt_type(self, allow_tcg_test_mode: bool) -> anyhow::Result<&'static str> {
+        match self {
+            Self::Auto | Self::Kvm => Ok("kvm"),
+            Self::Tcg if allow_tcg_test_mode => Ok("qemu"),
+            Self::Tcg => anyhow::bail!(
+                "TCG may run only for an explicitly selected private TCG test deployment; public High traps require KVM"
+            ),
+        }
+    }
+
+    fn libvirt_type(self) -> &'static str {
+        match self {
+            Self::Kvm => "kvm",
+            Self::Tcg => "qemu",
+            Self::Auto => unreachable!("auto acceleration must be resolved before VM launch"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -174,8 +226,8 @@ const GENERIC_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
 const WINDOWS_PREPARED_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
     download: "ensure-prepared-image.sh",
     launch: "launch-prepared.sh",
-    publish: "discover-rdp.sh",
-    check_publication: "check-rdp-isolated.sh",
+    publish: "publish-service.sh",
+    check_publication: "check-publication.sh",
     stop: "stop.sh",
     reset: "reset.sh",
     required: &[
@@ -183,8 +235,9 @@ const WINDOWS_PREPARED_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
         "create-prepared-overlay.sh",
         "create-network.sh",
         "firewall-common.sh",
-        "discover-rdp.sh",
-        "check-rdp-isolated.sh",
+        "publish-service.sh",
+        "unpublish-service.sh",
+        "check-publication.sh",
         "stop.sh",
         "reset.sh",
         "ensure-prepared-image.sh",
@@ -232,6 +285,20 @@ enum ReconcileAction {
 
 impl LibvirtSandboxManager {
     pub fn with_high_root(recipe_dir: impl Into<PathBuf>, high_root: impl Into<PathBuf>) -> Self {
+        Self::with_high_root_and_acceleration(
+            recipe_dir,
+            high_root,
+            HighAcceleration::Auto,
+            false,
+        )
+    }
+
+    pub fn with_high_root_and_acceleration(
+        recipe_dir: impl Into<PathBuf>,
+        high_root: impl Into<PathBuf>,
+        acceleration: HighAcceleration,
+        allow_tcg_test_mode: bool,
+    ) -> Self {
         let ubuntu_recipe_dir = recipe_dir.into();
         let recipes_root = ubuntu_recipe_dir
             .parent()
@@ -276,7 +343,7 @@ impl LibvirtSandboxManager {
                     readiness_timeout: Duration::from_secs(300),
                     dhcp_wait_attempts: 180,
                     verify_cached_managed_image: true,
-                    publication: HighPublication::Disabled,
+                    publication: HighPublication::Required,
                     scripts: WINDOWS_PREPARED_SCRIPTS,
                 },
                 HighOsAdapter {
@@ -311,12 +378,19 @@ impl LibvirtSandboxManager {
                 },
             ],
             high_root: high_root.into(),
+            acceleration,
+            allow_tcg_test_mode,
         }
     }
 
     pub fn create_and_start(&self, vm: &HighVm) -> anyhow::Result<()> {
         let adapter = self.adapter_for(vm.profile)?;
-        if vm.external_service_port == 0 && adapter.publication == HighPublication::Required {
+        let private_tcg_test = self.acceleration == HighAcceleration::Tcg
+            && self.allow_tcg_test_mode;
+        if vm.external_service_port == 0
+            && adapter.publication == HighPublication::Required
+            && !private_tcg_test
+        {
             anyhow::bail!(
                 "High {} VM needs an external service port",
                 profile_recipe_name(vm.profile)
@@ -446,7 +520,7 @@ impl LibvirtSandboxManager {
         Ok(high_running_health(
             self.domain_state(vm.instance_id)?,
             self.domain_matches_security_profile(vm)?,
-            self.has_published_service(vm),
+            self.access_policy_ready(vm),
             self.guest_service_ready(vm),
         ))
     }
@@ -528,11 +602,19 @@ impl LibvirtSandboxManager {
         let adapter = self.adapter_for(vm.profile)?;
         let instance_id = vm.instance_id.to_string();
         let port = vm.external_service_port.to_string();
-        if let Err(failure) = self.run(
-            vm.profile,
-            adapter.scripts.publish,
-            &[&instance_id, &port],
-        ) {
+        let local_tcg_test = self.acceleration == HighAcceleration::Tcg
+            && self.allow_tcg_test_mode
+            && adapter.publication == HighPublication::Required;
+        let access_result = if local_tcg_test {
+            self.discover_local_guest_ip(vm)
+        } else {
+            self.run(
+                vm.profile,
+                adapter.scripts.publish,
+                &[&instance_id, &port],
+            )
+        };
+        if let Err(failure) = access_result {
             let dhcp_timeout = self
                 .high_root
                 .join(&instance_id)
@@ -552,7 +634,19 @@ impl LibvirtSandboxManager {
     }
 
     fn wait_until_ready(&self, vm: &HighVm) -> anyhow::Result<()> {
-        let timeout = self.adapter_for(vm.profile)?.readiness_timeout;
+        let adapter = self.adapter_for(vm.profile)?;
+        let timeout = if self
+            .acceleration
+            .resolve(self.allow_tcg_test_mode)?
+            == HighAcceleration::Tcg
+        {
+            adapter
+                .readiness_timeout
+                .saturating_mul(5)
+                .max(Duration::from_secs(300))
+        } else {
+            adapter.readiness_timeout
+        };
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if self.access_policy_ready(vm) && self.guest_service_ready(vm) {
@@ -592,7 +686,73 @@ impl LibvirtSandboxManager {
     }
 
     fn access_policy_ready(&self, vm: &HighVm) -> bool {
+        if self.acceleration == HighAcceleration::Tcg
+            && self.allow_tcg_test_mode
+            && self
+                .adapter_for(vm.profile)
+                .is_ok_and(|adapter| adapter.publication == HighPublication::Required)
+        {
+            let instance_dir = self.high_root.join(vm.instance_id.to_string());
+            let guest_ip = std::fs::read_to_string(instance_dir.join("guest-ip"))
+                .ok()
+                .and_then(|value| value.trim().parse::<IpAddr>().ok());
+            return guest_ip.is_some_and(is_high_guest_ip)
+                && !instance_dir.join("external-ssh-port").exists()
+                && !instance_dir.join("publish-interface").exists()
+                && !self.has_published_service(vm);
+        }
         self.has_published_service(vm)
+    }
+
+    fn discover_local_guest_ip(&self, vm: &HighVm) -> anyhow::Result<()> {
+        let name = format!("hf-high-{}", vm.instance_id);
+        let adapter = self.adapter_for(vm.profile)?;
+        let attempts = if self.acceleration == HighAcceleration::Tcg {
+            adapter.dhcp_wait_attempts.saturating_mul(5).min(180)
+        } else {
+            adapter.dhcp_wait_attempts
+        };
+        let mut address = None;
+        for _ in 0..attempts {
+            let output = Command::new("virsh")
+                .env("LC_ALL", "C")
+                .args(["domifaddr", &name, "--source", "lease"])
+                .output()?;
+            if output.status.success() {
+                address = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter(|line| line.contains("ipv4"))
+                    .flat_map(str::split_whitespace)
+                    .find_map(|field| {
+                        field
+                            .split('/')
+                            .next()
+                            .and_then(|value| value.parse::<IpAddr>().ok())
+                            .filter(|address| is_high_guest_ip(*address))
+                    });
+                if address.is_some() {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
+        let Some(address) = address else {
+            let instance_dir = self.high_root.join(vm.instance_id.to_string());
+            let _ = std::fs::write(instance_dir.join("dhcp-timeout"), b"");
+            anyhow::bail!("guest has no DHCP lease in hf-high-isolated before the test timeout");
+        };
+        let instance_dir = self.high_root.join(vm.instance_id.to_string());
+        anyhow::ensure!(instance_dir.is_dir(), "High VM state directory is missing");
+        std::fs::write(instance_dir.join("guest-ip"), address.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                instance_dir.join("guest-ip"),
+                std::fs::Permissions::from_mode(0o600),
+            )?;
+        }
+        Ok(())
     }
 
     fn guest_service_ready(&self, vm: &HighVm) -> bool {
@@ -638,10 +798,14 @@ impl LibvirtSandboxManager {
             .high_root
             .join(vm.instance_id.to_string())
             .join("telemetry.sock");
+        let expected_domain_type = self
+            .acceleration
+            .expected_libvirt_type(self.allow_tcg_test_mode)?;
         Ok(domain_xml_matches_security_profile(
             &String::from_utf8_lossy(&output.stdout),
             &telemetry_socket,
             vm.profile,
+            expected_domain_type,
         ))
     }
 
@@ -677,16 +841,28 @@ impl LibvirtSandboxManager {
     fn run(&self, profile: HighOsProfile, script: &str, arguments: &[&str]) -> anyhow::Result<()> {
         let adapter = self.adapter_for(profile)?;
         let path = adapter.recipe_dir.join("scripts").join(script);
-        let status = Command::new("sh")
+        let is_launch = script == adapter.scripts.launch;
+        let acceleration = if is_launch {
+            Some(self.acceleration.resolve(self.allow_tcg_test_mode)?)
+        } else {
+            None
+        };
+        let dhcp_attempts = if acceleration == Some(HighAcceleration::Tcg) {
+            adapter.dhcp_wait_attempts.saturating_mul(5).min(180)
+        } else {
+            adapter.dhcp_wait_attempts
+        };
+        let mut command = Command::new("sh");
+        command
             .arg(&path)
             .args(arguments)
             .env("HF_HIGH_ROOT", &self.high_root)
-            .env(
-                "HF_HIGH_DHCP_ATTEMPTS",
-                adapter.dhcp_wait_attempts.to_string(),
-            )
-            .env("LC_ALL", "C")
-            .status()?;
+            .env("HF_HIGH_DHCP_ATTEMPTS", dhcp_attempts.to_string())
+            .env("LC_ALL", "C");
+        if let Some(acceleration) = acceleration {
+            command.env("HF_HIGH_VIRT_TYPE", acceleration.libvirt_type());
+        }
+        let status = command.status()?;
         if !status.success() {
             anyhow::bail!(
                 "High VM lifecycle script {} exited with {status}",
@@ -753,9 +929,17 @@ fn domain_xml_matches_security_profile(
     xml: &str,
     telemetry_socket: &Path,
     profile: HighOsProfile,
+    expected_domain_type: &str,
 ) -> bool {
     let expected_socket = format!("path='{}'", telemetry_socket.display());
-    let common = xml.matches("<interface type=").count() == 1
+    let domain_type_matches = xml.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("<domain ")
+            && (line.contains(&format!("type='{expected_domain_type}'"))
+                || line.contains(&format!("type=\"{expected_domain_type}\"")))
+    });
+    let common = domain_type_matches
+        && xml.matches("<interface type=").count() == 1
         && xml.contains("<interface type='network'>")
         && xml.contains("<source network='hf-high-isolated'")
         && xml.contains("name='org.honeyforge.telemetry.0'")
@@ -779,6 +963,19 @@ fn domain_xml_matches_security_profile(
             | HighGuestOs::ArchLinux
             | HighGuestOs::CustomLinux => xml.matches("<graphics ").count() == 0,
         }
+}
+
+fn is_high_guest_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            octets[0] == 192
+                && octets[1] == 168
+                && octets[2] == 250
+                && (100..=200).contains(&octets[3])
+        }
+        IpAddr::V6(_) => false,
+    }
 }
 
 fn lifecycle_error(code: &'static str, stage: &'static str, failure: anyhow::Error) -> anyhow::Error {
@@ -928,7 +1125,7 @@ mod tests {
         assert!(debian.verify_cached_managed_image);
         assert!(!ubuntu.verify_cached_managed_image);
         assert!(windows.verify_cached_managed_image);
-        assert_eq!(windows.publication, HighPublication::Disabled);
+        assert_eq!(windows.publication, HighPublication::Required);
         assert!(!legacy.verify_cached_managed_image);
         assert_eq!(legacy.publication, HighPublication::Required);
         assert_eq!(custom_qcow2.publication, HighPublication::Required);
@@ -937,16 +1134,16 @@ mod tests {
     }
 
     #[test]
-    fn prepared_windows_uses_local_qcow2_and_no_publication_script() {
+    fn prepared_windows_uses_local_qcow2_and_publishes_only_rdp() {
         let manager = LibvirtSandboxManager::with_high_root("/recipes/ubuntu", "/state/high");
         let adapter = manager.adapter_for(HighOsProfile::windows_rdp()).unwrap();
         assert_eq!(
             adapter.default_image,
             "/var/lib/honeyforge/images/windows-server-prepared.qcow2"
         );
-        assert_eq!(adapter.scripts.publish, "discover-rdp.sh");
-        assert_eq!(adapter.scripts.check_publication, "check-rdp-isolated.sh");
-        assert_ne!(adapter.scripts.publish, "publish-service.sh");
+        assert_eq!(adapter.scripts.publish, "publish-service.sh");
+        assert_eq!(adapter.scripts.check_publication, "check-publication.sh");
+        assert_eq!(adapter.publication, HighPublication::Required);
         assert_eq!(
             profile_manifest_kind(HighOsProfile::windows_rdp()),
             "high_windows_rdp_prepared"
@@ -960,28 +1157,32 @@ mod tests {
     #[test]
     fn existing_domain_must_keep_isolated_network_and_exact_telemetry_socket() {
         let socket = Path::new("/var/lib/honeyforge/high/id/telemetry.sock");
-        let valid = "<domain><devices><interface type='network'><source network='hf-high-isolated'/></interface><channel type='unix'><source mode='bind' path='/var/lib/honeyforge/high/id/telemetry.sock'/><target type='virtio' name='org.honeyforge.telemetry.0'/></channel></devices></domain>";
+        let valid = "<domain type='kvm'><devices><interface type='network'><source network='hf-high-isolated'/></interface><channel type='unix'><source mode='bind' path='/var/lib/honeyforge/high/id/telemetry.sock'/><target type='virtio' name='org.honeyforge.telemetry.0'/></channel></devices></domain>";
         assert!(domain_xml_matches_security_profile(
             valid,
             socket,
-            HighOsProfile::ubuntu_ssh()
+            HighOsProfile::ubuntu_ssh(),
+            "kvm"
         ));
         assert!(!domain_xml_matches_security_profile(
             &valid.replace("hf-high-isolated", "default"),
             socket,
-            HighOsProfile::ubuntu_ssh()
+            HighOsProfile::ubuntu_ssh(),
+            "kvm"
         ));
         assert!(!domain_xml_matches_security_profile(
             &valid.replace("telemetry.sock", "spoof.sock"),
             socket,
-            HighOsProfile::ubuntu_ssh()
+            HighOsProfile::ubuntu_ssh(),
+            "kvm"
         ));
         let second_interface =
             valid.replace("</interface>", "</interface><interface type='bridge'/>");
         assert!(!domain_xml_matches_security_profile(
             &second_interface,
             socket,
-            HighOsProfile::ubuntu_ssh()
+            HighOsProfile::ubuntu_ssh(),
+            "kvm"
         ));
 
         let windows = valid.replace(
@@ -991,12 +1192,14 @@ mod tests {
         assert!(domain_xml_matches_security_profile(
             &windows,
             socket,
-            HighOsProfile::windows_rdp()
+            HighOsProfile::windows_rdp(),
+            "kvm"
         ));
         assert!(!domain_xml_matches_security_profile(
             &windows.replace("127.0.0.1", "0.0.0.0"),
             socket,
-            HighOsProfile::windows_rdp()
+            HighOsProfile::windows_rdp(),
+            "kvm"
         ));
     }
 

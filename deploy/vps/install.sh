@@ -88,6 +88,7 @@ for binary in hf-center hf-agent hf-dispatcher honeyforge-backend; do
 done
 install -d -m 0755 /usr/local/lib/honeyforge
 tar --no-same-owner -xzf /opt/mellcore/artifacts/hf-high-ubuntu-ssh.tar.gz -C /usr/local/lib/honeyforge
+chmod 0755 /usr/local/lib/honeyforge/hf-image-builder/hf-image-builder
 install -d -m 0700 /root/mellcore-backups
 cp -p /etc/hysteria/config.yaml "/root/mellcore-backups/hysteria-$(date +%Y%m%d-%H%M%S).yaml"
 systemctl stop hf-agent hf-center 2>/dev/null || true
@@ -261,5 +262,5 @@ python3 "$repo/deploy/vps/verify-and-seed.py"
 touch /etc/honeyforge/mellcore-installed
 echo 'Компоненты запущены и проверены. Панель: https://yourpasswordforemail.ru/'
 echo 'Данные входа: /root/mellcore-access.txt (cat /root/mellcore-access.txt)'
-if [[ ! -c /dev/kvm ]]; then echo 'High Ubuntu VM недоступна на этом VPS: отсутствует /dev/kvm.'; fi
+if [[ ! -c /dev/kvm ]]; then echo 'Публичные High VM требуют /dev/kvm; для локальной проверки используйте standalone TCG test mode.'; fi
 echo 'SMTP и полноценная связь backend CRUD с агентом пока не реализованы в этом контуре.'

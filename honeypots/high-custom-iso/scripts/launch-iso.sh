@@ -11,11 +11,13 @@ virsh dominfo "$vm_name" >/dev/null 2>&1 && { echo "VM already exists: $vm_name"
 trap 'virsh destroy "$vm_name" >/dev/null 2>&1 || true; virsh undefine "$vm_name" --nvram >/dev/null 2>&1 || true; rm -rf "$instance_dir"' EXIT INT TERM
 mkdir -p "$instance_dir"
 qemu-img create -f qcow2 "$instance_dir/disk.qcow2" 40G
+high_virt_type=${HF_HIGH_VIRT_TYPE:-kvm}
+case "$high_virt_type" in kvm|qemu) ;; *) echo "invalid High libvirt domain type: $high_virt_type" >&2; exit 1 ;; esac
 libvirt_user=${HF_HIGH_LIBVIRT_USER:-libvirt-qemu}
 getent passwd "$libvirt_user" >/dev/null || { echo "libvirt QEMU user does not exist: $libvirt_user" >&2; exit 1; }
 setfacl -m "u:$libvirt_user:--x" "$(dirname "$root_dir")" "$root_dir" "$(dirname "$(dirname "$base_iso")")" "$(dirname "$base_iso")"
 setfacl -m "u:$libvirt_user:r--" "$base_iso"
 setfacl -m "u:$libvirt_user:rw-" "$instance_dir/disk.qcow2"
 setfacl -m "u:$libvirt_user:rwx" "$instance_dir"
-virt-install --name "$vm_name" --memory 2048 --vcpus 2 --os-variant generic --disk "path=$instance_dir/disk.qcow2,format=qcow2,bus=sata" --disk "path=$base_iso,device=cdrom,readonly=on" --network "network=hf-high-isolated,model=e1000" --channel "unix,path=$instance_dir/telemetry.sock,mode=bind,target.type=virtio,target.name=org.honeyforge.telemetry.0" --channel "unix,target.type=virtio,target.name=org.qemu.guest_agent.0" --graphics spice,listen=127.0.0.1 --noautoconsole
+virt-install --virt-type "$high_virt_type" --name "$vm_name" --memory 2048 --vcpus 2 --os-variant generic --disk "path=$instance_dir/disk.qcow2,format=qcow2,bus=sata" --disk "path=$base_iso,device=cdrom,readonly=on" --network "network=hf-high-isolated,model=e1000" --channel "unix,path=$instance_dir/telemetry.sock,mode=bind,target.type=virtio,target.name=org.honeyforge.telemetry.0" --channel "unix,target.type=virtio,target.name=org.qemu.guest_agent.0" --graphics spice,listen=127.0.0.1 --noautoconsole
 trap - EXIT INT TERM

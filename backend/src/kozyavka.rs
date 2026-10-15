@@ -5,7 +5,7 @@ use crate::{
     models::TrapLevel,
     resources::{PortBinding, Transport, Trap},
 };
-use hf_core::{AgentCommand, KozyavkaDeployment};
+use hf_core::{AgentCommand, KozyavkaDeployment, LowSshCredential};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr};
@@ -22,12 +22,33 @@ pub struct Settings {
     pub bind_address: IpAddr,
     #[schema(min_length = 1, max_length = 253, pattern = "^[ -~]+$")]
     pub banner: String,
+    pub auth_mode: LowAuthMode,
+    pub credentials: Vec<Credential>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LowAuthMode {
+    #[default]
+    CaptureCredentials,
+    Configured,
+    AnyPassword,
+    Passwordless,
+}
+
+#[derive(Clone, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Credential {
+    pub username: String,
+    pub password: String,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
             bind_address: Ipv4Addr::LOCALHOST.into(),
             banner: "SSH-2.0-OpenSSH_9.6".into(),
+            auth_mode: LowAuthMode::CaptureCredentials,
+            credentials: Vec::new(),
         }
     }
 }
@@ -43,6 +64,8 @@ pub struct RuntimeConfig {
     #[schema(min_length = 1, max_length = 253, pattern = "^[ -~]+$")]
     pub banner: String,
     pub trap_id: Uuid,
+    pub auth_mode: LowAuthMode,
+    pub credentials: Vec<Credential>,
 }
 
 pub fn validate_profile(
@@ -64,6 +87,23 @@ pub fn validate_profile(
         return Err(AppError::invalid(
             "kozyavka banner requires 1–253 printable ASCII bytes",
         ));
+    }
+    if settings.auth_mode == LowAuthMode::Configured && settings.credentials.is_empty() {
+        return Err(AppError::invalid(
+            "Low SSH configured login requires credentials",
+        ));
+    }
+    if settings.credentials.len() > 32
+        || settings.credentials.iter().any(|pair| {
+            pair.username.is_empty()
+                || pair.username.len() > 32
+                || pair.password.is_empty()
+                || pair.password.len() > 128
+                || pair.username.chars().any(char::is_control)
+                || pair.password.chars().any(char::is_control)
+        })
+    {
+        return Err(AppError::invalid("Invalid Low SSH credentials"));
     }
     Ok(settings)
 }
@@ -102,6 +142,8 @@ pub fn runtime_config(trap: &Trap) -> Result<RuntimeConfig, AppError> {
         port: container_port,
         banner: settings.banner,
         trap_id: trap.trap_id,
+        auth_mode: settings.auth_mode,
+        credentials: settings.credentials,
     })
 }
 
@@ -121,6 +163,21 @@ pub fn deployment_command(trap: &Trap) -> Result<AgentCommand, AppError> {
         host_port,
         container_port: runtime.port,
         banner: runtime.banner,
+        auth_mode: match runtime.auth_mode {
+            LowAuthMode::CaptureCredentials => "capture_credentials",
+            LowAuthMode::Configured => "configured",
+            LowAuthMode::AnyPassword => "any_password",
+            LowAuthMode::Passwordless => "passwordless",
+        }
+        .into(),
+        credentials: runtime
+            .credentials
+            .into_iter()
+            .map(|pair| LowSshCredential {
+                username: pair.username,
+                password: pair.password,
+            })
+            .collect(),
         resources: trap.resources.into(),
         publish_address: if binding.route_mode == crate::resources::RouteMode::Direct {
             "0.0.0.0"

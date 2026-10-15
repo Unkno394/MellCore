@@ -38,6 +38,111 @@ fn run(shell: &mut SessionShell, command: &str) -> String {
 }
 
 #[test]
+fn linux_vulnerability_clients_and_events_match_enabled_scenarios() {
+    let profiles = [
+        "ssh_weak_credentials",
+        "ssh_root_login_enabled",
+        "redis_unauthenticated_access",
+        "docker_api_exposed",
+        "http_admin_panel_exposure",
+        "sql_database_weak_credentials",
+        "ftp_anonymous_login",
+        "web_path_traversal",
+        "web_command_injection",
+    ];
+    let probes = [
+        (
+            "curl -i http://127.0.0.1:8080/",
+            "http_admin_panel_exposure",
+            "Administration",
+        ),
+        (
+            "curl -i http://127.0.0.1:2375/containers/json",
+            "docker_api_exposed",
+            "billing-api",
+        ),
+        (
+            "curl --path-as-is -i http://127.0.0.1:8080/../../etc/passwd",
+            "web_path_traversal",
+            "root:x:0:0",
+        ),
+        (
+            "curl --get --data-urlencode 'cmd=echo HF_PROBE' http://127.0.0.1:8080/",
+            "web_command_injection",
+            "HF_PROBE",
+        ),
+        (
+            "psql 'postgresql://admin:password@127.0.0.1:15432/billing' -c 'SELECT count(*) FROM users;'",
+            "sql_database_weak_credentials",
+            "count",
+        ),
+        (
+            "mysql -h 127.0.0.1 -P 13306 -u admin -ppassword -e 'SELECT 1;'",
+            "sql_database_weak_credentials",
+            "Query OK",
+        ),
+        (
+            "ftp localhost 2121",
+            "ftp_anonymous_login",
+            "230 Login successful",
+        ),
+    ];
+
+    for os in [
+        Distribution::Ubuntu,
+        Distribution::Debian,
+        Distribution::Arch,
+    ] {
+        let mut guest = shell(os, &[], &profiles);
+        let redis_client = if os == Distribution::Arch {
+            "valkey-cli"
+        } else {
+            "redis-cli"
+        };
+        for client in ["curl", "psql", "mysql", "ftp", redis_client] {
+            let output = run(&mut guest, &format!("which {client}"));
+            assert!(output.contains(client), "{os:?}: {client}: {output}");
+        }
+        let root_login = run(&mut guest, "sshd -T");
+        assert!(
+            root_login.contains("permitrootlogin yes"),
+            "{os:?}: {root_login}"
+        );
+
+        let redis = guest.execute(&format!("{redis_client} -h 127.0.0.1 -p 6379 PING"), now());
+        assert_eq!(redis.exit_status, 0, "{os:?}: {}", redis.output);
+        assert!(redis.output.contains("PONG"), "{os:?}: {}", redis.output);
+        assert!(
+            redis
+                .vulnerability_attempts
+                .iter()
+                .any(|attempt| attempt.profile_id == "redis_unauthenticated_access")
+        );
+
+        for (command, profile, response) in probes {
+            let result = guest.execute(command, now());
+            assert_eq!(
+                result.exit_status, 0,
+                "{os:?}: {command}: {}",
+                result.output
+            );
+            assert!(
+                result.output.contains(response),
+                "{os:?}: {command}: {}",
+                result.output
+            );
+            assert!(
+                result
+                    .vulnerability_attempts
+                    .iter()
+                    .any(|attempt| attempt.profile_id == profile),
+                "{os:?}: {command} did not report {profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn linux_profiles_keep_identity_commands_and_package_files_consistent() {
     for (os, marker, kernel, manager, absent) in [
         (

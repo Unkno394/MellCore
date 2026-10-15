@@ -45,6 +45,11 @@ async fn snapshot(
         crate::pritvoryashka::validate_ports(&input.ports, &settings.vulnerability_profiles)?;
     }
     if profile.honeypot_type == "high_ubuntu_ssh" {
+        if effective.get("high_runtime_mode").is_some() {
+            return Err(AppError::invalid(
+                "high_runtime_mode is supported only by the high_vm profile",
+            ));
+        }
         crate::high_ubuntu::validate_profile(profile.level, &profile.service_type, &effective)?;
         if input.ports.len() != 1
             || input.ports[0].transport != Transport::Tcp
@@ -56,6 +61,11 @@ async fn snapshot(
         }
     }
     if profile.honeypot_type == "high_vm" {
+        if profile.config.get("high_runtime_mode").is_some() {
+            return Err(AppError::invalid(
+                "High runtime mode is selected on each trap, not in the shared profile",
+            ));
+        }
         let configured_os = crate::high_vm::validate_profile(
             profile.level,
             &profile.service_type,
@@ -68,27 +78,7 @@ async fn snapshot(
                 "A trap cannot override the operating system selected by its High profile",
             ));
         }
-        if input.ports.len() != 1
-            || input.ports[0].transport != Transport::Tcp
-            || input.ports[0].route_mode != RouteMode::Direct
-        {
-            return Err(AppError::invalid(
-                "High SSH requires exactly one direct TCP port",
-            ));
-        }
-        let guest_port = match crate::high_vm::os_profile(&effective)?.connection {
-            hf_core::HighGuestConnection::Ssh { guest_port } => guest_port,
-            hf_core::HighGuestConnection::Rdp { .. } => {
-                return Err(AppError::invalid(
-                    "high_vm currently supports SSH profiles only",
-                ));
-            }
-        };
-        if input.ports[0].target_port != guest_port {
-            return Err(AppError::invalid(
-                "High SSH guest port does not match the selected OS profile",
-            ));
-        }
+        crate::high_vm::validate_port_bindings(&effective, &input.ports)?;
     }
     Ok((profile, effective, resources))
 }
