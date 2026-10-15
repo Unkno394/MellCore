@@ -159,7 +159,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
                     self.assertIn("preseed/late_command", preseed)
                     self.assertIn("apt-setup/use_mirror boolean false", preseed)
 
-    def test_arch_media_uses_syslinux_and_uefi_without_grub(self):
+    def test_arch_media_rebuilds_one_rootfs_without_etc_conflict(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             fake_bin = root / "bin"
@@ -193,27 +193,49 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 "[ -n \"$out\" ] && { printf '%s' 'prepared ISO' > \"$out\"; exit 0; }\n"
                 "exit 2\n",
             )
-            serial_capture = root / "serial-autologin.conf"
+            repack_capture = root / "repacked-root"
             executable(
                 fake_bin / "mksquashfs",
                 "#!/bin/sh\n"
-                "overlay=$1; image=$2\n"
-                "dropin=\"$overlay/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf\"\n"
-                "link=\"$overlay/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service\"\n"
+                "source=$1; image=$2\n"
+                "dropin=\"$source/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf\"\n"
+                "link=\"$source/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service\"\n"
+                "[ -f \"$source/etc/from-original-rootfs\" ] || exit 19\n"
+                "[ ! -e \"$source/etc_1\" ] || exit 20\n"
                 "grep -F -- '--autologin root --keep-baud 115200,57600,38400,9600' \"$dropin\" >/dev/null || exit 20\n"
                 "[ \"$(readlink \"$link\")\" = /usr/lib/systemd/system/serial-getty@.service ] || exit 21\n"
-                "cp \"$dropin\" \"$FAKE_SERIAL_CAPTURE\"\n"
-                "printf '%s' 'prepared squashfs' >> \"$image\"\n",
+                "rm -rf \"$FAKE_REPACK_CAPTURE\"\n"
+                "mkdir -p \"$FAKE_REPACK_CAPTURE\"\n"
+                "cp -a \"$source/.\" \"$FAKE_REPACK_CAPTURE/\"\n"
+                "printf '%s' 'prepared squashfs' > \"$image\"\n",
             )
             executable(
                 fake_bin / "unsquashfs",
                 "#!/bin/sh\n"
-                "dest=\n"
-                "while [ \"$#\" -gt 0 ]; do [ \"$1\" = -d ] && { shift; dest=$1; }; shift; done\n"
-                "dropin=\"$dest/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf\"\n"
-                "mkdir -p \"$(dirname \"$dropin\")\" \"$dest/etc/systemd/system/getty.target.wants\"\n"
-                "cp \"$FAKE_SERIAL_CAPTURE\" \"$dropin\"\n"
-                "ln -s /usr/lib/systemd/system/serial-getty@.service \"$dest/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service\"\n",
+                "dest=; image=; selected=; list=false\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  case $1 in\n"
+                "    -d) shift; dest=$1 ;;\n"
+                "    -l) list=true ;;\n"
+                "    -*) ;;\n"
+                "    *) if [ -z \"$image\" ]; then image=$1; else selected=true; fi ;;\n"
+                "  esac\n"
+                "  shift\n"
+                "done\n"
+                "if [ \"$list\" = true ]; then\n"
+                "  printf '%s\\n' squashfs-root squashfs-root/etc squashfs-root/etc/systemd\n"
+                "  [ ! -e \"$FAKE_REPACK_CAPTURE/etc_1\" ] || printf '%s\\n' squashfs-root/etc_1\n"
+                "  exit 0\n"
+                "fi\n"
+                "if [ -z \"$selected\" ]; then\n"
+                "  mkdir -p \"$dest/etc\"\n"
+                "  printf '%s\\n' preserved > \"$dest/etc/from-original-rootfs\"\n"
+                "  chmod 0640 \"$dest/etc/from-original-rootfs\"\n"
+                "  ln -s /usr/lib/original-target \"$dest/etc/original-link\"\n"
+                "  exit 0\n"
+                "fi\n"
+                "mkdir -p \"$dest\"\n"
+                "cp -a \"$FAKE_REPACK_CAPTURE/.\" \"$dest/\"\n",
             )
             executable(
                 fake_bin / "sha512sum",
@@ -227,7 +249,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 PATH=f"{fake_bin}:{os.environ['PATH']}",
                 HF_HIGH_ROOT=str(root / "high"),
                 FAKE_XORRISO_LOG=str(xorriso_log),
-                FAKE_SERIAL_CAPTURE=str(serial_capture),
+                FAKE_REPACK_CAPTURE=str(repack_capture),
             )
             subprocess.run(
                 [
@@ -264,10 +286,22 @@ class CustomIsoRecipeTests(unittest.TestCase):
             self.assertIn("-boot_image any replay", calls)
             self.assertNotIn("/boot/grub", calls)
             self.assertTrue((instance / "unattended.iso").is_file())
-            self.assertIn("--autologin root", serial_capture.read_text())
+            dropin = repack_capture / "etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf"
+            self.assertIn("--autologin root", dropin.read_text())
+            self.assertTrue((repack_capture / "etc/from-original-rootfs").is_file())
+            self.assertEqual(
+                stat.S_IMODE((repack_capture / "etc/from-original-rootfs").stat().st_mode),
+                0o640,
+            )
+            self.assertTrue((repack_capture / "etc/original-link").is_symlink())
+            self.assertEqual(
+                os.readlink(repack_capture / "etc/original-link"),
+                "/usr/lib/original-target",
+            )
+            self.assertFalse((repack_capture / "etc_1").exists())
             self.assertEqual(
                 (instance / "unattended-arch.version").read_text().strip(),
-                "arch-serial-getty-v1",
+                "arch-serial-getty-v2",
             )
             self.assertEqual(hashlib.sha256(base.read_bytes()).hexdigest(), base_digest)
 
