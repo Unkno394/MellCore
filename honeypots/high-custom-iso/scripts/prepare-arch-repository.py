@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -291,6 +292,24 @@ def resolve_packages(
     return sorted(selected.values(), key=lambda item: (repository_order[item.repository], item.name))
 
 
+def parse_xorriso_listing(output: str) -> set[str]:
+    listing: set[str] = set()
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            fields = shlex.split(line, posix=True)
+        except ValueError:
+            fields = []
+        # xorriso normally emits one shell-quoted ISO path per result line.
+        # With -sh_style_result on it emits the same path without quotes. Reject
+        # ambiguous result lines rather than accidentally accepting diagnostics.
+        if len(fields) == 1 and fields[0].startswith("/") and "\x00" not in fields[0]:
+            listing.add(fields[0])
+    return listing
+
+
 def validate_cached_iso(iso_path: Path, checksum_path: Path) -> bool:
     ensure_safe_regular(iso_path)
     ensure_safe_regular(checksum_path)
@@ -301,9 +320,23 @@ def validate_cached_iso(iso_path: Path, checksum_path: Path) -> bool:
         if not SHA256.fullmatch(expected) or sha256_file(iso_path) != expected:
             raise RepositoryError("ARCH_REPO_CACHE_INVALID", "cached repository ISO checksum mismatch")
     result = subprocess.run(
-        ["xorriso", "-indev", str(iso_path), "-find", "/", "-type", "f", "-exec", "echo"],
+        [
+            "xorriso",
+            "-report_about",
+            "FAILURE",
+            "-indev",
+            str(iso_path),
+            "-sh_style_result",
+            "on",
+            "-find",
+            "/",
+            "-type",
+            "f",
+            "-exec",
+            "echo",
+        ],
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         text=True,
     )
     required = {
@@ -311,9 +344,21 @@ def validate_cached_iso(iso_path: Path, checksum_path: Path) -> bool:
         "/extra/os/x86_64/extra.db",
         "/HF-ARCH-REPO.json",
     }
-    listing = {line.strip() for line in result.stdout.splitlines()}
-    if result.returncode or not required.issubset(listing):
-        raise RepositoryError("ARCH_REPO_CACHE_INVALID", "cached repository ISO structure is invalid")
+    listing = parse_xorriso_listing(result.stdout)
+    missing = sorted(required - listing)
+    if result.returncode or missing:
+        discovered = sorted(listing)
+        sample = ", ".join(discovered[:12]) or "<none>"
+        if len(discovered) > 12:
+            sample += f", ... ({len(discovered)} files total)"
+        stderr = " ".join(result.stderr.strip().splitlines())[-600:] or "<none>"
+        raise RepositoryError(
+            "ARCH_REPO_CACHE_INVALID",
+            "repository ISO structure verification failed: "
+            f"xorriso_exit={result.returncode}; "
+            f"missing={','.join(missing) or '<none>'}; "
+            f"discovered={sample}; xorriso_stderr={stderr}",
+        )
     if not checksum_path.exists():
         atomic_text(checksum_path, f"{sha256_file(iso_path)}  {iso_path.name}\n")
     return True

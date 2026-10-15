@@ -193,6 +193,81 @@ class CustomIsoRecipeTests(unittest.TestCase):
             self.assertEqual(manifest["databases"]["core"], hashlib.sha256(b"core metadata").hexdigest())
             self.assertEqual(manifest["databases"]["extra"], hashlib.sha256(b"extra metadata").hexdigest())
 
+    def test_arch_repository_listing_accepts_xorriso_shell_quoted_paths(self):
+        repository = load_arch_repository_module()
+        listing = repository.parse_xorriso_listing(
+            "'/core/os/x86_64/core.db'\n"
+            "'/extra/os/x86_64/extra.db'\n"
+            "'/HF-ARCH-REPO.json'\n"
+        )
+        self.assertEqual(
+            listing,
+            {
+                "/core/os/x86_64/core.db",
+                "/extra/os/x86_64/extra.db",
+                "/HF-ARCH-REPO.json",
+            },
+        )
+        self.assertEqual(repository.parse_xorriso_listing("diagnostic text\n'unclosed\n"), set())
+
+    @unittest.skipUnless(shutil.which("xorriso"), "xorriso is required for a real ISO test")
+    def test_arch_repository_validator_accepts_a_real_small_xorriso_image(self):
+        repository = load_arch_repository_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            staging = root / "staging"
+            for name in ("core", "extra"):
+                target = staging / name / "os" / "x86_64"
+                target.mkdir(parents=True)
+                (target / f"{name}.db").write_bytes(f"{name} database fixture".encode())
+            (staging / "HF-ARCH-REPO.json").write_text("{}\n", encoding="utf-8")
+            image = root / "repository.iso"
+            completed = subprocess.run(
+                [
+                    shutil.which("xorriso"),
+                    "-as",
+                    "mkisofs",
+                    "-quiet",
+                    "-r",
+                    "-V",
+                    "HF_ARCH_REPO",
+                    "-o",
+                    str(image),
+                    str(staging),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            checksum = image.with_suffix(".iso.sha256")
+            self.assertTrue(repository.validate_cached_iso(image, checksum))
+            self.assertTrue(checksum.is_file())
+
+    def test_arch_repository_validator_reports_exit_missing_paths_and_listing(self):
+        repository = load_arch_repository_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            image = root / "repository.iso"
+            image.write_bytes(b"ISO fixture")
+            result = subprocess.CompletedProcess(
+                args=["xorriso"],
+                returncode=5,
+                stdout="'/core/os/x86_64/core.db'\n",
+                stderr="xorriso : FAILURE : fixture read error\n",
+            )
+            with mock.patch.object(repository.subprocess, "run", return_value=result) as run_mock:
+                with self.assertRaises(repository.RepositoryError) as caught:
+                    repository.validate_cached_iso(image, root / "repository.iso.sha256")
+            command = run_mock.call_args.args[0]
+            self.assertIn("-sh_style_result", command)
+            self.assertEqual(command[-6:], ["-find", "/", "-type", "f", "-exec", "echo"])
+            detail = str(caught.exception)
+            self.assertIn("xorriso_exit=5", detail)
+            self.assertIn("/extra/os/x86_64/extra.db", detail)
+            self.assertIn("/HF-ARCH-REPO.json", detail)
+            self.assertIn("discovered=/core/os/x86_64/core.db", detail)
+            self.assertIn("fixture read error", detail)
+
     def test_arch_package_signature_download_has_specific_diagnostic(self):
         repository = load_arch_repository_module()
         with tempfile.TemporaryDirectory() as directory:
@@ -263,10 +338,11 @@ class CustomIsoRecipeTests(unittest.TestCase):
             executable(
                 fake_bin / "xorriso",
                 "#!/bin/sh\n"
-                "if [ \"$1\" = -indev ]; then\n"
+                "case \" $* \" in\n"
+                "*' -indev '*)\n"
                 "  printf '%s\\n' /core/os/x86_64/core.db /extra/os/x86_64/extra.db /HF-ARCH-REPO.json\n"
-                "  exit 0\n"
-                "fi\n"
+                "  exit 0 ;;\n"
+                "esac\n"
                 "output=\n"
                 "while [ \"$#\" -gt 0 ]; do\n"
                 "  [ \"$1\" = -o ] && { shift; output=$1; }\n"
