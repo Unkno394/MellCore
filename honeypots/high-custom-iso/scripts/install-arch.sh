@@ -47,7 +47,14 @@ virsh domstate "$vm_name" 2>/dev/null | grep -Eqi 'shut|off' || { echo 'installe
 virt-cat -a "$instance_dir/disk.qcow2" /etc/honeyforge-installed | grep -Fx installed >/dev/null || { echo 'Arch installation marker is absent from target disk' >&2; exit 1; }
 record_phase REBOOTING
 cdrom_target=$(virsh domblklist "$vm_name" --details | awk '$2 == "cdrom" { print $3; exit }')
-[ -n "$cdrom_target" ] && virsh change-media "$vm_name" "$cdrom_target" --eject --config >/dev/null
+cdrom_source=$(virsh domblklist "$vm_name" --details | awk '$2 == "cdrom" && $4 != "-" { print $4; exit }')
+if [ -n "$cdrom_source" ]; then
+  [ -n "$cdrom_target" ] || { echo 'HF_HIGH_ERROR code=INSTALL_MEDIA_DEVICE_MISSING stage=reboot: installer CD-ROM device is absent' >&2; exit 1; }
+  if ! virsh change-media "$vm_name" "$cdrom_target" --eject --config >/dev/null; then
+    cdrom_source=$(virsh domblklist "$vm_name" --details | awk '$2 == "cdrom" && $4 != "-" { print $4; exit }')
+    [ -z "$cdrom_source" ] || { echo 'HF_HIGH_ERROR code=INSTALL_MEDIA_EJECT_FAILED stage=reboot: libvirt failed to eject Arch installation media' >&2; exit 1; }
+  fi
+fi
 umask 077; : > "$instance_dir/installed-disk-verified"
 rm -f "$instance_dir/install-started" "$instance_dir/arch-guest-install.sh"
 virsh start "$vm_name" >/dev/null

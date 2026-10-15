@@ -14,6 +14,8 @@ setfacl -m "u:$libvirt_user:--x" "$(dirname "$root_dir")" "$root_dir" "$(dirname
 setfacl -m "u:$libvirt_user:r--" "$base_iso"
 setfacl -m "u:$libvirt_user:rwx" "$instance_dir"
 install_iso=$base_iso
+installer=${HF_HIGH_ISO_INSTALLER:-interactive}
+install_boot=cdrom,hd
 case ${HF_HIGH_ISO_INSTALLER:-interactive}:$(test -e "$instance_dir/installed-disk-verified" && echo installed || echo pending) in
   ubuntu:pending|debian:pending|arch:pending)
     sh "$script_dir/prepare-unattended-iso.sh" "$base_iso" "$instance_id" "$HF_HIGH_ISO_INSTALLER"
@@ -21,6 +23,7 @@ case ${HF_HIGH_ISO_INSTALLER:-interactive}:$(test -e "$instance_dir/installed-di
     setfacl -m "u:$libvirt_user:r--" "$install_iso"
     ;;
 esac
+[ "$installer" != arch ] || install_boot=cdrom,hd,menu=off,useserial=on
 if ! virsh dominfo "$vm_name" >/dev/null 2>&1; then
   [ -f "$instance_dir/disk.qcow2" ] || qemu-img create -f qcow2 "$instance_dir/disk.qcow2" 40G
   setfacl -m "u:$libvirt_user:rw-" "$instance_dir/disk.qcow2"
@@ -34,7 +37,7 @@ if ! virsh dominfo "$vm_name" >/dev/null 2>&1; then
   else
     virt-install --name "$vm_name" --memory 2048 --vcpus 2 --os-variant generic \
       --disk "path=$instance_dir/disk.qcow2,format=qcow2,bus=virtio" \
-      --cdrom "$install_iso" --boot cdrom,hd \
+      --cdrom "$install_iso" --boot "$install_boot" \
       --network "network=$HF_HIGH_NETWORK_NAME,model=virtio" \
       --channel "unix,path=$instance_dir/telemetry.sock,mode=bind,target.type=virtio,target.name=org.honeyforge.telemetry.0" \
       --channel "unix,target.type=virtio,target.name=org.qemu.guest_agent.0" \

@@ -25,7 +25,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
         launch = (RECIPE / "scripts" / "launch-iso.sh").read_text()
         check = (RECIPE / "scripts" / "check-ssh-isolated.sh").read_text()
         self.assertIn("network=$HF_HIGH_NETWORK_NAME", launch)
-        self.assertIn('--cdrom "$install_iso" --boot cdrom,hd', launch)
+        self.assertIn('--cdrom "$install_iso" --boot "$install_boot"', launch)
         self.assertIn("spice,listen=127.0.0.1", launch)
         self.assertNotIn("publish-ssh", launch)
         self.assertIn("unexpected DNAT publication", check)
@@ -41,7 +41,9 @@ class CustomIsoRecipeTests(unittest.TestCase):
         self.assertIn('arch) sh "$script_dir/install-arch.sh"', launch)
         self.assertIn("autoinstall:", prepare)
         self.assertIn("preseed/late_command", prepare)
-        self.assertIn("--boot cdrom,hd", launch)
+        self.assertIn('install_boot=cdrom,hd', launch)
+        self.assertIn('--boot "$install_boot"', launch)
+        self.assertIn("cdrom,hd,menu=off,useserial=on", launch)
         self.assertIn('change-media "$vm_name"', finalizer)
         self.assertIn('virsh start "$vm_name"', finalizer)
         self.assertIn("installed-disk-verified", finalizer)
@@ -49,6 +51,8 @@ class CustomIsoRecipeTests(unittest.TestCase):
         self.assertIn("installed-disk-verified", arch)
         guest = (RECIPE / "scripts" / "arch-guest-install.sh").read_text()
         self.assertNotIn("pacstrap", guest)
+        self.assertNotIn("pacman", guest)
+        self.assertIn("timedatectl set-ntp false", guest)
         self.assertIn("INSTALL_MEDIA_COMPONENT_MISSING", guest)
         self.assertIn("cp -a", guest)
 
@@ -58,12 +62,12 @@ class CustomIsoRecipeTests(unittest.TestCase):
         self.assertNotIn("virsh undefine", launch)
         self.assertIn("HF_HIGH_INSTALL_TIMEOUT_SECONDS", arch)
         self.assertIn("install-started", arch)
+        self.assertIn("INSTALL_MEDIA_EJECT_FAILED", arch)
 
     def test_unattended_media_is_generated_per_instance(self):
         grub_by_flavor = {
             "ubuntu": "menuentry x {\n linux /casper/vmlinuz ---\n}\n",
             "debian": "menuentry x {\n linux /install.amd/vmlinuz --- quiet\n}\n",
-            "arch": "menuentry x {\n linux /arch/boot/x86_64/vmlinuz-linux archisobasedir=arch\n}\n",
         }
         for flavor, grub in grub_by_flavor.items():
             with self.subTest(flavor=flavor), tempfile.TemporaryDirectory() as directory:
@@ -85,7 +89,6 @@ class CustomIsoRecipeTests(unittest.TestCase):
                     "  last=$1; shift\n"
                     "done\n"
                     "if [ \"$source\" = /isolinux/txt.cfg ]; then printf '%s\\n' ' append initrd=/install.amd/initrd.gz --- quiet' > \"$extract\"; exit 0; fi\n"
-                    "if [ \"$source\" = /syslinux ]; then mkdir -p \"$extract\"; printf '%s\\n' ' APPEND archisobasedir=arch' > \"$extract/arch.cfg\"; exit 0; fi\n"
                     "if [ -n \"$extract\" ]; then printf '%s' \"$FAKE_GRUB\" > \"$extract\"; exit 0; fi\n"
                     "[ -n \"$out\" ] && { : > \"$out\"; exit 0; }\n"
                     "exit 2\n",
@@ -150,6 +153,73 @@ class CustomIsoRecipeTests(unittest.TestCase):
                     preseed = (instance / "preseed.cfg").read_text()
                     self.assertIn("preseed/late_command", preseed)
                     self.assertIn("apt-setup/use_mirror boolean false", preseed)
+
+    def test_arch_media_uses_syslinux_and_uefi_without_grub(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            xorriso_log = root / "xorriso.log"
+            executable(
+                fake_bin / "xorriso",
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$FAKE_XORRISO_LOG\"\n"
+                "out=; extract=; source=\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  case $1 in\n"
+                "    -extract) shift; source=$1; shift; extract=$1 ;;\n"
+                "    -outdev) shift; out=$1 ;;\n"
+                "  esac\n"
+                "  shift\n"
+                "done\n"
+                "case $source in\n"
+                "  /boot/syslinux)\n"
+                "    mkdir -p \"$extract\"\n"
+                "    printf '%s\\n' 'INCLUDE boot/syslinux/archiso_sys-linux.cfg' > \"$extract/archiso_sys.cfg\"\n"
+                "    printf '%s\\n' 'LABEL arch64' '  LINUX /arch/boot/x86_64/vmlinuz-linux' '  INITRD /arch/boot/x86_64/initramfs-linux.img' '  APPEND archisobasedir=arch archisolabel=ARCH_202508' > \"$extract/archiso_sys-linux.cfg\"\n"
+                "    exit 0 ;;\n"
+                "  /arch/boot/x86_64/vmlinuz-linux|/arch/boot/x86_64/initramfs-linux.img|/EFI/BOOT/BOOTx64.EFI)\n"
+                "    mkdir -p \"$(dirname \"$extract\")\"; : > \"$extract\"; exit 0 ;;\n"
+                "  /boot/grub/*) exit 9 ;;\n"
+                "esac\n"
+                "[ -n \"$out\" ] && { : > \"$out\"; exit 0; }\n"
+                "exit 2\n",
+            )
+            base = root / "archlinux-2025.08.01-x86_64.iso"
+            base.write_bytes(b"verified Arch ISO fixture")
+            subprocess.run(
+                [
+                    "sh",
+                    str(RECIPE / "scripts" / "prepare-unattended-iso.sh"),
+                    str(base),
+                    INSTANCE_ID,
+                    "arch",
+                ],
+                check=True,
+                env=dict(
+                    os.environ,
+                    PATH=f"{fake_bin}:{os.environ['PATH']}",
+                    HF_HIGH_ROOT=str(root / "high"),
+                    FAKE_XORRISO_LOG=str(xorriso_log),
+                ),
+                capture_output=True,
+                text=True,
+            )
+            instance = root / "high" / INSTANCE_ID
+            main = (instance / "boot-syslinux/archiso_sys.cfg").read_text()
+            entry = (instance / "boot-syslinux/archiso_sys-linux.cfg").read_text()
+            self.assertIn("DEFAULT arch64", main)
+            self.assertIn("PROMPT 0", main)
+            self.assertIn("TIMEOUT 1", main)
+            self.assertIn("SERIAL 0 115200", main)
+            self.assertIn("console=ttyS0,115200n8", entry)
+            self.assertIn("archisobasedir=arch", entry)
+            calls = xorriso_log.read_text()
+            self.assertIn("-extract /boot/syslinux", calls)
+            self.assertIn("-extract /EFI/BOOT/BOOTx64.EFI", calls)
+            self.assertIn("-boot_image any replay", calls)
+            self.assertNotIn("/boot/grub", calls)
+            self.assertTrue((instance / "unattended.iso").is_file())
 
     def test_ubuntu_finalizer_requires_disk_boot_and_full_guest_readiness(self):
         finalizer = (RECIPE / "scripts" / "finalize-linux-install.sh").read_text()

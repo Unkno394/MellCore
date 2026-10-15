@@ -3,7 +3,8 @@ set -eu
 trap 'echo HF_INSTALL_FAILED:guest-script; rm -f /run/hf-installing' EXIT INT TERM
 disk=/dev/vda
 [ -b "$disk" ] || { echo 'HF_INSTALL_FAILED: target disk /dev/vda is absent' >&2; exit 1; }
-timedatectl set-ntp true || true
+# Installation is intentionally offline; do not wait for NTP or package repositories.
+timedatectl set-ntp false || true
 for command in sshd qemu-ga auditd python3 grub-install mkinitcpio; do
   command -v "$command" >/dev/null || {
     echo "HF_INSTALL_FAILED:INSTALL_MEDIA_COMPONENT_MISSING:$command" >&2

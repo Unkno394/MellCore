@@ -9,6 +9,7 @@ case "$flavor" in ubuntu|debian|arch) ;; *) echo "unsupported unattended ISO fla
 for command in xorriso openssl python3; do command -v "$command" >/dev/null; done
 [ -r "$base_iso" ]
 mkdir -p "$instance_dir/iso-payload/nocloud" "$instance_dir/iso-payload/honeyforge"
+rm -f "$instance_dir/unattended.iso.tmp"
 password_file="$instance_dir/ssh-password"
 if [ -r "$password_file" ]; then analyst_password=$(cat "$password_file"); else
   analyst_password=$(openssl rand -base64 24 | tr -d '\n'); umask 077; printf '%s\n' "$analyst_password" > "$password_file"
@@ -144,32 +145,62 @@ PY
     -map "$instance_dir/preseed.cfg" /preseed.cfg \
     -map "$instance_dir/iso-payload/honeyforge" /honeyforge -commit >/dev/null 2>&1
 elif [ "$flavor" = arch ]; then
-  grub="$instance_dir/grub.cfg"
-  xorriso -osirrox on -indev "$base_iso" -extract /boot/grub/grub.cfg "$grub" >/dev/null 2>&1 || {
-    echo 'Arch media lacks /boot/grub/grub.cfg required for serial unattended installation' >&2; exit 1;
+  # Official Arch installation media boots in BIOS mode from /boot/syslinux. It does not
+  # provide the Ubuntu/Debian-style /boot/grub/grub.cfg that older recipes assumed.
+  syslinux_dir="$instance_dir/boot-syslinux"
+  rm -rf "$syslinux_dir" "$instance_dir/arch-media-probe"
+  xorriso -osirrox on -indev "$base_iso" -extract /boot/syslinux "$syslinux_dir" >/dev/null 2>&1 || {
+    echo 'Arch media lacks /boot/syslinux required for BIOS serial installation' >&2; exit 1;
   }
-  python3 - "$grub" <<'PY'
-import pathlib, re, sys
-p = pathlib.Path(sys.argv[1]); text = p.read_text()
-text, count = re.subn(r'(?m)^(\s*linux\s+/arch/boot/x86_64/vmlinuz-linux)(?![^\n]*console=ttyS0)', r'\1 console=ttyS0,115200n8', text)
-if not count and "/arch/boot/x86_64/vmlinuz-linux" not in text: raise SystemExit("Arch GRUB config has no supported x86_64 kernel entry")
-p.write_text(text)
-PY
-  syslinux_dir="$instance_dir/syslinux"
-  xorriso -osirrox on -indev "$base_iso" -extract /syslinux "$syslinux_dir" >/dev/null 2>&1 || {
-    echo 'Arch media lacks /syslinux required for BIOS serial installation' >&2; exit 1;
-  }
+  mkdir -p "$instance_dir/arch-media-probe"
+  for media_path in /arch/boot/x86_64/vmlinuz-linux /arch/boot/x86_64/initramfs-linux.img /EFI/BOOT/BOOTx64.EFI; do
+    probe="$instance_dir/arch-media-probe/$(basename "$media_path")"
+    xorriso -osirrox on -indev "$base_iso" -extract "$media_path" "$probe" >/dev/null 2>&1 || {
+      echo "Arch media lacks required boot artefact $media_path" >&2; exit 1;
+    }
+  done
   python3 - "$syslinux_dir" <<'PY'
 import pathlib, re, sys
-changed = 0
-for p in pathlib.Path(sys.argv[1]).glob("*.cfg"):
-    text = p.read_text()
-    rendered, count = re.subn(r'(?mi)^(\s*append\s+)(?![^\n]*console=ttyS0)', r'\1console=ttyS0,115200n8 ', text)
-    if count: p.write_text(rendered); changed += count
-if not changed: raise SystemExit("Arch SYSLINUX config has no append entry")
+root = pathlib.Path(sys.argv[1])
+configs = sorted(root.rglob("*.cfg"))
+main = root / "archiso_sys.cfg"
+if not main.is_file():
+    raise SystemExit("Arch SYSLINUX tree lacks archiso_sys.cfg")
+
+default_label = None
+serial_append = False
+for path in configs:
+    text = path.read_text(encoding="utf-8")
+    labels = list(re.finditer(r"(?mi)^\s*LABEL\s+(\S+)", text))
+    for index, label in enumerate(labels):
+        end = labels[index + 1].start() if index + 1 < len(labels) else len(text)
+        block = text[label.start():end]
+        if "vmlinuz-linux" in block and "initramfs-linux.img" in block:
+            default_label = default_label or label.group(1)
+
+    rendered = []
+    for line in text.splitlines(keepends=True):
+        if re.match(r"(?i)^\s*APPEND\s+", line) and "console=ttyS0" not in line:
+            ending = "\n" if line.endswith("\n") else ""
+            line = line.rstrip("\r\n") + " console=ttyS0,115200n8" + ending
+        if re.match(r"(?i)^\s*APPEND\s+", line) and "console=ttyS0" in line:
+            serial_append = True
+        rendered.append(line)
+    path.write_text("".join(rendered), encoding="utf-8")
+
+if default_label is None:
+    raise SystemExit("Arch SYSLINUX config has no x86_64 live kernel entry")
+if not serial_append:
+    raise SystemExit("Arch SYSLINUX config has no kernel APPEND directive for serial boot")
+with main.open("a", encoding="utf-8") as config:
+    config.write(
+        "\n# HoneyForge deterministic serial boot\n"
+        f"DEFAULT {default_label}\nPROMPT 0\nTIMEOUT 1\nSERIAL 0 115200\n"
+    )
 PY
+  rm -rf "$instance_dir/arch-media-probe"
   xorriso -indev "$base_iso" -outdev "$instance_dir/unattended.iso.tmp" -boot_image any replay \
-    -map "$grub" /boot/grub/grub.cfg -map "$syslinux_dir" /syslinux -commit >/dev/null 2>&1
+    -map "$syslinux_dir" /boot/syslinux -commit >/dev/null 2>&1
 fi
 mv "$instance_dir/unattended.iso.tmp" "$instance_dir/unattended.iso"
 chmod 0600 "$password_file" "$instance_dir/unattended.iso"
