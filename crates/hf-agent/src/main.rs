@@ -197,6 +197,40 @@ fn resumes_interrupted_high_download(manifest: &HighRuntimeManifest) -> bool {
         && manifest.lifecycle_state == HighLifecycleState::Downloading
 }
 
+fn holds_failed_high_for_explicit_retry(manifest: &HighRuntimeManifest) -> bool {
+    manifest.desired_state == HighDesiredState::Running
+        && manifest.lifecycle_state == HighLifecycleState::Failed
+}
+
+fn same_image_artifact(
+    left: &hf_core::HighImageSource,
+    right: &hf_core::HighImageSource,
+) -> bool {
+    left.sha256.eq_ignore_ascii_case(&right.sha256)
+        && left.format == right.format
+        && left.architecture == right.architecture
+}
+
+fn approved_iso_for_deployment(
+    deployment: &HighVmDeployment,
+) -> Result<Option<high_image::ApprovedIso>, high_image::HighImageError> {
+    if !matches!(
+        deployment.profile,
+        profile if profile == HighOsProfile::ubuntu_iso_ssh()
+            || profile == HighOsProfile::debian_iso_ssh()
+            || profile == HighOsProfile::arch_linux_iso_ssh()
+    ) {
+        return Ok(None);
+    }
+    let catalog = high_image::approved_iso(deployment.profile)?;
+    Ok(deployment.image_source.as_ref().and_then(|source| {
+        same_image_artifact(source, &catalog.source).then(|| high_image::ApprovedIso {
+            source: source.clone(),
+            expected_size_bytes: catalog.expected_size_bytes,
+        })
+    }))
+}
+
 #[derive(Clone)]
 enum SharedTcpDeployment {
     Kozyavka(KozyavkaDeployment),
@@ -478,25 +512,7 @@ impl ComposeProjectStore {
         allow_existing_ubuntu_image: bool,
     ) -> anyhow::Result<()> {
         Self::resolve_managed_iso_source(&mut deployment)?;
-        let approved = if matches!(
-            deployment.profile,
-            profile if profile == HighOsProfile::ubuntu_iso_ssh()
-                || profile == HighOsProfile::debian_iso_ssh()
-                || profile == HighOsProfile::arch_linux_iso_ssh()
-        ) {
-            let catalog = high_image::approved_iso(deployment.profile)?;
-            if deployment
-                .image_source
-                .as_ref()
-                .is_none_or(|source| source == &catalog.source)
-            {
-                Some(catalog)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let approved = approved_iso_for_deployment(&deployment)?;
         Self::validate_high_deployment(&deployment, allow_existing_ubuntu_image)?;
         let previous = self.load_high_manifest(deployment.trap_id)?;
         let mut manifest = HighRuntimeManifest {
@@ -511,23 +527,8 @@ impl ComposeProjectStore {
         let detect_iso_installer = deployment.profile == HighOsProfile::custom_linux_iso_ssh();
         if deployment.image_source.is_some() {
             self.transition_high_lifecycle(&mut manifest, HighLifecycleState::Downloading, None)?;
-            let state_dir = self.root.parent().unwrap_or(Path::new(DEFAULT_STATE_DIR));
-            let source = deployment.image_source.as_ref().expect("checked above");
-            let materialized = if let Some(approved) = &approved {
-                high_image::materialize_approved_iso(
-                    approved,
-                    deployment.profile,
-                    &state_dir.join("images").join("iso"),
-                )
-            } else {
-                high_image::materialize_image(
-                    source,
-                    deployment.profile,
-                    &state_dir.join("images").join("custom"),
-                )
-            };
-            match materialized {
-                Ok(path) => deployment.base_image = path.to_string_lossy().into_owned(),
+            match self.materialize_deployment_image(&mut deployment, approved.as_ref()) {
+                Ok(()) => {}
                 Err(error) => {
                     self.transition_high_lifecycle(
                         &mut manifest,
@@ -569,10 +570,7 @@ impl ComposeProjectStore {
                 || current.deployment.profile != deployment.profile
                 || current.deployment.image_source != deployment.image_source
         });
-        manifest.kind = profile_manifest_kind(deployment.profile).into();
-        manifest.profile = deployment.profile;
-        manifest.deployment = deployment.clone();
-        self.transition_high_lifecycle(&mut manifest, HighLifecycleState::VmCreated, None)?;
+        self.persist_materialized_deployment(&mut manifest, &deployment)?;
         let active_state = if matches!(
             deployment.profile.image_preparation,
             hf_core::HighImagePreparation::UnattendedInstall
@@ -633,6 +631,82 @@ impl ComposeProjectStore {
             };
         }
         Ok(())
+    }
+
+    fn materialize_deployment_image(
+        &self,
+        deployment: &mut HighVmDeployment,
+        approved: Option<&high_image::ApprovedIso>,
+    ) -> anyhow::Result<()> {
+        self.materialize_deployment_image_with(
+            deployment,
+            approved,
+            |source, profile, cache_dir, approved| {
+                if let Some(approved) = approved {
+                    Ok(high_image::materialize_approved_iso(
+                        approved, profile, cache_dir,
+                    )?)
+                } else {
+                    Ok(high_image::materialize_image(source, profile, cache_dir)?)
+                }
+            },
+        )
+    }
+
+    fn materialize_deployment_image_with<F>(
+        &self,
+        deployment: &mut HighVmDeployment,
+        approved: Option<&high_image::ApprovedIso>,
+        materialize: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(
+            &hf_core::HighImageSource,
+            HighOsProfile,
+            &Path,
+            Option<&high_image::ApprovedIso>,
+        ) -> anyhow::Result<PathBuf>,
+    {
+        let Some(source) = deployment.image_source.clone() else {
+            return Ok(());
+        };
+        let state_dir = self.root.parent().unwrap_or(Path::new(DEFAULT_STATE_DIR));
+        let managed_cache = state_dir.join("images").join("iso");
+        let custom_cache = state_dir.join("images").join("custom");
+        let (preferred, fallback) = if approved.is_some() {
+            (&managed_cache, &custom_cache)
+        } else {
+            (&custom_cache, &managed_cache)
+        };
+        // A durable manifest may outlive an approved URL or catalog revision. Locate the
+        // digest-keyed final/partial entry in either standard cache before selecting where a
+        // fresh download would go; the materializer still performs full size/SHA/format checks.
+        let cache_dir = if high_image::cache_has_download(&source, deployment.profile, preferred)? {
+            preferred
+        } else if high_image::cache_has_download(&source, deployment.profile, fallback)? {
+            fallback
+        } else {
+            preferred
+        };
+        let path = materialize(
+            &source,
+            deployment.profile,
+            cache_dir,
+            approved,
+        )?;
+        deployment.base_image = path.to_string_lossy().into_owned();
+        Ok(())
+    }
+
+    fn persist_materialized_deployment(
+        &self,
+        manifest: &mut HighRuntimeManifest,
+        deployment: &HighVmDeployment,
+    ) -> anyhow::Result<()> {
+        manifest.kind = profile_manifest_kind(deployment.profile).into();
+        manifest.profile = deployment.profile;
+        manifest.deployment = deployment.clone();
+        self.transition_high_lifecycle(manifest, HighLifecycleState::VmCreated, None)
     }
 
     fn validate_high_deployment(
@@ -819,6 +893,13 @@ impl ComposeProjectStore {
                 if let Err(error) = self.deploy_high(manifest.deployment.clone(), false) {
                     tracing::error!(trap_id = %trap_id, %error, "High ISO download reconciliation failed");
                 }
+                continue;
+            }
+            if holds_failed_high_for_explicit_retry(&manifest) {
+                tracing::debug!(
+                    trap_id = %trap_id,
+                    "High trap remains failed until an explicit lifecycle command retries it"
+                );
                 continue;
             }
             if manifest.desired_state == HighDesiredState::Running
@@ -3164,11 +3245,12 @@ mod tests {
         dependency_auto_install_from_value, high_tool_probe_args, high_tool_works_at,
         high_vm_missing_packages, high_vm_required_tools, load_or_create_standalone_high_identity,
         parse_platform, quarantine_result, resumes_interrupted_high_download,
+        approved_iso_for_deployment, holds_failed_high_for_explicit_retry,
         standalone_high_command, validate_standalone_high_args,
     };
     use clap::Parser;
     use hf_core::{AgentCommand, HighUbuntuDeployment, HighVmDeployment};
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{cell::Cell, fs, os::unix::fs::PermissionsExt};
 
     use uuid::Uuid;
 
@@ -3529,6 +3611,106 @@ mod tests {
         manifest.lifecycle_state = HighLifecycleState::Downloading;
         manifest.desired_state = HighDesiredState::Stopped;
         assert!(!resumes_interrupted_high_download(&manifest));
+    }
+
+    #[test]
+    fn restarted_download_uses_cached_iso_path_in_vm_and_manifest() {
+        let state_dir =
+            std::env::temp_dir().join(format!("hf-high-download-recovery-{}", Uuid::new_v4()));
+        let store = ComposeProjectStore::new(&state_dir);
+        let trap_id = Uuid::new_v4();
+        let profile = HighOsProfile::ubuntu_iso_ssh();
+        let catalog = crate::high_image::approved_iso(profile).unwrap();
+        let mut source = catalog.source.clone();
+        source.url = "https://old-approved-mirror.example.invalid/ubuntu.iso".into();
+        let manifest = HighRuntimeManifest {
+            version: 1,
+            kind: super::profile_manifest_kind(profile).into(),
+            profile,
+            deployment: HighVmDeployment {
+                command_id: Uuid::new_v4(),
+                trap_id,
+                base_image: String::new(),
+                external_service_port: 0,
+                profile,
+                image_source: Some(source.clone()),
+            },
+            desired_state: HighDesiredState::Running,
+            lifecycle_state: HighLifecycleState::Downloading,
+            last_error: None,
+        };
+        store.save_high_manifest(&manifest).unwrap();
+
+        let managed_cache = state_dir.join("images").join("iso");
+        fs::create_dir_all(&managed_cache).unwrap();
+        let cached_path = crate::high_image::cached_image_path(&source, profile, &managed_cache)
+            .unwrap();
+        fs::write(&cached_path, b"already verified ISO fixture").unwrap();
+
+        let restarted = ComposeProjectStore::new(&state_dir);
+        let mut recovered = restarted.load_high_manifest(trap_id).unwrap().unwrap();
+        let approved = approved_iso_for_deployment(&recovered.deployment)
+            .unwrap()
+            .expect("approved artifact is matched by SHA-256, format and architecture");
+        assert_eq!(approved.source.url, source.url);
+        let materialize_calls = Cell::new(0_u8);
+        restarted
+            .materialize_deployment_image_with(
+                &mut recovered.deployment,
+                Some(&approved),
+                |actual_source, actual_profile, cache_dir, _| {
+                    materialize_calls.set(materialize_calls.get() + 1);
+                    assert_eq!(actual_source.sha256, source.sha256);
+                    assert_eq!(actual_profile, profile);
+                    assert_eq!(cache_dir, managed_cache);
+                    let path = crate::high_image::cached_image_path(
+                        actual_source,
+                        actual_profile,
+                        cache_dir,
+                    )?;
+                    assert!(path.is_file());
+                    Ok(path)
+                },
+            )
+            .unwrap();
+        assert_eq!(materialize_calls.get(), 1);
+        assert_eq!(recovered.deployment.base_image, cached_path.to_string_lossy());
+
+        let materialized_deployment = recovered.deployment.clone();
+        let vm = ComposeProjectStore::high_vm(&materialized_deployment);
+        assert_eq!(vm.base_image, cached_path);
+        restarted
+            .persist_materialized_deployment(&mut recovered, &materialized_deployment)
+            .unwrap();
+        let persisted = restarted.load_high_manifest(trap_id).unwrap().unwrap();
+        assert_eq!(persisted.lifecycle_state, HighLifecycleState::VmCreated);
+        assert_eq!(persisted.deployment.base_image, vm.base_image.to_string_lossy());
+        assert!(persisted.last_error.is_none());
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn failed_running_high_waits_for_an_explicit_retry() {
+        let profile = HighOsProfile::ubuntu_iso_ssh();
+        let mut manifest = HighRuntimeManifest {
+            version: 1,
+            kind: super::profile_manifest_kind(profile).into(),
+            profile,
+            deployment: HighVmDeployment {
+                command_id: Uuid::new_v4(),
+                trap_id: Uuid::new_v4(),
+                base_image: String::new(),
+                external_service_port: 0,
+                profile,
+                image_source: Some(crate::high_image::approved_iso(profile).unwrap().source),
+            },
+            desired_state: HighDesiredState::Running,
+            lifecycle_state: HighLifecycleState::Failed,
+            last_error: Some("previous permanent failure".into()),
+        };
+        assert!(holds_failed_high_for_explicit_retry(&manifest));
+        manifest.desired_state = HighDesiredState::Stopped;
+        assert!(!holds_failed_high_for_explicit_retry(&manifest));
     }
 
     #[test]

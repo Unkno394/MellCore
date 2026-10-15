@@ -155,6 +155,46 @@ pub fn materialize_approved_iso(
     )
 }
 
+pub fn cached_image_path(
+    source: &HighImageSource,
+    profile: HighOsProfile,
+    cache_dir: &Path,
+) -> Result<PathBuf, HighImageError> {
+    validate_source_metadata(source, profile)?;
+    let extension = match source.format {
+        HighImageFormat::Qcow2 => "qcow2",
+        HighImageFormat::Iso => "iso",
+    };
+    Ok(cache_dir.join(format!(
+        "{}.{}",
+        source.sha256.to_ascii_lowercase(),
+        extension
+    )))
+}
+
+pub fn cache_has_download(
+    source: &HighImageSource,
+    profile: HighOsProfile,
+    cache_dir: &Path,
+) -> Result<bool, HighImageError> {
+    let destination = cached_image_path(source, profile, cache_dir)?;
+    let extension = destination
+        .extension()
+        .and_then(|value| value.to_str())
+        .expect("cache image extension");
+    let partial = cache_dir.join(format!(
+        ".{}.{}.part",
+        source.sha256.to_ascii_lowercase(),
+        extension
+    ));
+    Ok(
+        destination.exists()
+            || destination.is_symlink()
+            || partial.exists()
+            || partial.is_symlink(),
+    )
+}
+
 fn materialize_image_with_space(
     source: &HighImageSource,
     profile: HighOsProfile,
@@ -177,12 +217,12 @@ fn materialize_image_with_space(
             format!("cannot protect custom image cache: {failure}"),
         )
     })?;
-    let extension = match source.format {
-        HighImageFormat::Qcow2 => "qcow2",
-        HighImageFormat::Iso => "iso",
-    };
     let digest = source.sha256.to_ascii_lowercase();
-    let destination = cache_dir.join(format!("{digest}.{extension}"));
+    let destination = cached_image_path(source, profile, cache_dir)?;
+    let extension = destination
+        .extension()
+        .and_then(|value| value.to_str())
+        .expect("cache image extension");
     let partial = cache_dir.join(format!(".{digest}.{extension}.part"));
     let metadata = cache_dir.join(format!(".{digest}.{extension}.part.json"));
     let lock_path = cache_dir.join(format!(".{digest}.{extension}.lock"));
