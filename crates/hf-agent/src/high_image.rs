@@ -1191,10 +1191,7 @@ fn verify_iso(path: &Path, profile: HighOsProfile) -> Result<(), HighImageError>
         "xorriso could not read the ISO9660 structure",
     )?;
     let listing = output(
-        Command::new("xorriso")
-            .args(["-indev"])
-            .arg(path)
-            .args(["-find", "/", "-type", "f", "-print"]),
+        &mut xorriso_file_listing_command(path),
         "IMAGE_STRUCTURE_INVALID",
         "inspection",
         "xorriso could not enumerate installation media",
@@ -1228,6 +1225,15 @@ fn verify_iso(path: &Path, profile: HighOsProfile) -> Result<(), HighImageError>
         ));
     }
     Ok(())
+}
+
+fn xorriso_file_listing_command(path: &Path) -> Command {
+    let mut command = Command::new("xorriso");
+    command
+        .arg("-indev")
+        .arg(path)
+        .args(["-find", "/", "-type", "f", "-exec", "echo"]);
+    command
 }
 
 fn inspect_iso_text(inspection: &str) -> (Option<HighGuestOs>, Option<HighImageArchitecture>) {
@@ -1272,10 +1278,7 @@ pub fn automatic_install_profile(path: &Path) -> Result<HighOsProfile, HighImage
         "xorriso could not read the ISO9660 structure",
     )?;
     let listing = output(
-        Command::new("xorriso")
-            .args(["-indev"])
-            .arg(path)
-            .args(["-find", "/", "-type", "f", "-print"]),
+        &mut xorriso_file_listing_command(path),
         "IMAGE_STRUCTURE_INVALID",
         "inspection",
         "xorriso could not enumerate installation media",
@@ -1892,6 +1895,59 @@ fi
                 (Some(expected), Some(HighImageArchitecture::X86_64))
             );
         }
+    }
+
+    #[test]
+    fn xorriso_listing_uses_supported_find_exec_echo_syntax() {
+        let command = xorriso_file_listing_command(Path::new("/tmp/installer image.iso"));
+        let arguments: Vec<_> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            arguments,
+            [
+                "-indev",
+                "/tmp/installer image.iso",
+                "-find",
+                "/",
+                "-type",
+                "f",
+                "-exec",
+                "echo",
+            ]
+        );
+        assert!(!arguments.iter().any(|argument| argument == "-print"));
+    }
+
+    #[test]
+    fn parses_xorriso_exec_echo_listing_for_supported_and_custom_media() {
+        let cases = [
+            (
+                "xorriso : UPDATE : 42 nodes read\n'/casper/vmlinuz'\n'/casper/install-sources.yaml'\n'/EFI/BOOT/BOOTX64.EFI'\n",
+                Some(HighGuestOs::Ubuntu),
+            ),
+            (
+                "xorriso : NOTE : File objects found\n'/install.amd/vmlinuz'\n",
+                Some(HighGuestOs::Debian),
+            ),
+            (
+                "xorriso : NOTE : File objects found\n'/arch/boot/x86_64/vmlinuz-linux'\n",
+                Some(HighGuestOs::ArchLinux),
+            ),
+            (
+                "xorriso : NOTE : File objects found\n'/EFI/BOOT/BOOTX64.EFI'\n'/payload/custom.img'\n",
+                None,
+            ),
+        ];
+        for &(listing, expected_os) in &cases {
+            let listing = listing.to_ascii_lowercase();
+            assert_eq!(
+                inspect_iso_text(&listing),
+                (expected_os, Some(HighImageArchitecture::X86_64))
+            );
+        }
+        assert!(cases[0].0.contains("/casper/install-sources.yaml"));
     }
 
     #[test]
