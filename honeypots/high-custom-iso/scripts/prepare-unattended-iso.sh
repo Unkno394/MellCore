@@ -167,36 +167,48 @@ main = root / "archiso_sys.cfg"
 if not main.is_file():
     raise SystemExit("Arch SYSLINUX tree lacks archiso_sys.cfg")
 
-default_label = None
-serial_append = False
+selected = None
 for path in configs:
     text = path.read_text(encoding="utf-8")
     labels = list(re.finditer(r"(?mi)^\s*LABEL\s+(\S+)", text))
     for index, label in enumerate(labels):
         end = labels[index + 1].start() if index + 1 < len(labels) else len(text)
         block = text[label.start():end]
-        if "vmlinuz-linux" in block and "initramfs-linux.img" in block:
-            default_label = default_label or label.group(1)
+        if selected is None and "vmlinuz-linux" in block and "initramfs-linux.img" in block:
+            selected = (path, label.group(1), label.start(), end)
 
-    rendered = []
-    for line in text.splitlines(keepends=True):
-        if re.match(r"(?i)^\s*APPEND\s+", line) and "console=ttyS0" not in line:
-            ending = "\n" if line.endswith("\n") else ""
-            line = line.rstrip("\r\n") + " console=ttyS0,115200n8" + ending
-        if re.match(r"(?i)^\s*APPEND\s+", line) and "console=ttyS0" in line:
-            serial_append = True
-        rendered.append(line)
-    path.write_text("".join(rendered), encoding="utf-8")
-
-if default_label is None:
+if selected is None:
     raise SystemExit("Arch SYSLINUX config has no x86_64 live kernel entry")
-if not serial_append:
-    raise SystemExit("Arch SYSLINUX config has no kernel APPEND directive for serial boot")
-with main.open("a", encoding="utf-8") as config:
-    config.write(
-        "\n# HoneyForge deterministic serial boot\n"
-        f"DEFAULT {default_label}\nPROMPT 0\nTIMEOUT 1\nSERIAL 0 115200\n"
-    )
+entry_path, default_label, start, end = selected
+entry_text = entry_path.read_text(encoding="utf-8")
+block = entry_text[start:end]
+append_pattern = re.compile(r"(?mi)^(\s*APPEND\s+)([^\r\n]*)")
+
+def serial_args(match):
+    args = match.group(2)
+    if "console=ttyS0" not in args:
+        args += " console=tty0 console=ttyS0,115200n8"
+    return match.group(1) + args
+
+block, append_count = append_pattern.subn(serial_args, block, count=1)
+if append_count != 1 or "console=ttyS0" not in block:
+    raise SystemExit("Arch SYSLINUX live entry has no usable APPEND directive for serial boot")
+entry_path.write_text(entry_text[:start] + block + entry_text[end:], encoding="utf-8")
+
+# Avoid accumulating contradictory directives when an interrupted deployment is
+# retried against the same per-instance tree.
+main_text = main.read_text(encoding="utf-8")
+main_text = re.sub(
+    r"(?mi)^\s*(?:DEFAULT|PROMPT|TIMEOUT|SERIAL)\b[^\r\n]*(?:\r?\n|$)",
+    "",
+    main_text,
+)
+main.write_text(
+    "# HoneyForge deterministic serial boot\n"
+    f"SERIAL 0 115200\nDEFAULT {default_label}\nPROMPT 0\nTIMEOUT 1\n"
+    + main_text,
+    encoding="utf-8",
+)
 PY
   rm -rf "$instance_dir/arch-media-probe"
   xorriso -indev "$base_iso" -outdev "$instance_dir/unattended.iso.tmp" -boot_image any replay \

@@ -9,6 +9,9 @@ for command in expect openssl base64 python3 virt-cat virsh timeout; do command 
 timeout_seconds=${HF_HIGH_INSTALL_TIMEOUT_SECONDS:-3600}
 case "$timeout_seconds" in ''|*[!0-9]*) echo 'installation timeout must be numeric' >&2; exit 1 ;; esac
 [ "$timeout_seconds" -ge 900 ] && [ "$timeout_seconds" -le 7200 ] || { echo 'installation timeout is outside 900..7200 seconds' >&2; exit 1; }
+boot_timeout_seconds=${HF_HIGH_ARCH_BOOT_TIMEOUT_SECONDS:-240}
+case "$boot_timeout_seconds" in ''|*[!0-9]*) echo 'Arch serial boot timeout must be numeric' >&2; exit 1 ;; esac
+[ "$boot_timeout_seconds" -ge 30 ] && [ "$boot_timeout_seconds" -le 600 ] || { echo 'Arch serial boot timeout is outside 30..600 seconds' >&2; exit 1; }
 [ -f "$instance_dir/installed-disk-verified" ] && { virsh domstate "$vm_name" 2>/dev/null | grep -qi running || virsh start "$vm_name" >/dev/null; exit 0; }
 record_phase() {
   lifecycle_log=${HF_HIGH_LIFECYCLE_LOG:-$instance_dir/lifecycle-events.jsonl}
@@ -28,19 +31,30 @@ sensor_b64=$(base64 < "$shared_guest_dir/high_telemetry_sensor.py" | tr -d '\n')
 audit_sensor_b64=$(base64 < "$shared_guest_dir/high_telemetry_audit.py" | tr -d '\n')
 service_b64=$(base64 < "$shared_guest_dir/high-telemetry.service" | tr -d '\n')
 audit_rules_b64=$(base64 < "$shared_guest_dir/90-honeyforge.rules" | tr -d '\n')
+umask 077
 sed -e "s|@@HOSTNAME@@|$hostname|g" -e "s|@@ANALYST_PASSWORD_HASH@@|$password_hash|g" \
   -e "s|@@AUDIT_SENSOR_B64@@|$audit_sensor_b64|g" -e "s|@@SERVICE_B64@@|$service_b64|g" \
   -e "s|@@AUDIT_RULES_B64@@|$audit_rules_b64|g" -e "s|@@SENSOR_B64@@|$sensor_b64|g" \
   "$script_dir/arch-guest-install.sh" > "$instance_dir/arch-guest-install.sh"
+chmod 0600 "$instance_dir/arch-guest-install.sh"
 grep -q '@@[A-Z0-9_][A-Z0-9_]*@@' "$instance_dir/arch-guest-install.sh" && { echo 'unresolved Arch installer marker' >&2; exit 1; }
-payload=$(base64 < "$instance_dir/arch-guest-install.sh" | tr -d '\n')
+payload_file="$instance_dir/arch-guest-install.b64"
+console_log="$instance_dir/arch-serial-console.log"
+base64 < "$instance_dir/arch-guest-install.sh" | tr -d '\n' > "$payload_file"
+: > "$console_log"
+chmod 0600 "$payload_file" "$console_log"
+cleanup_payload() { rm -f "$payload_file"; }
+trap cleanup_payload EXIT HUP INT TERM
 already_installed=false
 if [ -e "$instance_dir/install-started" ] && virsh domstate "$vm_name" 2>/dev/null | grep -Eqi 'shut|off'; then
   if virt-cat -a "$instance_dir/disk.qcow2" /etc/honeyforge-installed 2>/dev/null | grep -Fx installed >/dev/null; then already_installed=true; else virsh start "$vm_name" >/dev/null; fi
 fi
 if [ "$already_installed" = false ]; then
   umask 077; : > "$instance_dir/install-started"
-  HF_HIGH_INSTALL_TIMEOUT_SECONDS=$timeout_seconds timeout "$timeout_seconds" expect "$script_dir/arch-console.exp" "$vm_name" "$payload"
+  command_timeout=$((timeout_seconds + boot_timeout_seconds + 60))
+  HF_HIGH_INSTALL_TIMEOUT_SECONDS=$timeout_seconds \
+    HF_HIGH_ARCH_BOOT_TIMEOUT_SECONDS=$boot_timeout_seconds \
+    timeout "$command_timeout" expect "$script_dir/arch-console.exp" "$vm_name" "$payload_file" "$console_log"
 fi
 attempt=1; while [ "$attempt" -le 90 ]; do virsh domstate "$vm_name" 2>/dev/null | grep -Eqi 'shut|off' && break; sleep 2; attempt=$((attempt + 1)); done
 virsh domstate "$vm_name" 2>/dev/null | grep -Eqi 'shut|off' || { echo 'installed Arch did not power off' >&2; exit 1; }
@@ -56,6 +70,7 @@ if [ -n "$cdrom_source" ]; then
   fi
 fi
 umask 077; : > "$instance_dir/installed-disk-verified"
-rm -f "$instance_dir/install-started" "$instance_dir/arch-guest-install.sh"
+rm -f "$instance_dir/install-started" "$instance_dir/arch-guest-install.sh" "$payload_file"
+trap - EXIT HUP INT TERM
 virsh start "$vm_name" >/dev/null
 record_phase CONFIGURING

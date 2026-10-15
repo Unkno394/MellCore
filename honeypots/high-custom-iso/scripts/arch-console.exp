@@ -1,22 +1,179 @@
 #!/usr/bin/expect -f
-set timeout $env(HF_HIGH_INSTALL_TIMEOUT_SECONDS)
+
+# ArchISO decorates both the login prompt and the shell prompt with ANSI cursor
+# control sequences. Do not anchor prompt expressions to the end of a line.
+set install_timeout $env(HF_HIGH_INSTALL_TIMEOUT_SECONDS)
+set boot_timeout $env(HF_HIGH_ARCH_BOOT_TIMEOUT_SECONDS)
 set vm_name [lindex $argv 0]
-set payload [lindex $argv 1]
-if {$vm_name eq "" || $payload eq ""} { puts stderr "missing VM name or installer payload"; exit 2 }
+set payload_file [lindex $argv 1]
+set diagnostic_log [lindex $argv 2]
+if {$vm_name eq "" || $payload_file eq "" || $diagnostic_log eq ""} {
+    puts stderr "missing VM name, installer payload file, or diagnostic log"
+    exit 2
+}
+
+set diagnostic_limit 65536
+set diagnostic_bytes 0
+set diagnostic_truncated 0
+set log_fd [open $diagnostic_log "a"]
+fconfigure $log_fd -translation binary -buffering none
+
+proc record_console {fd data} {
+    global diagnostic_limit diagnostic_bytes diagnostic_truncated
+    if {$data eq "" || $diagnostic_truncated} { return }
+    # Preserve useful console text, but strip terminal control bytes and redact
+    # anything shaped like the base64 installer payload.
+    set clean [string map [list "\033" "<ESC>"] $data]
+    regsub -all -- {printf '%s' '[A-Za-z0-9+/=]+' >> /tmp/hf-install\.b64} $clean {printf '%s' '<redacted-payload>' >> /tmp/hf-install.b64} clean
+    regsub -all -- {[A-Za-z0-9+/]{80,}={0,2}} $clean {<redacted-base64>} clean
+    regsub -all -- {[^[:print:]\r\n\t]} $clean {?} clean
+    set remaining [expr {$diagnostic_limit - $diagnostic_bytes}]
+    if {$remaining <= 0} {
+        puts $fd "\n\[diagnostic log truncated at 65536 bytes\]"
+        set diagnostic_truncated 1
+        return
+    }
+    if {[string length $clean] > $remaining} {
+        puts -nonewline $fd [string range $clean 0 [expr {$remaining - 1}]]
+        puts $fd "\n\[diagnostic log truncated at 65536 bytes\]"
+        set diagnostic_bytes $diagnostic_limit
+        set diagnostic_truncated 1
+        return
+    }
+    puts -nonewline $fd $clean
+    incr diagnostic_bytes [string length $clean]
+}
+
+proc fail_install {fd code message status} {
+    close $fd
+    puts stderr "HF_HIGH_ERROR code=$code stage=installation: $message"
+    exit $status
+}
+
+set root_prompt {root@archiso[^\r\n]{0,200}#}
+log_user 0
+match_max 262144
 spawn virsh console $vm_name --force
+# virsh does not replay bytes that the guest emitted before this attachment. A
+# carriage return is harmless at boot and makes an already waiting getty or shell
+# emit a fresh prompt, which is essential for restart/reconciliation.
+send -- "\r"
+
+# A separate, deliberately short timeout prevents the full installation timeout
+# from hiding a serial boot/login failure.
+set timeout $boot_timeout
+set login_attempts 0
+set empty_password_attempted 0
 expect {
-    -re {root@archiso[^\r\n]*# *$} {}
-    -re {archiso login: *$} { send -- "root\r"; exp_continue }
-    timeout { puts stderr "Arch ISO serial console did not reach a root shell"; exit 3 }
-    eof { puts stderr "Arch ISO serial console closed before login"; exit 4 }
+    -re {(?i)archiso[[:space:]]+login:} {
+        record_console $log_fd $expect_out(buffer)
+        incr login_attempts
+        if {$login_attempts > 3} {
+            fail_install $log_fd ARCH_SERIAL_LOGIN_FAILED "ArchISO repeatedly returned to its login prompt; sanitized log: $diagnostic_log" 3
+        }
+        send -- "root\r"
+        exp_continue -continue_timer
+    }
+    -re {(?i)password:} {
+        record_console $log_fd $expect_out(buffer)
+        if {$empty_password_attempted} {
+            fail_install $log_fd ARCH_SERIAL_LOGIN_FAILED "ArchISO rejected the live root login; sanitized log: $diagnostic_log" 3
+        }
+        set empty_password_attempted 1
+        send -- "\r"
+        exp_continue -continue_timer
+    }
+    -re $root_prompt {
+        record_console $log_fd $expect_out(buffer)
+    }
+    -re {\r\n|\n|\r} {
+        record_console $log_fd $expect_out(buffer)
+        exp_continue -continue_timer
+    }
+    timeout {
+        record_console $log_fd $expect_out(buffer)
+        fail_install $log_fd ARCH_SERIAL_ROOT_TIMEOUT "ArchISO serial console did not reach a root shell within ${boot_timeout}s; sanitized log: $diagnostic_log" 3
+    }
+    eof {
+        record_console $log_fd $expect_out(buffer)
+        fail_install $log_fd ARCH_SERIAL_CONSOLE_CLOSED "ArchISO serial console closed before login; sanitized log: $diagnostic_log" 4
+    }
 }
-send -- "stty -echo\r"
-expect -re {# *$}
-send -- "printf '%s' '$payload' | base64 -d > /tmp/hf-install.sh && chmod 0700 /tmp/hf-install.sh && if test -e /run/hf-installing; then while test -e /run/hf-installing; do sleep 5; done; test -e /mnt/etc/honeyforge-installed && echo HF_INSTALL_COMPLETE || echo HF_INSTALL_FAILED:previous-run; else : > /run/hf-installing; nohup /tmp/hf-install.sh >/dev/ttyS0 2>&1 & while test -e /run/hf-installing; do sleep 5; done; fi\r"
+
+# Disable terminal echo before reading or transmitting the installer. The payload
+# path is used instead of a command-line payload so process listings cannot expose
+# the generated password hash or guest sensor sources.
+send -- "stty -echo; printf 'HF_SERIAL_READY\\n'\r"
+set timeout 15
 expect {
-    -re {HF_INSTALL_COMPLETE} {}
-    -re {HF_INSTALL_FAILED:[^\r\n]*} { puts stderr $expect_out(0,string); exit 5 }
-    timeout { puts stderr "Arch installation exceeded its timeout"; exit 6 }
-    eof { puts stderr "Arch console closed before installation completed"; exit 7 }
+    -re {HF_SERIAL_READY} { record_console $log_fd $expect_out(buffer) }
+    timeout { fail_install $log_fd ARCH_SERIAL_SETUP_FAILED "could not disable serial console echo; sanitized log: $diagnostic_log" 8 }
+    eof { fail_install $log_fd ARCH_SERIAL_CONSOLE_CLOSED "ArchISO serial console closed during setup; sanitized log: $diagnostic_log" 4 }
 }
+expect {
+    -re $root_prompt { record_console $log_fd $expect_out(buffer) }
+    timeout { fail_install $log_fd ARCH_SERIAL_SETUP_FAILED "root prompt did not return after serial setup; sanitized log: $diagnostic_log" 8 }
+    eof { fail_install $log_fd ARCH_SERIAL_CONSOLE_CLOSED "ArchISO serial console closed during setup; sanitized log: $diagnostic_log" 4 }
+}
+
+if {[catch {set payload_fd [open $payload_file "r"]}]} {
+    fail_install $log_fd ARCH_INSTALL_PAYLOAD_INVALID "cannot read protected installer payload" 2
+}
+set payload [read $payload_fd]
+close $payload_fd
+regsub -all -- {[[:space:]]} $payload {} payload
+if {[string length $payload] < 4 || [string length $payload] > 2097152 ||
+    ![regexp -- {^[A-Za-z0-9+/]*={0,2}$} $payload]} {
+    fail_install $log_fd ARCH_INSTALL_PAYLOAD_INVALID "installer payload is empty, oversized, or not base64" 2
+}
+
+# A Linux tty in canonical mode has a small per-line limit. Sending the previous
+# one-line payload could silently truncate the installer. Transfer bounded chunks
+# and wait for the root prompt after every write.
+send -- "rm -f /tmp/hf-install.b64 /tmp/hf-install.sh\r"
+expect {
+    -re $root_prompt { record_console $log_fd $expect_out(buffer) }
+    timeout { fail_install $log_fd ARCH_SERIAL_TRANSFER_FAILED "console did not accept payload initialization; sanitized log: $diagnostic_log" 8 }
+    eof { fail_install $log_fd ARCH_SERIAL_CONSOLE_CLOSED "console closed before payload transfer; sanitized log: $diagnostic_log" 4 }
+}
+set offset 0
+set payload_length [string length $payload]
+while {$offset < $payload_length} {
+    set chunk [string range $payload $offset [expr {$offset + 767}]]
+    send -- "printf '%s' '$chunk' >> /tmp/hf-install.b64\r"
+    expect {
+        -re $root_prompt { record_console $log_fd $expect_out(buffer) }
+        timeout { fail_install $log_fd ARCH_SERIAL_TRANSFER_FAILED "console stopped accepting installer payload; sanitized log: $diagnostic_log" 8 }
+        eof { fail_install $log_fd ARCH_SERIAL_CONSOLE_CLOSED "console closed during payload transfer; sanitized log: $diagnostic_log" 4 }
+    }
+    incr offset 768
+}
+
+send -- "base64 -d /tmp/hf-install.b64 > /tmp/hf-install.sh && rm -f /tmp/hf-install.b64 && chmod 0700 /tmp/hf-install.sh && if test -e /run/hf-installing; then while test -e /run/hf-installing; do sleep 5; done; test -e /mnt/etc/honeyforge-installed && echo HF_INSTALL_COMPLETE || echo HF_INSTALL_FAILED:previous-run; else : > /run/hf-installing; nohup /tmp/hf-install.sh >/dev/ttyS0 2>&1 & while test -e /run/hf-installing; do sleep 5; done; fi\r"
+set timeout $install_timeout
+expect {
+    -re {HF_INSTALL_COMPLETE} {
+        record_console $log_fd $expect_out(buffer)
+    }
+    -re {HF_INSTALL_FAILED:[^\r\n]*} {
+        record_console $log_fd $expect_out(buffer)
+        set failure $expect_out(0,string)
+        close $log_fd
+        puts stderr "HF_HIGH_ERROR code=ARCH_GUEST_INSTALL_FAILED stage=installation: $failure; sanitized log: $diagnostic_log"
+        exit 5
+    }
+    -re {\r\n|\n|\r} {
+        record_console $log_fd $expect_out(buffer)
+        exp_continue -continue_timer
+    }
+    timeout {
+        record_console $log_fd $expect_out(buffer)
+        fail_install $log_fd ARCH_INSTALL_TIMEOUT "Arch installation exceeded ${install_timeout}s; sanitized log: $diagnostic_log" 6
+    }
+    eof {
+        record_console $log_fd $expect_out(buffer)
+        fail_install $log_fd ARCH_SERIAL_CONSOLE_CLOSED "Arch console closed before installation completed; sanitized log: $diagnostic_log" 7
+    }
+}
+close $log_fd
 exit 0

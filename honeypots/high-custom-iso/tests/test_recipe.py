@@ -1,6 +1,8 @@
-import pathlib
+import base64
 import hashlib
 import os
+import pathlib
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -61,6 +63,9 @@ class CustomIsoRecipeTests(unittest.TestCase):
         arch = (RECIPE / "scripts" / "install-arch.sh").read_text()
         self.assertNotIn("virsh undefine", launch)
         self.assertIn("HF_HIGH_INSTALL_TIMEOUT_SECONDS", arch)
+        self.assertIn("HF_HIGH_ARCH_BOOT_TIMEOUT_SECONDS", arch)
+        self.assertIn("arch-serial-console.log", arch)
+        self.assertIn("arch-guest-install.b64", arch)
         self.assertIn("install-started", arch)
         self.assertIn("INSTALL_MEDIA_EJECT_FAILED", arch)
 
@@ -175,7 +180,8 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 "case $source in\n"
                 "  /boot/syslinux)\n"
                 "    mkdir -p \"$extract\"\n"
-                "    printf '%s\\n' 'INCLUDE boot/syslinux/archiso_sys-linux.cfg' > \"$extract/archiso_sys.cfg\"\n"
+                "    printf '%s\\n' 'DEFAULT select' 'TIMEOUT 150' 'INCLUDE archiso_head.cfg' 'INCLUDE archiso_sys-linux.cfg' > \"$extract/archiso_sys.cfg\"\n"
+                "    printf '%s\\n' 'SERIAL 0 115200' > \"$extract/archiso_head.cfg\"\n"
                 "    printf '%s\\n' 'LABEL arch64' '  LINUX /arch/boot/x86_64/vmlinuz-linux' '  INITRD /arch/boot/x86_64/initramfs-linux.img' '  APPEND archisobasedir=arch archisolabel=ARCH_202508' > \"$extract/archiso_sys-linux.cfg\"\n"
                 "    exit 0 ;;\n"
                 "  /arch/boot/x86_64/vmlinuz-linux|/arch/boot/x86_64/initramfs-linux.img|/EFI/BOOT/BOOTx64.EFI)\n"
@@ -212,7 +218,10 @@ class CustomIsoRecipeTests(unittest.TestCase):
             self.assertIn("PROMPT 0", main)
             self.assertIn("TIMEOUT 1", main)
             self.assertIn("SERIAL 0 115200", main)
+            self.assertEqual(main.count("DEFAULT "), 1)
+            self.assertEqual(main.count("TIMEOUT "), 1)
             self.assertIn("console=ttyS0,115200n8", entry)
+            self.assertIn("console=tty0", entry)
             self.assertIn("archisobasedir=arch", entry)
             calls = xorriso_log.read_text()
             self.assertIn("-extract /boot/syslinux", calls)
@@ -220,6 +229,112 @@ class CustomIsoRecipeTests(unittest.TestCase):
             self.assertIn("-boot_image any replay", calls)
             self.assertNotIn("/boot/grub", calls)
             self.assertTrue((instance / "unattended.iso").is_file())
+
+    @unittest.skipUnless(shutil.which("expect"), "expect is required for Arch console tests")
+    def test_arch_console_accepts_ansi_prompt_and_hides_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            executable(
+                fake_bin / "virsh",
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "def emit(value):\n"
+                "    sys.stdout.write(value); sys.stdout.flush()\n"
+                "emit('Arch Linux boot\\r\\narchiso login: \\x1b[?2004h')\n"
+                "line = sys.stdin.readline()\n"
+                "while not line.strip(): line = sys.stdin.readline()\n"
+                "if line.strip() != 'root': raise SystemExit(10)\n"
+                "emit('\\r\\nroot@archiso ~ # \\x1b[?2004h')\n"
+                "if not sys.stdin.readline().startswith('stty -echo'): raise SystemExit(11)\n"
+                "emit('HF_SERIAL_READY\\r\\nroot@archiso ~ # \\x1b[?2004h')\n"
+                "if not sys.stdin.readline().startswith('rm -f '): raise SystemExit(12)\n"
+                "emit('root@archiso ~ # \\x1b[?2004h')\n"
+                "chunks = 0\n"
+                "while True:\n"
+                "    line = sys.stdin.readline()\n"
+                "    if line.startswith(\"printf '%s' '\"):\n"
+                "        chunks += 1; emit('root@archiso ~ # \\x1b[?2004h'); continue\n"
+                "    if line.startswith('base64 -d '): break\n"
+                "    raise SystemExit(13)\n"
+                "if chunks < 2: raise SystemExit(14)\n"
+                "emit('installing offline\\r\\nHF_INSTALL_COMPLETE\\r\\n')\n",
+            )
+            payload_value = base64.b64encode(b"fixture" * 600).decode("ascii")
+            payload = root / "payload.b64"
+            payload.write_text(payload_value, encoding="ascii")
+            payload.chmod(0o600)
+            console_log = root / "console.log"
+            console_log.write_text("", encoding="utf-8")
+            console_log.chmod(0o600)
+            completed = subprocess.run(
+                [
+                    shutil.which("expect"),
+                    str(RECIPE / "scripts" / "arch-console.exp"),
+                    "fixture-vm",
+                    str(payload),
+                    str(console_log),
+                ],
+                check=False,
+                env=dict(
+                    os.environ,
+                    PATH=f"{fake_bin}:{os.environ['PATH']}",
+                    HF_HIGH_INSTALL_TIMEOUT_SECONDS="10",
+                    HF_HIGH_ARCH_BOOT_TIMEOUT_SECONDS="3",
+                ),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            diagnostic = console_log.read_text(encoding="utf-8")
+            self.assertIn("archiso login:", diagnostic)
+            self.assertIn("root@archiso", diagnostic)
+            self.assertIn("<redacted-payload>", diagnostic)
+            self.assertNotIn(payload_value, diagnostic)
+            self.assertNotIn(payload_value[:768], diagnostic)
+            self.assertEqual(stat.S_IMODE(console_log.stat().st_mode), 0o600)
+
+    @unittest.skipUnless(shutil.which("expect"), "expect is required for Arch console tests")
+    def test_arch_console_root_wait_has_diagnostic_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            executable(
+                fake_bin / "virsh",
+                "#!/usr/bin/env python3\n"
+                "import sys, time\n"
+                "sys.stdout.write('Booting ArchISO without login prompt\\r\\n'); sys.stdout.flush()\n"
+                "time.sleep(10)\n",
+            )
+            payload = root / "payload.b64"
+            payload.write_text("Zml4dHVyZQ==", encoding="ascii")
+            console_log = root / "console.log"
+            console_log.write_text("", encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    shutil.which("expect"),
+                    str(RECIPE / "scripts" / "arch-console.exp"),
+                    "fixture-vm",
+                    str(payload),
+                    str(console_log),
+                ],
+                check=False,
+                env=dict(
+                    os.environ,
+                    PATH=f"{fake_bin}:{os.environ['PATH']}",
+                    HF_HIGH_INSTALL_TIMEOUT_SECONDS="10",
+                    HF_HIGH_ARCH_BOOT_TIMEOUT_SECONDS="1",
+                ),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 3)
+            self.assertIn("code=ARCH_SERIAL_ROOT_TIMEOUT", completed.stderr)
+            self.assertIn("Booting ArchISO", console_log.read_text(encoding="utf-8"))
 
     def test_ubuntu_finalizer_requires_disk_boot_and_full_guest_readiness(self):
         finalizer = (RECIPE / "scripts" / "finalize-linux-install.sh").read_text()
