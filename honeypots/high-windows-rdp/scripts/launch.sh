@@ -1,15 +1,16 @@
 #!/bin/sh
 set -eu
-base_iso=${1:?verified Windows ISO}; instance_id=${2:?instance UUID}; external_port=${3:?external RDP port}
+base_iso=${1:?verified Windows ISO}; instance_id=${2:?instance UUID}; _external_port=${3:-0}
 root_dir=${HF_HIGH_ROOT:-/var/lib/honeyforge/high}; instance_dir="$root_dir/$instance_id"; vm_name="hf-high-$instance_id"
 script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 . "$script_dir/../../high-ubuntu-ssh/scripts/firewall-common.sh"
 validate_instance_id "$instance_id"
 command -v virsh >/dev/null; command -v virt-install >/dev/null
 sh "$script_dir/create-network.sh"
-virsh dominfo "$vm_name" >/dev/null 2>&1 && { echo "VM already exists: $vm_name" >&2; exit 1; }
-trap 'virsh destroy "$vm_name" >/dev/null 2>&1 || true; virsh undefine "$vm_name" --nvram >/dev/null 2>&1 || true; rm -rf "$instance_dir"' EXIT INT TERM
-sh "$script_dir/create-overlay.sh" "$base_iso" "$instance_dir" "$instance_id"
-virt-install --name "$vm_name" --memory 4096 --vcpus 2 --os-variant win2k22 --disk "path=$instance_dir/disk.qcow2,format=qcow2,bus=sata" --disk "path=$base_iso,device=cdrom,readonly=on" --disk "path=$instance_dir/seed.iso,device=cdrom,readonly=on" --network "network=hf-high-isolated,model=e1000e" --channel "unix,path=$instance_dir/telemetry.sock,mode=bind,target.type=virtio,target.name=org.honeyforge.telemetry.0" --graphics spice,listen=127.0.0.1 --noautoconsole
-printf '%s\n' "$external_port" > "$instance_dir/external-ssh-port"
-trap - EXIT INT TERM
+sh "$script_dir/verify-windows-media.sh" "$base_iso" "$instance_dir"
+if ! virsh dominfo "$vm_name" >/dev/null 2>&1; then
+  sh "$script_dir/create-overlay.sh" "$base_iso" "$instance_dir" "$instance_id"
+  virt-install --name "$vm_name" --memory 4096 --vcpus 2 --os-variant win2k22 --disk "path=$instance_dir/disk.qcow2,format=qcow2,bus=sata" --cdrom "$base_iso" --disk "path=$instance_dir/seed.iso,device=cdrom,readonly=on" --boot cdrom,hd --network "network=hf-high-isolated,model=e1000e" --channel "unix,path=$instance_dir/telemetry.sock,mode=bind,target.type=virtio,target.name=org.honeyforge.telemetry.0" --channel "unix,target.type=virtio,target.name=org.qemu.guest_agent.0" --graphics spice,listen=127.0.0.1 --noautoconsole
+fi
+sh "$script_dir/install-windows.sh" "$instance_id"
+rm -f "$instance_dir/external-ssh-port" "$instance_dir/publish-interface"

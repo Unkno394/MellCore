@@ -102,11 +102,23 @@ pub enum AgentCommand {
     /// Generic High VM deployment. `DeployHighUbuntu` remains for wire compatibility.
     DeployHighVm(HighVmDeployment),
     DeployHighUbuntu(HighUbuntuDeployment),
-    ResetHighVm { command_id: Uuid, trap_id: Uuid },
-    ResetHighUbuntu { command_id: Uuid, trap_id: Uuid },
+    ResetHighVm {
+        command_id: Uuid,
+        trap_id: Uuid,
+    },
+    ResetHighUbuntu {
+        command_id: Uuid,
+        trap_id: Uuid,
+    },
     ReconcileTcpPortGroup(TcpPortGroup),
-    StopTrap { command_id: Uuid, trap_id: Uuid },
-    RemoveTrap { command_id: Uuid, trap_id: Uuid },
+    StopTrap {
+        command_id: Uuid,
+        trap_id: Uuid,
+    },
+    RemoveTrap {
+        command_id: Uuid,
+        trap_id: Uuid,
+    },
 }
 
 impl AgentCommand {
@@ -172,17 +184,27 @@ pub struct ContainerResourceLimits {
 
 impl Default for ContainerResourceLimits {
     fn default() -> Self {
-        Self { cpu_cores: 0.5, memory_mb: 128, pids: 64 }
+        Self {
+            cpu_cores: 0.5,
+            memory_mb: 128,
+            pids: 64,
+        }
     }
 }
 
 impl ContainerResourceLimits {
     pub fn middle_default() -> Self {
-        Self { cpu_cores: 1.0, memory_mb: 512, pids: 256 }
+        Self {
+            cpu_cores: 1.0,
+            memory_mb: 512,
+            pids: 256,
+        }
     }
 
     pub fn within(&self, max_cpu: f64, max_memory_mb: u32, max_pids: u32) -> bool {
-        self.cpu_cores.is_finite() && self.cpu_cores >= 0.05 && self.cpu_cores <= max_cpu
+        self.cpu_cores.is_finite()
+            && self.cpu_cores >= 0.05
+            && self.cpu_cores <= max_cpu
             && (32..=max_memory_mb).contains(&self.memory_mb)
             && (16..=max_pids).contains(&self.pids)
     }
@@ -257,6 +279,19 @@ pub enum HighImagePreparation {
     BestEffortInstall,
 }
 
+/// Durable deployment progress for long-running High VM installation workflows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HighLifecycleState {
+    VmCreated,
+    Installing,
+    Rebooting,
+    Configuring,
+    #[default]
+    Ready,
+    Failed,
+}
+
 /// The service published externally by a High guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -319,6 +354,33 @@ impl HighOsProfile {
             image_kind: HighImageKind::InstallMediaAndDisk,
             image_preparation: HighImagePreparation::UnattendedInstall,
             connection: HighGuestConnection::Rdp { guest_port: 3389 },
+        }
+    }
+
+    pub const fn ubuntu_iso_ssh() -> Self {
+        Self {
+            guest_os: HighGuestOs::Ubuntu,
+            image_kind: HighImageKind::InstallMediaAndDisk,
+            image_preparation: HighImagePreparation::UnattendedInstall,
+            connection: HighGuestConnection::Ssh { guest_port: 22 },
+        }
+    }
+
+    pub const fn debian_iso_ssh() -> Self {
+        Self {
+            guest_os: HighGuestOs::Debian,
+            image_kind: HighImageKind::InstallMediaAndDisk,
+            image_preparation: HighImagePreparation::UnattendedInstall,
+            connection: HighGuestConnection::Ssh { guest_port: 22 },
+        }
+    }
+
+    pub const fn arch_linux_iso_ssh() -> Self {
+        Self {
+            guest_os: HighGuestOs::ArchLinux,
+            image_kind: HighImageKind::InstallMediaAndDisk,
+            image_preparation: HighImagePreparation::UnattendedInstall,
+            connection: HighGuestConnection::Ssh { guest_port: 22 },
         }
     }
 
@@ -593,6 +655,9 @@ mod tests {
             HighOsProfile::arch_linux_ssh(),
             HighOsProfile::windows_rdp(),
             HighOsProfile::windows_rdp_legacy_iso(),
+            HighOsProfile::ubuntu_iso_ssh(),
+            HighOsProfile::debian_iso_ssh(),
+            HighOsProfile::arch_linux_iso_ssh(),
             HighOsProfile::custom_linux_qcow2_ssh(),
             HighOsProfile::custom_linux_iso_ssh(),
         ] {
@@ -602,6 +667,18 @@ mod tests {
                 profile
             );
         }
+    }
+
+    #[test]
+    fn high_lifecycle_states_use_backend_facing_names() {
+        assert_eq!(
+            serde_json::to_string(&HighLifecycleState::VmCreated).unwrap(),
+            "\"VM_CREATED\""
+        );
+        assert_eq!(
+            serde_json::from_str::<HighLifecycleState>("\"REBOOTING\"").unwrap(),
+            HighLifecycleState::Rebooting
+        );
     }
 
     #[test]
@@ -641,8 +718,7 @@ mod tests {
         assert_eq!(decoded.image_source, deployment.image_source);
         assert_eq!(decoded.profile, HighOsProfile::debian_ssh());
 
-        let unsupported: HighImageArchitecture =
-            serde_json::from_str("\"sparc64\"").unwrap();
+        let unsupported: HighImageArchitecture = serde_json::from_str("\"sparc64\"").unwrap();
         assert_eq!(unsupported, HighImageArchitecture::Unknown);
     }
 }

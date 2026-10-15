@@ -10,7 +10,7 @@ use std::{
 use crate::sandbox::{
     HighDomainState, LibvirtSandboxManager, default_recipe_dir, is_supported_profile,
 };
-use hf_core::{HighGuestConnection, HighOsProfile};
+use hf_core::{HighGuestConnection, HighLifecycleState, HighOsProfile};
 use hf_services::high_telemetry::{
     DEFAULT_MAX_PENDING_HIGH_EVENTS, HighTelemetryStore, SharedHighTelemetryStore,
     receive_high_telemetry_connection,
@@ -42,14 +42,12 @@ pub fn queue_pending_for_center(
         MAX_TELEMETRY_BATCH_EVENTS,
         MAX_TELEMETRY_PACKET_BYTES / 2,
         created_at,
-    )? else {
+    )?
+    else {
         return Ok(0);
     };
     let count = batch.events.len();
-    let envelope = batch.kazik_envelope(
-        identity.agent_id,
-        identity.transport_credential.clone(),
-    );
+    let envelope = batch.kazik_envelope(identity.agent_id, identity.transport_credential.clone());
     crate::telemetry::ensure_packet_size(&envelope)?;
     outbox.enqueue(envelope)?;
     Ok(count)
@@ -88,6 +86,8 @@ struct HighOperationalSnapshot {
     trap_id: Uuid,
     observed_at_unix_ms: i64,
     domain_state: String,
+    #[serde(default)]
+    lifecycle_state: HighLifecycleState,
     running_since_unix_ms: Option<i64>,
     uptime_seconds: Option<u64>,
     /// Aggregate busy percentage across all guest vCPUs (for example, 150% means 1.5 cores).
@@ -275,6 +275,11 @@ fn collect_operational_snapshots_with_probe(
             trap_id,
             observed_at_unix_ms: observed,
             domain_state: domain_state_name(state).into(),
+            lifecycle_state: manifest
+                .get("lifecycle_state")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default(),
             running_since_unix_ms: running_since,
             uptime_seconds: running_since.map(|started| {
                 u64::try_from(observed.saturating_sub(started) / 1_000).unwrap_or_default()
@@ -642,13 +647,22 @@ mod tests {
             hysteria: None,
         };
         let mut outbox = SqliteKazikOutbox::open(root.join("kazik.sqlite")).unwrap();
-        assert_eq!(queue_pending_for_center(&root, &identity, &mut outbox).unwrap(), 1);
+        assert_eq!(
+            queue_pending_for_center(&root, &identity, &mut outbox).unwrap(),
+            1
+        );
         let first = outbox.ready_to_send(10).unwrap();
         assert_eq!(first.len(), 1);
         let message_id = first[0].envelope.message_id;
 
-        assert_eq!(queue_pending_for_center(&root, &identity, &mut outbox).unwrap(), 1);
-        assert_eq!(outbox.ready_to_send(10).unwrap()[0].envelope.message_id, message_id);
+        assert_eq!(
+            queue_pending_for_center(&root, &identity, &mut outbox).unwrap(),
+            1
+        );
+        assert_eq!(
+            outbox.ready_to_send(10).unwrap()[0].envelope.message_id,
+            message_id
+        );
         assert!(acknowledge_center_batch(&root, message_id).unwrap());
         let source = HighTelemetryStore::open(root.join("high-telemetry.sqlite"), 10).unwrap();
         assert_eq!(source.pending_count().unwrap(), 0);

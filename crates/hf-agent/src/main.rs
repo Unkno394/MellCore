@@ -21,9 +21,10 @@ mod telemetry;
 use anyhow::Context;
 use clap::Parser;
 use hf_core::{
-    AgentCommand, AgentRegistration, CommandResult, CoreError, HighOsProfile, HighVmDeployment,
-    HysteriaConnection, KozyavkaDeployment, PacketTransport, PritvoryashkaDeployment,
-    RegisteredAgent, RegistrationTransport, SharedTcpTrapKind, TcpPortGroup, TrapSpec,
+    AgentCommand, AgentRegistration, CommandResult, CoreError, HighLifecycleState, HighOsProfile,
+    HighVmDeployment, HysteriaConnection, KozyavkaDeployment, PacketTransport,
+    PritvoryashkaDeployment, RegisteredAgent, RegistrationTransport, SharedTcpTrapKind,
+    TcpPortGroup, TrapSpec,
 };
 use hf_services::{
     FailoverSender, HysteriaSocks5UdpTransport,
@@ -146,12 +147,24 @@ fn quarantine_result(marker: &QuarantineMarker, applied: bool) -> kazik_protocol
     let mut event = marker.trigger.clone();
     event.payload["trigger_event_type"] = serde_json::json!(event.event_type.clone());
     event.payload["trigger_event_id"] = serde_json::json!(event.event_id);
-    event.event_type = if applied { "security.trap_quarantined" } else { "security.trap_quarantine_failed" }.into();
-    event.payload["quarantine_result"] = serde_json::json!(if applied { "applied" } else { "failed" });
-    event.metadata["assessment"] = serde_json::json!(if applied { "isolated" } else { "suspicious_unconfirmed" });
+    event.event_type = if applied {
+        "security.trap_quarantined"
+    } else {
+        "security.trap_quarantine_failed"
+    }
+    .into();
+    event.payload["quarantine_result"] =
+        serde_json::json!(if applied { "applied" } else { "failed" });
+    event.metadata["assessment"] = serde_json::json!(if applied {
+        "isolated"
+    } else {
+        "suspicious_unconfirmed"
+    });
     event.event_id = marker.result_event_id;
     event.occurred_at_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|value| value.as_millis() as i64).unwrap_or_default();
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis() as i64)
+        .unwrap_or_default();
     event
 }
 
@@ -172,6 +185,8 @@ struct HighRuntimeManifest {
     profile: HighOsProfile,
     deployment: HighVmDeployment,
     desired_state: HighDesiredState,
+    #[serde(default)]
+    lifecycle_state: HighLifecycleState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
 }
@@ -342,6 +357,39 @@ impl ComposeProjectStore {
         atomic_write(&path, &serde_json::to_vec_pretty(manifest)?)
     }
 
+    fn transition_high_lifecycle(
+        &self,
+        manifest: &mut HighRuntimeManifest,
+        state: HighLifecycleState,
+        error: Option<String>,
+    ) -> anyhow::Result<()> {
+        manifest.lifecycle_state = state;
+        manifest.last_error = error;
+        self.save_high_manifest(manifest)?;
+        let project_dir = self.root.join(manifest.deployment.trap_id.to_string());
+        fs::create_dir_all(&project_dir)?;
+        let event = serde_json::json!({
+            "event_id": Uuid::new_v4(),
+            "state": state,
+            "occurred_at_unix_ms": now_unix_ms(),
+            "detail": manifest.last_error,
+        });
+        let path = project_dir.join("lifecycle-events.jsonl");
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        serde_json::to_writer(&mut file, &event)?;
+        file.write_all(b"\n")?;
+        file.sync_data()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
     /// Standalone mode is deliberately narrower than the production command adapter. It may
     /// create a new High VM, or manage a High VM whose manifest already lives in the dedicated
     /// standalone state directory. It never falls back to Compose or legacy High teardown.
@@ -369,7 +417,11 @@ impl ComposeProjectStore {
                     "refusing to adopt untracked High runtime {trap_id} in standalone mode"
                 );
                 anyhow::ensure!(
-                    !self.root.join(trap_id.to_string()).join("compose.yaml").exists(),
+                    !self
+                        .root
+                        .join(trap_id.to_string())
+                        .join("compose.yaml")
+                        .exists(),
                     "refusing to replace non-High trap {trap_id} in standalone mode"
                 );
                 anyhow::ensure!(
@@ -411,11 +463,9 @@ impl ComposeProjectStore {
         allow_existing_ubuntu_image: bool,
     ) -> anyhow::Result<()> {
         Self::validate_high_deployment(&deployment, allow_existing_ubuntu_image)?;
+        let detect_iso_installer = deployment.profile == HighOsProfile::custom_linux_iso_ssh();
         if let Some(source) = &deployment.image_source {
-            let state_dir = self
-                .root
-                .parent()
-                .unwrap_or(Path::new(DEFAULT_STATE_DIR));
+            let state_dir = self.root.parent().unwrap_or(Path::new(DEFAULT_STATE_DIR));
             deployment.base_image = high_image::materialize_image(
                 source,
                 deployment.profile,
@@ -423,6 +473,11 @@ impl ComposeProjectStore {
             )?
             .to_string_lossy()
             .into_owned();
+        }
+        if detect_iso_installer {
+            deployment.profile =
+                high_image::automatic_install_profile(Path::new(&deployment.base_image))?;
+            Self::validate_high_deployment(&deployment, false)?;
         }
         let changed = self
             .load_high_manifest(deployment.trap_id)?
@@ -438,25 +493,42 @@ impl ComposeProjectStore {
             profile: deployment.profile,
             deployment: deployment.clone(),
             desired_state: HighDesiredState::Running,
+            lifecycle_state: HighLifecycleState::VmCreated,
             last_error: None,
         };
-        self.save_high_manifest(&manifest)?;
+        self.transition_high_lifecycle(&mut manifest, HighLifecycleState::VmCreated, None)?;
+        let active_state = if matches!(
+            deployment.profile.image_preparation,
+            hf_core::HighImagePreparation::UnattendedInstall
+                | hf_core::HighImagePreparation::BestEffortInstall
+        ) {
+            HighLifecycleState::Installing
+        } else {
+            HighLifecycleState::Configuring
+        };
+        self.transition_high_lifecycle(&mut manifest, active_state, None)?;
         if changed {
-            if let Err(error) = self
-                .high_manager()
-                .reset(&Self::high_vm(&deployment))
-            {
-                manifest.last_error = Some(error.to_string());
-                self.save_high_manifest(&manifest)?;
+            if let Err(error) = self.high_manager().reset(&Self::high_vm(&deployment)) {
+                self.transition_high_lifecycle(
+                    &mut manifest,
+                    HighLifecycleState::Failed,
+                    Some(error.to_string()),
+                )?;
                 return Err(error);
             }
         }
         let result = self
             .high_manager()
             .reconcile(&Self::high_vm(&deployment), true);
-        if let Err(error) = &result {
-            manifest.last_error = Some(error.to_string());
-            self.save_high_manifest(&manifest)?;
+        match &result {
+            Ok(()) => {
+                self.transition_high_lifecycle(&mut manifest, HighLifecycleState::Ready, None)?
+            }
+            Err(error) => self.transition_high_lifecycle(
+                &mut manifest,
+                HighLifecycleState::Failed,
+                Some(error.to_string()),
+            )?,
         }
         result
     }
@@ -468,6 +540,10 @@ impl ComposeProjectStore {
         if deployment.trap_id.is_nil()
             || (deployment.external_service_port == 0
                 && deployment.profile != HighOsProfile::windows_rdp()
+                && deployment.profile != HighOsProfile::windows_rdp_legacy_iso()
+                && deployment.profile != HighOsProfile::ubuntu_iso_ssh()
+                && deployment.profile != HighOsProfile::debian_iso_ssh()
+                && deployment.profile != HighOsProfile::arch_linux_iso_ssh()
                 && deployment.profile != HighOsProfile::custom_linux_iso_ssh())
         {
             anyhow::bail!(
@@ -512,23 +588,48 @@ impl ComposeProjectStore {
         let mut manifest = self
             .load_high_manifest(trap_id)?
             .ok_or_else(|| anyhow::anyhow!("High trap {trap_id} has no durable manifest"))?;
+        if manifest.deployment.profile == HighOsProfile::custom_linux_iso_ssh() {
+            let profile =
+                high_image::automatic_install_profile(Path::new(&manifest.deployment.base_image))?;
+            manifest.profile = profile;
+            manifest.deployment.profile = profile;
+            manifest.kind = profile_manifest_kind(profile).into();
+        }
         manifest.desired_state = HighDesiredState::Running;
-        manifest.last_error = None;
-        self.save_high_manifest(&manifest)?;
+        self.transition_high_lifecycle(&mut manifest, HighLifecycleState::VmCreated, None)?;
         if let Err(error) = self
             .high_manager()
             .reset(&Self::high_vm(&manifest.deployment))
         {
-            manifest.last_error = Some(error.to_string());
-            self.save_high_manifest(&manifest)?;
+            self.transition_high_lifecycle(
+                &mut manifest,
+                HighLifecycleState::Failed,
+                Some(error.to_string()),
+            )?;
             return Err(error);
         }
+        let active_state = if matches!(
+            manifest.deployment.profile.image_preparation,
+            hf_core::HighImagePreparation::UnattendedInstall
+                | hf_core::HighImagePreparation::BestEffortInstall
+        ) {
+            HighLifecycleState::Installing
+        } else {
+            HighLifecycleState::Configuring
+        };
+        self.transition_high_lifecycle(&mut manifest, active_state, None)?;
         let result = self
             .high_manager()
             .reconcile(&Self::high_vm(&manifest.deployment), true);
-        if let Err(error) = &result {
-            manifest.last_error = Some(error.to_string());
-            self.save_high_manifest(&manifest)?;
+        match &result {
+            Ok(()) => {
+                self.transition_high_lifecycle(&mut manifest, HighLifecycleState::Ready, None)?
+            }
+            Err(error) => self.transition_high_lifecycle(
+                &mut manifest,
+                HighLifecycleState::Failed,
+                Some(error.to_string()),
+            )?,
         }
         result
     }
@@ -612,22 +713,64 @@ impl ComposeProjectStore {
                 }
                 continue;
             }
+            if manifest.desired_state == HighDesiredState::Running
+                && manifest.deployment.profile == HighOsProfile::custom_linux_iso_ssh()
+            {
+                match high_image::automatic_install_profile(Path::new(
+                    &manifest.deployment.base_image,
+                )) {
+                    Ok(profile) => {
+                        manifest.profile = profile;
+                        manifest.deployment.profile = profile;
+                        manifest.kind = profile_manifest_kind(profile).into();
+                        if let Err(error) = self.save_high_manifest(&manifest) {
+                            tracing::error!(trap_id = %trap_id, %error, "cannot persist detected ISO profile");
+                            continue;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(trap_id = %trap_id, %error, "automatic ISO reconciliation refused unsupported media");
+                        let _ = self.transition_high_lifecycle(
+                            &mut manifest,
+                            HighLifecycleState::Failed,
+                            Some(error.to_string()),
+                        );
+                        continue;
+                    }
+                }
+            }
             let desired_running = manifest.desired_state == HighDesiredState::Running;
             match self
                 .high_manager()
-                .reconcile(
-                    &Self::high_vm(&manifest.deployment),
-                    desired_running,
-                )
+                .reconcile(&Self::high_vm(&manifest.deployment), desired_running)
             {
                 Ok(()) => {
-                    manifest.last_error = None;
-                    let _ = self.save_high_manifest(&manifest);
+                    if desired_running
+                        && (manifest.lifecycle_state != HighLifecycleState::Ready
+                            || manifest.last_error.is_some())
+                    {
+                        let _ = self.transition_high_lifecycle(
+                            &mut manifest,
+                            HighLifecycleState::Ready,
+                            None,
+                        );
+                    } else {
+                        manifest.last_error = None;
+                        let _ = self.save_high_manifest(&manifest);
+                    }
                 }
                 Err(error) => {
                     tracing::error!(trap_id = %trap_id, %error, "High reconciliation failed");
-                    manifest.last_error = Some(error.to_string());
-                    let _ = self.save_high_manifest(&manifest);
+                    let detail = error.to_string();
+                    if manifest.lifecycle_state != HighLifecycleState::Failed
+                        || manifest.last_error.as_deref() != Some(detail.as_str())
+                    {
+                        let _ = self.transition_high_lifecycle(
+                            &mut manifest,
+                            HighLifecycleState::Failed,
+                            Some(detail),
+                        );
+                    }
                 }
             }
         }
@@ -639,11 +782,25 @@ impl ComposeProjectStore {
                 let Some(manifest) = self.load_high_manifest(deployment.trap_id)? else {
                     return Ok(false);
                 };
+                let same_custom_source = deployment.image_source.is_some()
+                    && manifest.deployment.image_source == deployment.image_source;
+                let compatible_detected_profile = deployment.profile
+                    == HighOsProfile::custom_linux_iso_ssh()
+                    && matches!(
+                        manifest.deployment.profile,
+                        profile
+                            if profile == HighOsProfile::windows_rdp_legacy_iso()
+                                || profile == HighOsProfile::ubuntu_iso_ssh()
+                                || profile == HighOsProfile::debian_iso_ssh()
+                                || profile == HighOsProfile::arch_linux_iso_ssh()
+                    );
                 Ok(manifest.desired_state == HighDesiredState::Running
-                    && manifest.deployment.base_image == deployment.base_image
+                    && (manifest.deployment.base_image == deployment.base_image
+                        || same_custom_source)
                     && manifest.deployment.external_service_port
                         == deployment.external_service_port
-                    && manifest.deployment.profile == deployment.profile
+                    && (manifest.deployment.profile == deployment.profile
+                        || (same_custom_source && compatible_detected_profile))
                     && manifest.deployment.image_source == deployment.image_source
                     && self
                         .high_manager()
@@ -749,7 +906,9 @@ impl ComposeProjectStore {
         pritvoryashka_image: &str,
         agent_id: uuid::Uuid,
     ) -> anyhow::Result<CommandResult> {
-        let _mutation = self.mutation_lock.lock()
+        let _mutation = self
+            .mutation_lock
+            .lock()
             .map_err(|_| anyhow::anyhow!("trap mutation lock is poisoned"))?;
         let command_id = command.command_id();
         let trap_id = match &command {
@@ -782,13 +941,23 @@ impl ComposeProjectStore {
             tracing::warn!(command_id = %command_id, trap_id = %trap_id, "cached command state is absent or unhealthy; reconciling it again");
         }
         let deploying_quarantined = match &command {
-            AgentCommand::DeployKozyavka(_) | AgentCommand::DeployPritvoryashka(_) =>
-                self.root.join(trap_id.to_string()).join("security-quarantine.json").exists(),
-            AgentCommand::ReconcileTcpPortGroup(group) => group.members.iter().any(|member|
-                self.root.join(member.trap_id.to_string()).join("security-quarantine.json").exists()),
+            AgentCommand::DeployKozyavka(_) | AgentCommand::DeployPritvoryashka(_) => self
+                .root
+                .join(trap_id.to_string())
+                .join("security-quarantine.json")
+                .exists(),
+            AgentCommand::ReconcileTcpPortGroup(group) => group.members.iter().any(|member| {
+                self.root
+                    .join(member.trap_id.to_string())
+                    .join("security-quarantine.json")
+                    .exists()
+            }),
             _ => false,
         };
-        anyhow::ensure!(!deploying_quarantined, "trap is isolated after a security incident");
+        anyhow::ensure!(
+            !deploying_quarantined,
+            "trap is isolated after a security incident"
+        );
         let high_manifest = matches!(
             &command,
             AgentCommand::StopTrap { .. } | AgentCommand::RemoveTrap { .. }
@@ -1196,9 +1365,16 @@ impl ComposeProjectStore {
         let project = self.root.join(trap_id.to_string());
         let route = fs::read(project.join("manifest.json"))
             .map_err(anyhow::Error::from)
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).map_err(Into::into))
-            .and_then(|manifest| self.detach_dispatcher_target(trap_id,
-                manifest["publish_address"].as_str() == Some("127.0.0.1")).map(|_| ()));
+            .and_then(|bytes| {
+                serde_json::from_slice::<serde_json::Value>(&bytes).map_err(Into::into)
+            })
+            .and_then(|manifest| {
+                self.detach_dispatcher_target(
+                    trap_id,
+                    manifest["publish_address"].as_str() == Some("127.0.0.1"),
+                )
+                .map(|_| ())
+            });
         let stopped = self.compose(&project, trap_id, ["stop"]);
         route?;
         stopped?;
@@ -1207,25 +1383,39 @@ impl ComposeProjectStore {
 
     /// Preserve the trap and its evidence, detach only its Dispatcher route and
     /// stop its container. Docker stop closes its established network sockets.
-    fn quarantine_trap(&self, trigger: &kazik_protocol::TrapEvent) -> anyhow::Result<kazik_protocol::TrapEvent> {
-        let _mutation = self.mutation_lock.lock()
+    fn quarantine_trap(
+        &self,
+        trigger: &kazik_protocol::TrapEvent,
+    ) -> anyhow::Result<kazik_protocol::TrapEvent> {
+        let _mutation = self
+            .mutation_lock
+            .lock()
             .map_err(|_| anyhow::anyhow!("trap mutation lock is poisoned"))?;
         let trap_id = trigger.trap_id;
         let project = self.root.join(trap_id.to_string());
-        anyhow::ensure!(project.join("compose.yaml").is_file()
-            && (project.join("config.json").is_file() || project.join("pritvoryashka.json").is_file()),
-            "only an existing Low/Middle trap may be quarantined");
+        anyhow::ensure!(
+            project.join("compose.yaml").is_file()
+                && (project.join("config.json").is_file()
+                    || project.join("pritvoryashka.json").is_file()),
+            "only an existing Low/Middle trap may be quarantined"
+        );
         let marker = project.join("security-quarantine.json");
         let record: QuarantineMarker = if marker.exists() {
             serde_json::from_slice(&fs::read(&marker)?)?
         } else {
-            let record = QuarantineMarker { trigger: trigger.clone(), result_event_id: uuid::Uuid::new_v4() };
+            let record = QuarantineMarker {
+                trigger: trigger.clone(),
+                result_event_id: uuid::Uuid::new_v4(),
+            };
             atomic_write(&marker, &serde_json::to_vec(&record)?)?;
             fs::File::open(&marker)?.sync_all()?;
             fs::File::open(&project)?.sync_all()?;
             record
         };
-        anyhow::ensure!(record.trigger.trap_id == trap_id, "quarantine marker trap ID mismatch");
+        anyhow::ensure!(
+            record.trigger.trap_id == trap_id,
+            "quarantine marker trap ID mismatch"
+        );
         self.isolate_project(trap_id)?;
         Ok(quarantine_result(&record, true))
     }
@@ -1234,25 +1424,36 @@ impl ComposeProjectStore {
         let mut results = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
-            let Ok(trap_id) = uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()) else { continue };
+            let Ok(trap_id) = uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()) else {
+                continue;
+            };
             let marker = entry.path().join("security-quarantine.json");
             if marker.is_file() {
                 let result = (|| -> anyhow::Result<kazik_protocol::TrapEvent> {
                     let record: QuarantineMarker = serde_json::from_slice(&fs::read(&marker)?)?;
-                    anyhow::ensure!(record.trigger.trap_id == trap_id, "quarantine marker trap ID mismatch");
+                    anyhow::ensure!(
+                        record.trigger.trap_id == trap_id,
+                        "quarantine marker trap ID mismatch"
+                    );
                     self.isolate_project(trap_id)?;
                     Ok(quarantine_result(&record, true))
                 })();
                 match result {
                     Ok(event) => results.push(event),
-                    Err(error) => tracing::error!(%trap_id, %error, "could not reapply trap quarantine after restart"),
+                    Err(error) => {
+                        tracing::error!(%trap_id, %error, "could not reapply trap quarantine after restart")
+                    }
                 }
             }
         }
         Ok(results)
     }
 
-    fn detach_dispatcher_target(&self, trap_id: uuid::Uuid, shared_backend: bool) -> anyhow::Result<Option<Vec<u8>>> {
+    fn detach_dispatcher_target(
+        &self,
+        trap_id: uuid::Uuid,
+        shared_backend: bool,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
         let path = Path::new("/etc/honeyforge/dispatcher.json");
         let previous = match fs::read(path) {
             Ok(bytes) => bytes,
@@ -1596,7 +1797,9 @@ async fn run_kazik_hysteria_loop(
     let mut telemetry_poll = tokio::time::interval(telemetry::batch_wait());
     let mut emergency_tick = tokio::time::interval(Duration::from_secs(1));
     let existing_incident = emergency::pending(state_dir)?;
-    let mut incident_message_id = existing_incident.as_ref().map(|incident| incident.message_id);
+    let mut incident_message_id = existing_incident
+        .as_ref()
+        .map(|incident| incident.message_id);
     let mut missing_alert = None;
     if let Some(incident) = existing_incident.as_ref() {
         if emergency::alert_was_acknowledged(state_dir, incident.message_id)? {
@@ -1611,7 +1814,9 @@ async fn run_kazik_hysteria_loop(
                 identity.agent_id,
                 identity.transport_credential.clone(),
                 event.occurred_at_unix_ms,
-                KazikBody::Telemetry { events: vec![event] },
+                KazikBody::Telemetry {
+                    events: vec![event],
+                },
             );
             envelope.message_id = incident.message_id;
             telemetry::ensure_packet_size(&envelope)?;
@@ -1635,9 +1840,11 @@ async fn run_kazik_hysteria_loop(
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<CommandJob>(32);
     let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<CommandExecution>(32);
     match projects.recover_quarantines() {
-        Ok(events) => for event in events {
-            telemetry::enqueue_immediate_event(&identity, &mut outbox, event)?;
-        },
+        Ok(events) => {
+            for event in events {
+                telemetry::enqueue_immediate_event(&identity, &mut outbox, event)?;
+            }
+        }
         Err(error) => tracing::error!(%error, "could not scan persisted trap quarantines"),
     }
     let worker_projects = projects.clone();
@@ -2249,9 +2456,7 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
     if custom_image {
         required_tools.extend(["virt-inspector", "xorriso"]);
     }
-    if profile == HighOsProfile::arch_linux_ssh()
-        || profile == HighOsProfile::debian_ssh()
-    {
+    if profile == HighOsProfile::arch_linux_ssh() || profile == HighOsProfile::debian_ssh() {
         required_tools.push("virt-customize");
     }
     if profile == HighOsProfile::windows_rdp() {
@@ -2263,6 +2468,15 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
             "virt-ls",
             "wimlib-imagex",
         ]);
+    } else if profile == HighOsProfile::windows_rdp_legacy_iso() {
+        required_tools.push("wimlib-imagex");
+    }
+    if profile == HighOsProfile::custom_linux_iso_ssh()
+        || profile == HighOsProfile::ubuntu_iso_ssh()
+        || profile == HighOsProfile::debian_iso_ssh()
+        || profile == HighOsProfile::arch_linux_iso_ssh()
+    {
+        required_tools.extend(["expect", "virt-cat"]);
     }
     if matches!(
         profile.guest_os,
@@ -2324,14 +2538,22 @@ fn ensure_high_vm_runtime(
                 }
                 if profile == HighOsProfile::windows_rdp() {
                     packages.extend(["qemu-system-x86", "libguestfs-tools", "wimtools"]);
+                } else if required_tools.contains(&"wimlib-imagex") {
+                    packages.push("wimtools");
                 }
                 if custom_image {
                     if !packages.contains(&"xorriso") {
                         packages.push("xorriso");
                     }
                 }
+                if required_tools.contains(&"expect") {
+                    packages.push("expect");
+                }
                 if required_tools.contains(&"setfacl") {
                     packages.push("acl");
+                }
+                if required_tools.contains(&"wimlib-imagex") {
+                    packages.push("wimlib-utils");
                 }
                 run_program("apt-get", &packages)?;
                 run_program("systemctl", &["enable", "--now", "libvirtd"])?;
@@ -2351,9 +2573,7 @@ fn ensure_high_vm_runtime(
                     "python3",
                 ];
                 match profile.image_preparation {
-                    hf_core::HighImagePreparation::CloudInitSeed => {
-                        packages.push("cloud-utils")
-                    }
+                    hf_core::HighImagePreparation::CloudInitSeed => packages.push("cloud-utils"),
                     hf_core::HighImagePreparation::UnattendedInstall => packages.push("xorriso"),
                     hf_core::HighImagePreparation::Sysprep => packages.push("xorriso"),
                     hf_core::HighImagePreparation::OfflineGuestPreparation => {}
@@ -2372,8 +2592,14 @@ fn ensure_high_vm_runtime(
                         packages.push("xorriso");
                     }
                 }
+                if required_tools.contains(&"expect") {
+                    packages.push("expect");
+                }
                 if required_tools.contains(&"setfacl") {
                     packages.push("acl");
+                }
+                if required_tools.contains(&"wimlib-imagex") {
+                    packages.push("wimlib");
                 }
                 run_program("dnf", &packages)?;
                 run_program("systemctl", &["enable", "--now", "libvirtd"])?;
@@ -2396,14 +2622,10 @@ fn ensure_high_vm_runtime(
                     hf_core::HighImagePreparation::CloudInitSeed => {
                         packages.push("cloud-image-utils")
                     }
-                    hf_core::HighImagePreparation::UnattendedInstall => {
-                        packages.push("libisoburn")
-                    }
+                    hf_core::HighImagePreparation::UnattendedInstall => packages.push("libisoburn"),
                     hf_core::HighImagePreparation::Sysprep => packages.push("libisoburn"),
                     hf_core::HighImagePreparation::OfflineGuestPreparation => {}
-                    hf_core::HighImagePreparation::BestEffortInstall => {
-                        packages.push("libisoburn")
-                    }
+                    hf_core::HighImagePreparation::BestEffortInstall => packages.push("libisoburn"),
                 }
                 if custom_image
                     || profile == HighOsProfile::arch_linux_ssh()
@@ -2415,6 +2637,9 @@ fn ensure_high_vm_runtime(
                     if !packages.contains(&"libisoburn") {
                         packages.push("libisoburn");
                     }
+                }
+                if required_tools.contains(&"expect") {
+                    packages.push("expect");
                 }
                 if required_tools.contains(&"setfacl") {
                     packages.push("acl");
@@ -2696,14 +2921,21 @@ fn atomic_write(path: &Path, content: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Args, ComposeProjectStore, DispatcherConfig, DispatcherListener, DispatcherTarget,
-        HighDesiredState, HighOsProfile, HighRuntimeManifest, Platform, QuarantineMarker,
-        STANDALONE_IDENTITY_FILE, compose_remove_id, default_image_for, high_vm_required_tools,
-        load_or_create_standalone_high_identity, parse_platform, quarantine_result,
-        standalone_high_command, validate_standalone_high_args,
+        HighDesiredState, HighLifecycleState, HighOsProfile, HighRuntimeManifest, Platform,
+        QuarantineMarker, STANDALONE_IDENTITY_FILE, compose_remove_id, default_image_for,
+        high_vm_required_tools, load_or_create_standalone_high_identity, parse_platform,
+        quarantine_result, standalone_high_command, validate_standalone_high_args,
     };
     use clap::Parser;
     use hf_core::{AgentCommand, HighUbuntuDeployment, HighVmDeployment};
@@ -2714,20 +2946,36 @@ mod tests {
     #[test]
     fn quarantine_recovery_reuses_the_same_event_id() {
         let trigger = kazik_protocol::TrapEvent {
-            event_id: Uuid::new_v4(), trap_id: Uuid::new_v4(), session_id: None,
-            source_sequence_no: None, occurred_at_unix_ms: 1, event_type: "security.resource_access".into(),
-            source_ip: None, source_port: None, destination_port: None,
-            protocol: "local".into(), service_type: "host_monitor".into(),
+            event_id: Uuid::new_v4(),
+            trap_id: Uuid::new_v4(),
+            session_id: None,
+            source_sequence_no: None,
+            occurred_at_unix_ms: 1,
+            event_type: "security.resource_access".into(),
+            source_ip: None,
+            source_port: None,
+            destination_port: None,
+            protocol: "local".into(),
+            service_type: "host_monitor".into(),
             payload: serde_json::json!({"policy_decision":"isolate_trap"}),
             metadata: serde_json::json!({"source":"hf-agent-ebpf"}),
         };
-        let marker = QuarantineMarker { trigger, result_event_id: Uuid::new_v4() };
+        let marker = QuarantineMarker {
+            trigger,
+            result_event_id: Uuid::new_v4(),
+        };
         let first = quarantine_result(&marker, true);
         let replay = quarantine_result(&marker, true);
         assert_eq!(first.event_id, replay.event_id);
-        assert_eq!(first.payload["trigger_event_id"], marker.trigger.event_id.to_string());
+        assert_eq!(
+            first.payload["trigger_event_id"],
+            marker.trigger.event_id.to_string()
+        );
         assert_eq!(first.event_type, "security.trap_quarantined");
-        assert_eq!(quarantine_result(&marker, false).event_type, "security.trap_quarantine_failed");
+        assert_eq!(
+            quarantine_result(&marker, false).event_type,
+            "security.trap_quarantine_failed"
+        );
     }
 
     fn target(weight: u8) -> DispatcherTarget {
@@ -2858,6 +3106,15 @@ mod tests {
         assert!(custom.contains(&"virt-inspector"));
         assert!(custom.contains(&"xorriso"));
         assert!(custom.contains(&"setfacl"));
+
+        let ubuntu_iso = high_vm_required_tools(HighOsProfile::ubuntu_iso_ssh(), true);
+        assert!(ubuntu_iso.contains(&"xorriso"));
+        assert!(ubuntu_iso.contains(&"expect"));
+        assert!(ubuntu_iso.contains(&"virt-cat"));
+        assert!(ubuntu_iso.contains(&"setfacl"));
+
+        let windows_iso = high_vm_required_tools(HighOsProfile::windows_rdp_legacy_iso(), true);
+        assert!(windows_iso.contains(&"wimlib-imagex"));
     }
 
     #[test]
@@ -2899,7 +3156,7 @@ mod tests {
         let mut legacy = deployment;
         legacy.profile = HighOsProfile::windows_rdp_legacy_iso();
         legacy.base_image = default_image_for(legacy.profile).into();
-        assert!(ComposeProjectStore::validate_high_deployment(&legacy, false).is_err());
+        ComposeProjectStore::validate_high_deployment(&legacy, false).unwrap();
     }
 
     #[test]
@@ -2937,8 +3194,10 @@ mod tests {
                 trap_id,
                 base_image: "/images/prepared.qcow2".into(),
                 external_ssh_port: 2222,
-            }.into(),
+            }
+            .into(),
             desired_state: HighDesiredState::Stopped,
+            lifecycle_state: HighLifecycleState::Failed,
             last_error: Some("test error".into()),
         };
         store.save_high_manifest(&manifest).unwrap();
@@ -2955,7 +3214,8 @@ mod tests {
 
     #[test]
     fn legacy_high_manifest_defaults_to_the_ubuntu_profile() {
-        let directory = std::env::temp_dir().join(format!("hf-high-legacy-profile-{}", Uuid::new_v4()));
+        let directory =
+            std::env::temp_dir().join(format!("hf-high-legacy-profile-{}", Uuid::new_v4()));
         let store = ComposeProjectStore::new(&directory);
         let trap_id = Uuid::new_v4();
         let legacy = serde_json::json!({
@@ -2992,8 +3252,10 @@ mod tests {
                 trap_id,
                 base_image: "/images/prepared.qcow2".into(),
                 external_ssh_port: 22022,
-            }.into(),
+            }
+            .into(),
             desired_state: HighDesiredState::Removing,
+            lifecycle_state: HighLifecycleState::Ready,
             last_error: None,
         };
         store.save_high_manifest(&manifest).unwrap();
@@ -3039,8 +3301,10 @@ mod tests {
                     trap_id,
                     base_image: "/images/prepared.qcow2".into(),
                     external_ssh_port: 2222,
-                }.into(),
+                }
+                .into(),
                 desired_state: HighDesiredState::Running,
+                lifecycle_state: HighLifecycleState::Ready,
                 last_error: None,
             })
             .unwrap();
@@ -3121,8 +3385,7 @@ mod tests {
 
     #[test]
     fn standalone_identity_is_stable_and_separate_from_production_identity() {
-        let directory =
-            std::env::temp_dir().join(format!("hf-high-identity-{}", Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("hf-high-identity-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
 
         let first = load_or_create_standalone_high_identity(&directory).unwrap();
@@ -3161,8 +3424,7 @@ mod tests {
 
     #[test]
     fn standalone_stop_cannot_fall_back_to_an_untracked_runtime() {
-        let directory =
-            std::env::temp_dir().join(format!("hf-high-scope-{}", Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("hf-high-scope-{}", Uuid::new_v4()));
         let store = ComposeProjectStore::new(&directory);
         let command = AgentCommand::StopTrap {
             command_id: Uuid::new_v4(),
@@ -3172,6 +3434,10 @@ mod tests {
         let error = store
             .validate_standalone_high_command(&command)
             .unwrap_err();
-        assert!(error.to_string().contains("recorded in its own state directory"));
+        assert!(
+            error
+                .to_string()
+                .contains("recorded in its own state directory")
+        );
     }
 }

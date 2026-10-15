@@ -6,7 +6,8 @@ use std::{
 };
 
 use hf_core::{
-    HighGuestConnection, HighGuestOs, HighImagePreparation, HighImageSource, HighOsProfile,
+    HighGuestConnection, HighGuestOs, HighImageKind, HighImagePreparation, HighImageSource,
+    HighOsProfile,
 };
 use uuid::Uuid;
 
@@ -15,8 +16,7 @@ pub const DEFAULT_UBUNTU_24_04_IMAGE: &str =
 
 const DEFAULT_ARCH_LINUX_IMAGE: &str =
     "/var/lib/honeyforge/images/arch-linux-x86_64-cloudimg.qcow2";
-const DEFAULT_DEBIAN_IMAGE: &str =
-    "/var/lib/honeyforge/images/debian-12-genericcloud-amd64.qcow2";
+const DEFAULT_DEBIAN_IMAGE: &str = "/var/lib/honeyforge/images/debian-12-genericcloud-amd64.qcow2";
 const DEFAULT_WINDOWS_PREPARED_IMAGE: &str =
     "/var/lib/honeyforge/images/windows-server-prepared.qcow2";
 const DEFAULT_WINDOWS_SERVER_ISO: &str = "/var/lib/honeyforge/images/windows-server-eval.iso";
@@ -24,6 +24,15 @@ const DEFAULT_WINDOWS_SERVER_ISO: &str = "/var/lib/honeyforge/images/windows-ser
 pub fn default_image_for(profile: HighOsProfile) -> &'static str {
     if profile == HighOsProfile::windows_rdp_legacy_iso() {
         return DEFAULT_WINDOWS_SERVER_ISO;
+    }
+    if profile.image_kind == HighImageKind::InstallMediaAndDisk {
+        return match profile.guest_os {
+            HighGuestOs::Ubuntu => "/var/lib/honeyforge/images/custom-source-required-ubuntu.iso",
+            HighGuestOs::Debian => "/var/lib/honeyforge/images/custom-source-required-debian.iso",
+            HighGuestOs::ArchLinux => "/var/lib/honeyforge/images/custom-source-required-arch.iso",
+            HighGuestOs::CustomLinux => "/var/lib/honeyforge/images/custom-source-required.iso",
+            HighGuestOs::Windows => DEFAULT_WINDOWS_SERVER_ISO,
+        };
     }
     match profile.guest_os {
         HighGuestOs::Ubuntu => DEFAULT_UBUNTU_24_04_IMAGE,
@@ -194,6 +203,28 @@ const WINDOWS_PREPARED_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
     ],
 };
 
+const WINDOWS_ISO_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
+    download: "download-base-image.sh",
+    launch: "launch.sh",
+    publish: "discover-rdp.sh",
+    check_publication: "check-rdp-isolated.sh",
+    stop: "stop.sh",
+    reset: "reset.sh",
+    required: &[
+        "launch.sh",
+        "install-windows.sh",
+        "verify-windows-media.sh",
+        "create-overlay.sh",
+        "create-network.sh",
+        "firewall-common.sh",
+        "discover-rdp.sh",
+        "check-rdp-isolated.sh",
+        "stop.sh",
+        "reset.sh",
+        "download-base-image.sh",
+    ],
+};
+
 const BEST_EFFORT_ISO_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
     download: "reject-managed-image.sh",
     launch: "launch-iso.sh",
@@ -203,6 +234,30 @@ const BEST_EFFORT_ISO_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
     reset: "reset.sh",
     required: &[
         "launch-iso.sh",
+        "create-network.sh",
+        "firewall-common.sh",
+        "discover-ssh-isolated.sh",
+        "check-ssh-isolated.sh",
+        "stop.sh",
+        "reset.sh",
+        "reject-managed-image.sh",
+    ],
+};
+
+const LINUX_ISO_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
+    download: "reject-managed-image.sh",
+    launch: "launch-iso.sh",
+    publish: "discover-ssh-isolated.sh",
+    check_publication: "check-ssh-isolated.sh",
+    stop: "stop.sh",
+    reset: "reset.sh",
+    required: &[
+        "launch-iso.sh",
+        "prepare-unattended-iso.sh",
+        "install-arch.sh",
+        "arch-console.exp",
+        "arch-guest-install.sh",
+        "finalize-linux-install.sh",
         "create-network.sh",
         "firewall-common.sh",
         "discover-ssh-isolated.sh",
@@ -249,7 +304,7 @@ impl LibvirtSandboxManager {
                     dhcp_wait_attempts: 12,
                     verify_cached_managed_image: false,
                     require_guest_agent: false,
-                    publication: HighPublication::Required,
+                    publication: HighPublication::Disabled,
                     scripts: UBUNTU_SCRIPTS,
                 },
                 HighOsAdapter {
@@ -293,8 +348,8 @@ impl LibvirtSandboxManager {
                     dhcp_wait_attempts: 180,
                     verify_cached_managed_image: false,
                     require_guest_agent: false,
-                    publication: HighPublication::Required,
-                    scripts: GENERIC_SCRIPTS,
+                    publication: HighPublication::Disabled,
+                    scripts: WINDOWS_ISO_SCRIPTS,
                 },
                 HighOsAdapter {
                     profile: HighOsProfile::custom_linux_qcow2_ssh(),
@@ -306,6 +361,39 @@ impl LibvirtSandboxManager {
                     require_guest_agent: false,
                     publication: HighPublication::Required,
                     scripts: GENERIC_SCRIPTS,
+                },
+                HighOsAdapter {
+                    profile: HighOsProfile::ubuntu_iso_ssh(),
+                    recipe_dir: recipes_root.join("high-custom-iso"),
+                    default_image: default_image_for(HighOsProfile::ubuntu_iso_ssh()),
+                    readiness_timeout: Duration::from_secs(300),
+                    dhcp_wait_attempts: 60,
+                    verify_cached_managed_image: true,
+                    require_guest_agent: true,
+                    publication: HighPublication::Disabled,
+                    scripts: LINUX_ISO_SCRIPTS,
+                },
+                HighOsAdapter {
+                    profile: HighOsProfile::debian_iso_ssh(),
+                    recipe_dir: recipes_root.join("high-custom-iso"),
+                    default_image: default_image_for(HighOsProfile::debian_iso_ssh()),
+                    readiness_timeout: Duration::from_secs(300),
+                    dhcp_wait_attempts: 60,
+                    verify_cached_managed_image: true,
+                    require_guest_agent: true,
+                    publication: HighPublication::Disabled,
+                    scripts: LINUX_ISO_SCRIPTS,
+                },
+                HighOsAdapter {
+                    profile: HighOsProfile::arch_linux_iso_ssh(),
+                    recipe_dir: recipes_root.join("high-custom-iso"),
+                    default_image: default_image_for(HighOsProfile::arch_linux_iso_ssh()),
+                    readiness_timeout: Duration::from_secs(300),
+                    dhcp_wait_attempts: 60,
+                    verify_cached_managed_image: true,
+                    require_guest_agent: true,
+                    publication: HighPublication::Disabled,
+                    scripts: LINUX_ISO_SCRIPTS,
                 },
                 HighOsAdapter {
                     profile: HighOsProfile::custom_linux_iso_ssh(),
@@ -357,9 +445,7 @@ impl LibvirtSandboxManager {
                     adapter.scripts.download,
                     &[adapter.default_image],
                 )
-                .map_err(|failure| {
-                    lifecycle_error("IMAGE_DOWNLOAD_FAILED", "download", failure)
-                })?;
+                .map_err(|failure| lifecycle_error("IMAGE_DOWNLOAD_FAILED", "download", failure))?;
             } else {
                 anyhow::bail!(
                     "High {} base image does not exist: {}",
@@ -436,6 +522,9 @@ impl LibvirtSandboxManager {
         if !desired_running {
             return self.stop(vm);
         }
+        if requires_installed_disk_marker(vm.profile) && !self.installed_marker_ready(vm) {
+            return self.create_and_start(vm);
+        }
         let matches_profile = self.domain_matches_security_profile(vm)?;
         let action = reconcile_action(self.domain_state(vm.instance_id)?, matches_profile);
         match action {
@@ -463,7 +552,8 @@ impl LibvirtSandboxManager {
             self.domain_matches_security_profile(vm)?,
             self.has_published_service(vm),
             self.guest_service_ready(vm)
-                && (!require_guest_agent || self.guest_agent_ready(vm.instance_id)),
+                && (!require_guest_agent || self.guest_agent_ready(vm.instance_id))
+                && self.installed_marker_ready(vm),
         ))
     }
 
@@ -544,11 +634,17 @@ impl LibvirtSandboxManager {
         let adapter = self.adapter_for(vm.profile)?;
         let instance_id = vm.instance_id.to_string();
         let port = vm.external_service_port.to_string();
-        if let Err(failure) = self.run(
-            vm.profile,
-            adapter.scripts.publish,
-            &[&instance_id, &port],
-        ) {
+        if !self.installed_marker_ready(vm) {
+            return Err(lifecycle_error(
+                "INSTALLATION_INCOMPLETE",
+                "installation",
+                anyhow::anyhow!(
+                    "the installed-disk marker is absent; a Live ISO is not a ready High VM"
+                ),
+            ));
+        }
+        if let Err(failure) = self.run(vm.profile, adapter.scripts.publish, &[&instance_id, &port])
+        {
             let dhcp_timeout = self
                 .high_root
                 .join(&instance_id)
@@ -572,11 +668,20 @@ impl LibvirtSandboxManager {
         let timeout = adapter.readiness_timeout;
         let deadline = Instant::now() + timeout;
         let mut service_ready = false;
+        let mut agent_ready = false;
+        let telemetry_ready = required_telemetry_unit(vm.profile).is_none();
         while Instant::now() < deadline {
             if self.access_policy_ready(vm) && self.guest_service_ready(vm) {
                 service_ready = true;
                 if self.guest_agent_ready(vm.instance_id) {
-                    return Ok(());
+                    agent_ready = true;
+                    if let Some(unit) = required_telemetry_unit(vm.profile) {
+                        if self.guest_systemd_unit_active(vm.instance_id, unit) {
+                            return Ok(());
+                        }
+                    } else {
+                        return Ok(());
+                    }
                 }
                 if !adapter.require_guest_agent {
                     tracing::warn!(trap_id = %vm.instance_id, "High VM service is ready but qemu-guest-agent is unavailable");
@@ -585,13 +690,20 @@ impl LibvirtSandboxManager {
             }
             std::thread::sleep(Duration::from_secs(2));
         }
-        if service_ready && adapter.require_guest_agent {
+        if service_ready && adapter.require_guest_agent && !agent_ready {
             return Err(lifecycle_error(
                 "GUEST_AGENT_UNAVAILABLE",
                 "readiness",
                 anyhow::anyhow!(
                     "guest service is reachable but qemu-guest-agent did not answer guest-ping"
                 ),
+            ));
+        }
+        if service_ready && agent_ready && !telemetry_ready {
+            return Err(lifecycle_error(
+                "GUEST_TELEMETRY_UNAVAILABLE",
+                "readiness",
+                anyhow::anyhow!("guest telemetry systemd service did not become active"),
             ));
         }
         let (code, stage) = match vm.profile.image_preparation {
@@ -603,9 +715,7 @@ impl LibvirtSandboxManager {
         Err(lifecycle_error(
             code,
             stage,
-            anyhow::anyhow!(
-                "guest service did not become reachable before the profile timeout"
-            ),
+            anyhow::anyhow!("guest service did not become reachable before the profile timeout"),
         ))
     }
 
@@ -643,6 +753,71 @@ impl LibvirtSandboxManager {
             }
         };
         TcpStream::connect_timeout(&SocketAddr::new(ip, guest_port), Duration::from_secs(2)).is_ok()
+    }
+
+    fn installed_marker_ready(&self, vm: &HighVm) -> bool {
+        !requires_installed_disk_marker(vm.profile)
+            || self
+                .high_root
+                .join(vm.instance_id.to_string())
+                .join("installed-disk-verified")
+                .is_file()
+    }
+
+    fn guest_systemd_unit_active(&self, instance_id: Uuid, unit: &str) -> bool {
+        let name = format!("hf-high-{instance_id}");
+        let request = serde_json::json!({
+            "execute": "guest-exec",
+            "arguments": {
+                "path": "/bin/systemctl",
+                "arg": ["is-active", "--quiet", unit],
+                "capture-output": true
+            }
+        });
+        let Ok(output) = Command::new("virsh")
+            .env("LC_ALL", "C")
+            .args(["qemu-agent-command", &name, &request.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        let Ok(reply) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+            return false;
+        };
+        let Some(pid) = reply
+            .pointer("/return/pid")
+            .and_then(|value| value.as_u64())
+        else {
+            return false;
+        };
+        for _ in 0..10 {
+            let status_request = serde_json::json!({
+                "execute": "guest-exec-status",
+                "arguments": { "pid": pid }
+            });
+            let Ok(status) = Command::new("virsh")
+                .env("LC_ALL", "C")
+                .args(["qemu-agent-command", &name, &status_request.to_string()])
+                .output()
+            else {
+                return false;
+            };
+            let Ok(status) = serde_json::from_slice::<serde_json::Value>(&status.stdout) else {
+                return false;
+            };
+            if status
+                .pointer("/return/exited")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+            {
+                return status
+                    .pointer("/return/exitcode")
+                    .and_then(|value| value.as_i64())
+                    == Some(0);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
     }
 
     /// Profile-aware probe used by operational telemetry.  It never guesses a guest's
@@ -708,7 +883,15 @@ impl LibvirtSandboxManager {
     fn run(&self, profile: HighOsProfile, script: &str, arguments: &[&str]) -> anyhow::Result<()> {
         let adapter = self.adapter_for(profile)?;
         let path = adapter.recipe_dir.join("scripts").join(script);
-        let status = Command::new("sh")
+        let lifecycle_instance = if script.starts_with("launch") {
+            arguments.get(1)
+        } else {
+            arguments.first()
+        }
+        .copied()
+        .unwrap_or("unknown");
+        let mut command = Command::new("sh");
+        command
             .arg(&path)
             .args(arguments)
             .env("HF_HIGH_ROOT", &self.high_root)
@@ -716,12 +899,44 @@ impl LibvirtSandboxManager {
                 "HF_HIGH_DHCP_ATTEMPTS",
                 adapter.dhcp_wait_attempts.to_string(),
             )
-            .env("LC_ALL", "C")
-            .status()?;
-        if !status.success() {
+            .env(
+                "HF_HIGH_LIFECYCLE_LOG",
+                self.high_root
+                    .parent()
+                    .unwrap_or(Path::new("/var/lib/honeyforge"))
+                    .join("traps")
+                    .join(lifecycle_instance)
+                    .join("lifecycle-events.jsonl"),
+            )
+            .env("LC_ALL", "C");
+        let installer = if profile == HighOsProfile::ubuntu_iso_ssh() {
+            Some("ubuntu")
+        } else if profile == HighOsProfile::debian_iso_ssh() {
+            Some("debian")
+        } else if profile == HighOsProfile::arch_linux_iso_ssh() {
+            Some("arch")
+        } else {
+            None
+        };
+        if let Some(installer) = installer {
+            command.env("HF_HIGH_ISO_INSTALLER", installer);
+        }
+        let output = command.output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let diagnostic = stderr
+                .chars()
+                .rev()
+                .take(4096)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
             anyhow::bail!(
-                "High VM lifecycle script {} exited with {status}",
-                path.display()
+                "High VM lifecycle script {} exited with {}: {}",
+                path.display(),
+                output.status,
+                diagnostic.trim()
             );
         }
         Ok(())
@@ -759,6 +974,15 @@ pub fn profile_manifest_kind(profile: HighOsProfile) -> &'static str {
         return "high_windows_rdp";
     }
     match profile.guest_os {
+        HighGuestOs::Ubuntu if profile.image_kind == HighImageKind::InstallMediaAndDisk => {
+            "high_ubuntu_iso_ssh"
+        }
+        HighGuestOs::Debian if profile.image_kind == HighImageKind::InstallMediaAndDisk => {
+            "high_debian_iso_ssh"
+        }
+        HighGuestOs::ArchLinux if profile.image_kind == HighImageKind::InstallMediaAndDisk => {
+            "high_arch_iso_ssh"
+        }
         HighGuestOs::Ubuntu => "high_ubuntu_ssh",
         HighGuestOs::Debian => "high_debian_ssh",
         HighGuestOs::ArchLinux => "high_arch_ssh",
@@ -776,6 +1000,9 @@ pub fn is_supported_profile(profile: HighOsProfile) -> bool {
         || profile == HighOsProfile::arch_linux_ssh()
         || profile == HighOsProfile::windows_rdp()
         || profile == HighOsProfile::windows_rdp_legacy_iso()
+        || profile == HighOsProfile::ubuntu_iso_ssh()
+        || profile == HighOsProfile::debian_iso_ssh()
+        || profile == HighOsProfile::arch_linux_iso_ssh()
         || profile == HighOsProfile::custom_linux_qcow2_ssh()
         || profile == HighOsProfile::custom_linux_iso_ssh()
 }
@@ -805,6 +1032,13 @@ fn domain_xml_matches_security_profile(
                     && xml.contains("listen='127.0.0.1'")
                     && !xml.contains("listen='0.0.0.0'")
             }
+            HighGuestOs::Ubuntu | HighGuestOs::Debian | HighGuestOs::ArchLinux
+                if profile.image_kind == HighImageKind::InstallMediaAndDisk =>
+            {
+                xml.matches("<graphics ").count() == 1
+                    && xml.contains("listen='127.0.0.1'")
+                    && !xml.contains("listen='0.0.0.0'")
+            }
             HighGuestOs::Ubuntu
             | HighGuestOs::Debian
             | HighGuestOs::ArchLinux
@@ -812,7 +1046,23 @@ fn domain_xml_matches_security_profile(
         }
 }
 
-fn lifecycle_error(code: &'static str, stage: &'static str, failure: anyhow::Error) -> anyhow::Error {
+fn requires_installed_disk_marker(profile: HighOsProfile) -> bool {
+    profile.image_kind == HighImageKind::InstallMediaAndDisk
+        && profile.image_preparation == HighImagePreparation::UnattendedInstall
+}
+
+fn required_telemetry_unit(profile: HighOsProfile) -> Option<&'static str> {
+    if !requires_installed_disk_marker(profile) || profile.guest_os == HighGuestOs::Windows {
+        return None;
+    }
+    Some("high-telemetry.service")
+}
+
+fn lifecycle_error(
+    code: &'static str,
+    stage: &'static str,
+    failure: anyhow::Error,
+) -> anyhow::Error {
     anyhow::anyhow!("HF_HIGH_ERROR code={code} stage={stage}: {failure}")
 }
 
@@ -963,7 +1213,8 @@ mod tests {
         assert!(windows.verify_cached_managed_image);
         assert_eq!(windows.publication, HighPublication::Disabled);
         assert!(!legacy.verify_cached_managed_image);
-        assert_eq!(legacy.publication, HighPublication::Required);
+        assert_eq!(legacy.publication, HighPublication::Disabled);
+        assert_eq!(legacy.scripts.publish, "discover-rdp.sh");
         assert_eq!(custom_qcow2.publication, HighPublication::Required);
         assert_eq!(custom_iso.publication, HighPublication::Disabled);
         assert_ne!(custom_iso.scripts.publish, "publish-service.sh");
@@ -988,6 +1239,35 @@ mod tests {
             profile_manifest_kind(HighOsProfile::windows_rdp_legacy_iso()),
             "high_windows_rdp"
         );
+    }
+
+    #[test]
+    fn unattended_iso_profiles_require_disk_boot_and_linux_telemetry() {
+        for profile in [
+            HighOsProfile::ubuntu_iso_ssh(),
+            HighOsProfile::debian_iso_ssh(),
+            HighOsProfile::arch_linux_iso_ssh(),
+            HighOsProfile::windows_rdp_legacy_iso(),
+        ] {
+            assert!(requires_installed_disk_marker(profile));
+        }
+        assert_eq!(
+            required_telemetry_unit(HighOsProfile::ubuntu_iso_ssh()),
+            Some("high-telemetry.service")
+        );
+        assert_eq!(
+            required_telemetry_unit(HighOsProfile::debian_iso_ssh()),
+            Some("high-telemetry.service")
+        );
+        assert_eq!(
+            required_telemetry_unit(HighOsProfile::arch_linux_iso_ssh()),
+            Some("high-telemetry.service")
+        );
+        assert_eq!(
+            required_telemetry_unit(HighOsProfile::windows_rdp_legacy_iso()),
+            None
+        );
+        assert!(!requires_installed_disk_marker(HighOsProfile::ubuntu_ssh()));
     }
 
     #[test]

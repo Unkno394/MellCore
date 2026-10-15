@@ -9,10 +9,11 @@ use std::{
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
+use hf_core::HighLifecycleState;
 use hf_services::kazik_outbox::SqliteKazikOutbox;
 use kazik_protocol::{
-    DurableOutbox, KazikBody, KazikEnvelope, MAX_TELEMETRY_BATCH_EVENTS,
-    MAX_TELEMETRY_BATCH_WAIT, MAX_TELEMETRY_PACKET_BYTES, TrapEvent,
+    DurableOutbox, KazikBody, KazikEnvelope, MAX_TELEMETRY_BATCH_EVENTS, MAX_TELEMETRY_BATCH_WAIT,
+    MAX_TELEMETRY_PACKET_BYTES, TrapEvent,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -57,6 +58,15 @@ struct LowEvent {
     trap_port: u16,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HighLifecycleEvent {
+    event_id: Uuid,
+    state: HighLifecycleState,
+    occurred_at_unix_ms: i64,
+    detail: Option<String>,
+}
+
 /// Collects new trap output, durably queues it before advancing source cursors, and returns the
 /// number of events placed in the Kazik outbox. Center ACKs remain responsible for deletion.
 pub fn collect_new_events(
@@ -83,6 +93,14 @@ pub fn collect_new_events(
             continue;
         };
         let project = entry.path();
+        if project.join("high.json").is_file() {
+            let lifecycle_log = project.join("lifecycle-events.jsonl");
+            if lifecycle_log.is_file() {
+                collected +=
+                    collect_high_lifecycle(&lifecycle_log, &cursor_dir, trap_id, identity, outbox)?;
+            }
+            continue;
+        }
         let middle_log = project.join("runtime/events.jsonl");
         if middle_log.is_file() {
             collected += collect_middle(&middle_log, &cursor_dir, trap_id, identity, outbox)?;
@@ -93,6 +111,60 @@ pub fn collect_new_events(
         }
     }
     Ok(collected)
+}
+
+fn collect_high_lifecycle(
+    log_path: &Path,
+    cursor_dir: &Path,
+    trap_id: Uuid,
+    identity: &AgentIdentity,
+    outbox: &mut SqliteKazikOutbox,
+) -> anyhow::Result<usize> {
+    let cursor_path = cursor_dir.join(format!("{trap_id}-high-lifecycle.offset"));
+    let offset = read_offset(&cursor_path)?;
+    let mut file = File::open(log_path)?;
+    let length = file.metadata()?.len();
+    let mut next_offset = if offset > length { 0 } else { offset };
+    file.seek(SeekFrom::Start(next_offset))?;
+    let mut reader = BufReader::new(file);
+    let mut events = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 || line.last() != Some(&b'\n') {
+            break;
+        }
+        next_offset += read as u64;
+        match serde_json::from_slice::<HighLifecycleEvent>(&line) {
+            Ok(event) => events.push(TrapEvent {
+                event_id: event.event_id,
+                trap_id,
+                session_id: None,
+                source_sequence_no: None,
+                occurred_at_unix_ms: event.occurred_at_unix_ms,
+                event_type: "high.lifecycle".into(),
+                source_ip: None,
+                source_port: None,
+                destination_port: None,
+                protocol: "local".into(),
+                service_type: "high_vm".into(),
+                payload: serde_json::json!({
+                    "state": event.state,
+                    "detail": event.detail,
+                }),
+                metadata: serde_json::json!({
+                    "source": "hf-agent",
+                    "schema_version": 1,
+                }),
+            }),
+            Err(error) => {
+                tracing::warn!(%error, %trap_id, "skipping malformed High lifecycle event")
+            }
+        }
+    }
+    let count = queue_events(events, identity, outbox)?;
+    write_cursor(&cursor_path, format!("{next_offset}\n").as_bytes())?;
+    Ok(count)
 }
 
 fn collect_middle(
@@ -131,7 +203,9 @@ fn collect_middle(
                 event.trap_id = trap_id;
                 event
             })),
-            Err(error) => tracing::warn!(%error, trap_id = %trap_id, "skipping malformed Middle telemetry line"),
+            Err(error) => {
+                tracing::warn!(%error, trap_id = %trap_id, "skipping malformed Middle telemetry line")
+            }
         }
     }
     let count = queue_events(events, identity, outbox)?;
@@ -244,22 +318,26 @@ pub(crate) fn batch_wait() -> std::time::Duration {
 }
 
 pub(crate) fn is_critical_event(event: &TrapEvent) -> bool {
-    let host_observer = event.metadata.get("source").and_then(Value::as_str)
-        == Some("hf-agent-ebpf");
-    (host_observer && matches!(
-        event.event_type.as_str(),
-        "security.escape_confirmed"
-            | "security.namespace_mismatch"
-            | "security.host_exec_from_trap"
-    )) || matches!(
-        event.event_type.as_str(),
-        "security.trap_quarantined" | "security.trap_quarantine_failed"
-    ) || (host_observer
-        && (event.payload.get("policy_decision").and_then(Value::as_str) == Some("isolate_trap")
+    let host_observer =
+        event.metadata.get("source").and_then(Value::as_str) == Some("hf-agent-ebpf");
+    (host_observer
+        && matches!(
+            event.event_type.as_str(),
+            "security.escape_confirmed"
+                | "security.namespace_mismatch"
+                | "security.host_exec_from_trap"
+        ))
         || matches!(
-            event.metadata.get("assessment").and_then(Value::as_str),
-            Some("confirmed" | "isolated")
-        )))
+            event.event_type.as_str(),
+            "security.trap_quarantined" | "security.trap_quarantine_failed"
+        )
+        || (host_observer
+            && (event.payload.get("policy_decision").and_then(Value::as_str)
+                == Some("isolate_trap")
+                || matches!(
+                    event.metadata.get("assessment").and_then(Value::as_str),
+                    Some("confirmed" | "isolated")
+                )))
 }
 
 pub(crate) fn enqueue_immediate_event(
@@ -304,7 +382,10 @@ fn plan_batches(
             }
             let envelope = telemetry_envelope(identity, sent_at_unix_ms, vec![event.clone()]);
             ensure_packet_size(&envelope).with_context(|| {
-                format!("critical event {} cannot fit in one HFSP packet", event.event_id)
+                format!(
+                    "critical event {} cannot fit in one HFSP packet",
+                    event.event_id
+                )
             })?;
             chunks.push((vec![event], true));
             continue;
@@ -326,7 +407,10 @@ fn plan_batches(
             chunks.push((std::mem::take(&mut normal), false));
             let single = telemetry_envelope(identity, sent_at_unix_ms, vec![event.clone()]);
             ensure_packet_size(&single).with_context(|| {
-                format!("telemetry event {} cannot fit in one HFSP packet", event.event_id)
+                format!(
+                    "telemetry event {} cannot fit in one HFSP packet",
+                    event.event_id
+                )
             })?;
         }
         normal.push(event);
@@ -387,7 +471,9 @@ fn write_cursor(path: &Path, value: &[u8]) -> anyhow::Result<()> {
 impl From<MiddleEvent> for TrapEvent {
     fn from(mut event: MiddleEvent) -> Self {
         // Container-controlled JSON cannot impersonate the host observer.
-        if !event.metadata.is_object() { event.metadata = serde_json::json!({}); }
+        if !event.metadata.is_object() {
+            event.metadata = serde_json::json!({});
+        }
         event.metadata["source"] = serde_json::json!("pritvoryashka");
         event.metadata["evidence_domain"] = serde_json::json!("simulated");
         if let Some(metadata) = event.metadata.as_object_mut() {
@@ -453,12 +539,29 @@ mod tests {
     #[test]
     fn batches_preserve_order_fields_and_twenty_event_limit() {
         let identity = identity();
-        let input: Vec<_> = (0..45).map(|index| event(index, "command.executed", 4)).collect();
+        let input: Vec<_> = (0..45)
+            .map(|index| event(index, "command.executed", 4))
+            .collect();
         let expected = input.clone();
         let batches = plan_batches(input, &identity, 100).unwrap();
-        assert_eq!(batches.iter().map(|batch| events_in(batch).len()).collect::<Vec<_>>(), vec![20, 20, 5]);
-        assert!(batches.iter().all(|batch| events_in(batch).len() <= MAX_TELEMETRY_BATCH_EVENTS));
-        assert!(batches.iter().all(|batch| batch.envelope.encode_hfsp(0, 0).unwrap().len() <= MAX_TELEMETRY_PACKET_BYTES));
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| events_in(batch).len())
+                .collect::<Vec<_>>(),
+            vec![20, 20, 5]
+        );
+        assert!(
+            batches
+                .iter()
+                .all(|batch| events_in(batch).len() <= MAX_TELEMETRY_BATCH_EVENTS)
+        );
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.envelope.encode_hfsp(0, 0).unwrap().len()
+                    <= MAX_TELEMETRY_PACKET_BYTES)
+        );
         let actual: Vec<_> = batches.iter().flat_map(events_in).cloned().collect();
         assert_eq!(actual, expected);
     }
@@ -467,13 +570,29 @@ mod tests {
     fn splits_on_encoded_packet_size_and_rejects_one_oversized_event() {
         let identity = identity();
         let batches = plan_batches(
-            vec![event(1, "command.executed", 6_000), event(2, "command.executed", 6_000), event(3, "command.executed", 6_000)],
+            vec![
+                event(1, "command.executed", 6_000),
+                event(2, "command.executed", 6_000),
+                event(3, "command.executed", 6_000),
+            ],
             &identity,
             100,
-        ).unwrap();
-        assert_eq!(batches.iter().map(|batch| events_in(batch).len()).sum::<usize>(), 3);
+        )
+        .unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| events_in(batch).len())
+                .sum::<usize>(),
+            3
+        );
         assert!(batches.len() >= 2);
-        assert!(batches.iter().all(|batch| batch.envelope.encode_hfsp(0, 0).unwrap().len() <= MAX_TELEMETRY_PACKET_BYTES));
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.envelope.encode_hfsp(0, 0).unwrap().len()
+                    <= MAX_TELEMETRY_PACKET_BYTES)
+        );
         assert!(plan_batches(vec![event(4, "command.executed", 20_000)], &identity, 100).is_err());
     }
 
@@ -486,10 +605,17 @@ mod tests {
         critical.metadata = serde_json::json!({"source":"hf-agent-ebpf","assessment":"confirmed"});
         let normal_after = event(3, "command.executed", 0);
         let mut outbox = SqliteKazikOutbox::open(state_dir.join("outbox.sqlite")).unwrap();
-        queue_events(vec![normal_before, critical.clone(), normal_after], &identity, &mut outbox).unwrap();
+        queue_events(
+            vec![normal_before, critical.clone(), normal_after],
+            &identity,
+            &mut outbox,
+        )
+        .unwrap();
         let pending = outbox.pending(10).unwrap();
         assert_eq!(pending.len(), 3);
-        let KazikBody::Telemetry { events } = &pending[0].body else { panic!("expected telemetry") };
+        let KazikBody::Telemetry { events } = &pending[0].body else {
+            panic!("expected telemetry")
+        };
         assert_eq!(events.as_slice(), &[critical]);
         drop(outbox);
         fs::remove_dir_all(state_dir).unwrap();
@@ -538,6 +664,45 @@ mod tests {
         assert_eq!(event.metadata["source"], "pritvoryashka");
         assert!(event.metadata.get("validation").is_none());
         assert!(!is_critical_event(&event));
+    }
+
+    #[test]
+    fn high_lifecycle_progress_is_queued_once_for_center() {
+        let state_dir = std::env::temp_dir().join(format!("hf-lifecycle-{}", Uuid::new_v4()));
+        let traps = state_dir.join("traps");
+        let trap_id = Uuid::new_v4();
+        fs::create_dir_all(traps.join(trap_id.to_string())).unwrap();
+        fs::write(traps.join(trap_id.to_string()).join("high.json"), b"{}").unwrap();
+        let event_id = Uuid::new_v4();
+        fs::write(
+            traps
+                .join(trap_id.to_string())
+                .join("lifecycle-events.jsonl"),
+            format!(
+                "{{\"event_id\":\"{event_id}\",\"state\":\"INSTALLING\",\"occurred_at_unix_ms\":1000,\"detail\":null}}\n"
+            ),
+        )
+        .unwrap();
+        let mut outbox = SqliteKazikOutbox::open(state_dir.join("outbox.sqlite")).unwrap();
+        let identity = identity();
+
+        assert_eq!(
+            collect_new_events(&traps, &state_dir, &identity, &mut outbox).unwrap(),
+            1
+        );
+        assert_eq!(
+            collect_new_events(&traps, &state_dir, &identity, &mut outbox).unwrap(),
+            0
+        );
+        let pending = outbox.pending(10).unwrap();
+        let KazikBody::Telemetry { events } = &pending[0].body else {
+            panic!("expected telemetry")
+        };
+        assert_eq!(events[0].event_id, event_id);
+        assert_eq!(events[0].event_type, "high.lifecycle");
+        assert_eq!(events[0].payload["state"], "INSTALLING");
+        drop(outbox);
+        fs::remove_dir_all(state_dir).unwrap();
     }
 
     #[test]

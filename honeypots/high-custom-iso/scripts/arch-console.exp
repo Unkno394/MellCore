@@ -1,0 +1,22 @@
+#!/usr/bin/expect -f
+set timeout $env(HF_HIGH_INSTALL_TIMEOUT_SECONDS)
+set vm_name [lindex $argv 0]
+set payload [lindex $argv 1]
+if {$vm_name eq "" || $payload eq ""} { puts stderr "missing VM name or installer payload"; exit 2 }
+spawn virsh console $vm_name --force
+expect {
+    -re {root@archiso[^\r\n]*# *$} {}
+    -re {archiso login: *$} { send -- "root\r"; exp_continue }
+    timeout { puts stderr "Arch ISO serial console did not reach a root shell"; exit 3 }
+    eof { puts stderr "Arch ISO serial console closed before login"; exit 4 }
+}
+send -- "stty -echo\r"
+expect -re {# *$}
+send -- "printf '%s' '$payload' | base64 -d > /tmp/hf-install.sh && chmod 0700 /tmp/hf-install.sh && if test -e /run/hf-installing; then while test -e /run/hf-installing; do sleep 5; done; test -e /mnt/etc/honeyforge-installed && echo HF_INSTALL_COMPLETE || echo HF_INSTALL_FAILED:previous-run; else : > /run/hf-installing; nohup /tmp/hf-install.sh >/dev/ttyS0 2>&1 & while test -e /run/hf-installing; do sleep 5; done; fi\r"
+expect {
+    -re {HF_INSTALL_COMPLETE} {}
+    -re {HF_INSTALL_FAILED:[^\r\n]*} { puts stderr $expect_out(0,string); exit 5 }
+    timeout { puts stderr "Arch installation exceeded its timeout"; exit 6 }
+    eof { puts stderr "Arch console closed before installation completed"; exit 7 }
+}
+exit 0

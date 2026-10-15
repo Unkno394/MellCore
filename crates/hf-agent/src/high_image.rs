@@ -431,7 +431,7 @@ fn verify_qcow2(path: &Path, profile: HighOsProfile) -> Result<(), HighImageErro
 }
 
 fn verify_iso(path: &Path, profile: HighOsProfile) -> Result<(), HighImageError> {
-    output(
+    let volume = output(
         Command::new("xorriso")
             .args(["-indev"])
             .arg(path)
@@ -449,40 +449,27 @@ fn verify_iso(path: &Path, profile: HighOsProfile) -> Result<(), HighImageError>
         "inspection",
         "xorriso could not enumerate installation media",
     )?;
-    let listing = String::from_utf8_lossy(&listing.stdout).to_ascii_lowercase();
-    let x86 = ["amd64", "x86_64", "bootx64.efi", "/install.amd/"]
-        .iter()
-        .any(|marker| listing.contains(marker));
-    let arm = ["arm64", "aarch64", "bootaa64.efi"]
-        .iter()
-        .any(|marker| listing.contains(marker));
-    if arm && !x86 {
+    let inspection = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&volume.stdout),
+        String::from_utf8_lossy(&listing.stdout)
+    )
+    .to_ascii_lowercase();
+    let (detected, architecture) = inspect_iso_text(&inspection);
+    if architecture == Some(HighImageArchitecture::Aarch64) {
         return Err(error(
             "IMAGE_ARCHITECTURE_UNSUPPORTED",
             "inspection",
             "installation media is ARM64, while this agent supports x86_64",
         ));
     }
-    if !x86 {
+    if architecture != Some(HighImageArchitecture::X86_64) {
         return Err(error(
             "IMAGE_ARCHITECTURE_UNVERIFIED",
             "inspection",
             "installation media does not expose verifiable x86_64 boot artefacts",
         ));
     }
-    let detected = if listing.contains("/sources/boot.wim")
-        && (listing.contains("/sources/install.wim") || listing.contains("/sources/install.esd"))
-    {
-        Some(HighGuestOs::Windows)
-    } else if listing.contains("/arch/boot/x86_64/") {
-        Some(HighGuestOs::ArchLinux)
-    } else if listing.contains("/casper/") {
-        Some(HighGuestOs::Ubuntu)
-    } else if listing.contains("/install.amd/") {
-        Some(HighGuestOs::Debian)
-    } else {
-        None
-    };
     if profile.guest_os != HighGuestOs::CustomLinux && detected != Some(profile.guest_os) {
         return Err(error(
             "IMAGE_OS_PROFILE_MISMATCH",
@@ -491,6 +478,98 @@ fn verify_iso(path: &Path, profile: HighOsProfile) -> Result<(), HighImageError>
         ));
     }
     Ok(())
+}
+
+fn inspect_iso_text(inspection: &str) -> (Option<HighGuestOs>, Option<HighImageArchitecture>) {
+    let x86 = ["amd64", "x86_64", "bootx64.efi", "/install.amd/"]
+        .iter()
+        .any(|marker| inspection.contains(marker));
+    let arm = ["arm64", "aarch64", "bootaa64.efi"]
+        .iter()
+        .any(|marker| inspection.contains(marker));
+    let architecture = if x86 {
+        Some(HighImageArchitecture::X86_64)
+    } else if arm {
+        Some(HighImageArchitecture::Aarch64)
+    } else {
+        None
+    };
+    let detected = if inspection.contains("/sources/boot.wim")
+        && (inspection.contains("/sources/install.wim")
+            || inspection.contains("/sources/install.esd"))
+    {
+        Some(HighGuestOs::Windows)
+    } else if inspection.contains("/arch/boot/x86_64/") {
+        Some(HighGuestOs::ArchLinux)
+    } else if inspection.contains("/casper/") {
+        Some(HighGuestOs::Ubuntu)
+    } else if inspection.contains("/install.amd/") {
+        Some(HighGuestOs::Debian)
+    } else {
+        None
+    };
+    (detected, architecture)
+}
+
+pub fn automatic_install_profile(path: &Path) -> Result<HighOsProfile, HighImageError> {
+    let volume = output(
+        Command::new("xorriso")
+            .args(["-indev"])
+            .arg(path)
+            .arg("-pvd_info"),
+        "IMAGE_STRUCTURE_INVALID",
+        "inspection",
+        "xorriso could not read the ISO9660 structure",
+    )?;
+    let listing = output(
+        Command::new("xorriso")
+            .args(["-indev"])
+            .arg(path)
+            .args(["-find", "/", "-type", "f", "-print"]),
+        "IMAGE_STRUCTURE_INVALID",
+        "inspection",
+        "xorriso could not enumerate installation media",
+    )?;
+    let inspection = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&volume.stdout),
+        String::from_utf8_lossy(&listing.stdout)
+    )
+    .to_ascii_lowercase();
+    let (guest_os, architecture) = inspect_iso_text(&inspection);
+    if guest_os == Some(HighGuestOs::Ubuntu) && !inspection.contains("/casper/install-sources.yaml")
+    {
+        return Err(error(
+            "INSTALL_MEDIA_VARIANT_UNSUPPORTED",
+            "inspection",
+            "Ubuntu media lacks casper/install-sources.yaml and is not a verified Subiquity server autoinstall ISO",
+        ));
+    }
+    automatic_profile_for_detected(guest_os, architecture)
+}
+
+fn automatic_profile_for_detected(
+    guest_os: Option<HighGuestOs>,
+    architecture: Option<HighImageArchitecture>,
+) -> Result<HighOsProfile, HighImageError> {
+    if architecture != Some(HighImageArchitecture::X86_64) {
+        return Err(error(
+            "IMAGE_ARCHITECTURE_UNSUPPORTED",
+            "inspection",
+            "automatic ISO installation requires verified x86_64 media",
+        ));
+    }
+    match guest_os {
+        Some(HighGuestOs::Windows) => Ok(HighOsProfile::windows_rdp_legacy_iso()),
+        Some(HighGuestOs::Ubuntu) => Ok(HighOsProfile::ubuntu_iso_ssh()),
+        Some(HighGuestOs::Debian) => Ok(HighOsProfile::debian_iso_ssh()),
+        Some(HighGuestOs::ArchLinux) => Ok(HighOsProfile::arch_linux_iso_ssh()),
+        _ => Err(error(
+            "AUTOMATED_INSTALL_UNSUPPORTED",
+            "installation",
+            "the ISO operating system is unknown or has no verified unattended adapter; interactive installation is required",
+        )),
+    }
 }
 
 fn output(
@@ -576,6 +655,9 @@ mod tests {
         }
         for profile in [
             HighOsProfile::windows_rdp_legacy_iso(),
+            HighOsProfile::ubuntu_iso_ssh(),
+            HighOsProfile::debian_iso_ssh(),
+            HighOsProfile::arch_linux_iso_ssh(),
             HighOsProfile::custom_linux_iso_ssh(),
         ] {
             validate_source_metadata(&source(HighImageFormat::Iso), profile).unwrap();
@@ -638,5 +720,84 @@ mod tests {
         assert_eq!(failure.code, "IMAGE_INTEGRITY_MISMATCH");
         assert!(!failure.to_string().contains("CORRUPT"));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn iso_inspection_detects_supported_operating_systems_and_architecture() {
+        let cases = [
+            ("/casper/vmlinuz /efi/boot/bootx64.efi", HighGuestOs::Ubuntu),
+            ("/install.amd/vmlinuz", HighGuestOs::Debian),
+            ("/arch/boot/x86_64/vmlinuz-linux", HighGuestOs::ArchLinux),
+            (
+                "/sources/boot.wim /sources/install.wim /efi/boot/bootx64.efi",
+                HighGuestOs::Windows,
+            ),
+        ];
+        for (listing, expected) in cases {
+            assert_eq!(
+                inspect_iso_text(&listing.to_ascii_lowercase()),
+                (Some(expected), Some(HighImageArchitecture::X86_64))
+            );
+        }
+    }
+
+    #[test]
+    fn iso_inspection_does_not_guess_unknown_or_arm_media() {
+        assert_eq!(inspect_iso_text("/readme.txt"), (None, None));
+        assert_eq!(
+            inspect_iso_text(
+                "volume id: NIXOS_ISO /nix-store.squashfs /boot/bzImage /efi/boot/bootx64.efi"
+            ),
+            (None, Some(HighImageArchitecture::X86_64))
+        );
+        assert_eq!(
+            inspect_iso_text("/efi/boot/bootaa64.efi /casper/vmlinuz"),
+            (
+                Some(HighGuestOs::Ubuntu),
+                Some(HighImageArchitecture::Aarch64)
+            )
+        );
+    }
+
+    #[test]
+    fn automatic_iso_routing_selects_only_explicit_installers() {
+        assert_eq!(
+            automatic_profile_for_detected(
+                Some(HighGuestOs::Windows),
+                Some(HighImageArchitecture::X86_64)
+            )
+            .unwrap(),
+            HighOsProfile::windows_rdp_legacy_iso()
+        );
+        assert_eq!(
+            automatic_profile_for_detected(
+                Some(HighGuestOs::Ubuntu),
+                Some(HighImageArchitecture::X86_64)
+            )
+            .unwrap(),
+            HighOsProfile::ubuntu_iso_ssh()
+        );
+        assert_eq!(
+            automatic_profile_for_detected(
+                Some(HighGuestOs::Debian),
+                Some(HighImageArchitecture::X86_64)
+            )
+            .unwrap(),
+            HighOsProfile::debian_iso_ssh()
+        );
+        assert_eq!(
+            automatic_profile_for_detected(
+                Some(HighGuestOs::ArchLinux),
+                Some(HighImageArchitecture::X86_64)
+            )
+            .unwrap(),
+            HighOsProfile::arch_linux_iso_ssh()
+        );
+        assert_eq!(
+            automatic_profile_for_detected(None, Some(HighImageArchitecture::X86_64))
+                .unwrap_err()
+                .code,
+            "AUTOMATED_INSTALL_UNSUPPORTED"
+        );
     }
 }

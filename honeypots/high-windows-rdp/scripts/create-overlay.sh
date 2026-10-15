@@ -12,7 +12,8 @@ mkdir -p "$instance_dir"
 password_file="$instance_dir/rdp-password"
 if [ -r "$password_file" ]; then admin_password=$(cat "$password_file"); else admin_password="Hf!$(openssl rand -hex 16)9a"; umask 077; printf '%s\n' "$admin_password" > "$password_file"; fi
 [ -n "$admin_password" ] || { echo 'generated Windows password is empty' >&2; exit 1; }
-sed "s|@@ADMIN_PASSWORD@@|$admin_password|g" "$script_dir/../autounattend.xml" > "$instance_dir/Autounattend.xml"
+hostname="HF-$(printf '%s' "$instance_id" | tr -d '-' | cut -c1-12)"
+sed -e "s|@@ADMIN_PASSWORD@@|$admin_password|g" -e "s|@@HOSTNAME@@|$hostname|g" "$script_dir/../autounattend.xml" > "$instance_dir/Autounattend.xml"
 if grep -q '@@[A-Z0-9_][A-Z0-9_]*@@' "$instance_dir/Autounattend.xml"; then
   echo 'unresolved Windows answer-file marker' >&2
   exit 1

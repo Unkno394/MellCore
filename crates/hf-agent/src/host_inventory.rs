@@ -10,9 +10,10 @@ use std::{
 use anyhow::Context;
 use hf_core::{
     ComponentCapability, CpuInventory, CpuVirtualization, DiskInventory, FilesystemMetric,
-    GpuInventory, HighImageArchitecture, HighImageSource, HighOsProfile, HostDynamicMetrics,
-    HostInventory, HostStaticInventory, MemoryInventory, NetworkInterfaceInventory,
-    NetworkInterfaceMetric, OperatingSystemInventory, VirtualizationInventory,
+    GpuInventory, HighGuestOs, HighImageArchitecture, HighImageKind, HighImageSource,
+    HighOsProfile, HostDynamicMetrics, HostInventory, HostStaticInventory, MemoryInventory,
+    NetworkInterfaceInventory, NetworkInterfaceMetric, OperatingSystemInventory,
+    VirtualizationInventory,
 };
 
 const MAX_ITEMS: usize = 64;
@@ -100,7 +101,7 @@ pub fn render_human(inventory: &HostInventory) -> String {
     format!(
         concat!(
             "OS: {} {} (kernel {})\n",
-            "CPU: {} {} [{}], cores {}, threads {}, max {} MHz\n",
+            "CPU: {} {} [{}], cores {}, threads {}, reported {} MHz\n",
             "RAM: {} total, {} available; swap: {} total, {} used\n",
             "Load: {}/{}/{}; CPU: {}%; uptime: {} s\n",
             "Storage: {} block devices, {} mounted filesystems\n",
@@ -219,6 +220,33 @@ pub fn validate_high_vm_host(
             "HF_HIGH_ERROR code=LIBVIRT_UNAVAILABLE stage=compatibility: virsh/libvirt is not installed"
         );
     }
+    if profile.image_kind == HighImageKind::InstallMediaAndDisk {
+        let minimum_ram = if profile.guest_os == HighGuestOs::Windows {
+            5 * 1024 * 1024 * 1024_u64
+        } else {
+            3 * 1024 * 1024 * 1024_u64
+        };
+        if inventory
+            .memory
+            .ram_total_bytes
+            .is_some_and(|total| total < minimum_ram)
+        {
+            anyhow::bail!(
+                "HF_HIGH_ERROR code=HOST_MEMORY_INSUFFICIENT stage=compatibility: unattended {:?} installation requires at least {} GiB host RAM",
+                profile.guest_os,
+                minimum_ram / 1024 / 1024 / 1024
+            );
+        }
+        if inventory
+            .cpu
+            .logical_threads
+            .is_some_and(|threads| threads < 2)
+        {
+            anyhow::bail!(
+                "HF_HIGH_ERROR code=HOST_CPU_INSUFFICIENT stage=compatibility: unattended installation requires at least two logical CPU threads"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -324,20 +352,34 @@ fn parse_cpu(cpuinfo: &str, flags: &[String]) -> CpuInventory {
 }
 
 fn cpu_flags(cpuinfo: &str) -> Vec<String> {
-    let fields = parse_first_cpu_fields(cpuinfo);
-    let mut flags = fields
-        .get("flags")
-        .or_else(|| fields.get("Features"))
-        .map(|value| {
-            value
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
+    let mut flags = cpuinfo
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            matches!(key.trim(), "flags" | "Features").then_some(value)
         })
-        .unwrap_or_default();
-    flags.sort();
-    flags.dedup();
+        .flat_map(str::split_whitespace)
+        .map(str::to_ascii_lowercase)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let virtualization_flags = ["svm", "vmx"]
+        .into_iter()
+        .filter_map(|flag| {
+            flags
+                .iter()
+                .any(|candidate| candidate == flag)
+                .then_some(flag.to_owned())
+        })
+        .collect::<Vec<_>>();
     flags.truncate(MAX_CPU_FLAGS);
+    let missing_virtualization_flags = virtualization_flags
+        .into_iter()
+        .filter(|flag| !flags.contains(flag))
+        .collect::<Vec<_>>();
+    flags.truncate(MAX_CPU_FLAGS.saturating_sub(missing_virtualization_flags.len()));
+    flags.extend(missing_virtualization_flags);
+    flags.sort();
     flags
 }
 
@@ -373,12 +415,16 @@ fn collect_disks(root: &Path) -> Vec<DiskInventory> {
                 return None;
             }
             let path = entry.path();
+            let size_bytes = read_path(path.join("size"))
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(|sectors| sectors.saturating_mul(512));
+            if name.starts_with("nbd") && size_bytes == Some(0) {
+                return None;
+            }
             Some(DiskInventory {
                 name,
                 model: read_path(path.join("device/model")).map(|value| clean(&value)),
-                size_bytes: read_path(path.join("size"))
-                    .and_then(|value| value.trim().parse::<u64>().ok())
-                    .map(|sectors| sectors.saturating_mul(512)),
+                size_bytes,
                 rotational: read_bool(path.join("queue/rotational")),
                 removable: read_bool(path.join("removable")),
             })
@@ -540,13 +586,7 @@ fn collect_os(root: &Path) -> OperatingSystemInventory {
 }
 
 fn collect_virtualization(root: &Path, flags: &[String]) -> VirtualizationInventory {
-    let cpu_virtualization = if flags.iter().any(|flag| flag == "vmx") {
-        Some(CpuVirtualization::IntelVtx)
-    } else if flags.iter().any(|flag| flag == "svm") {
-        Some(CpuVirtualization::AmdV)
-    } else {
-        None
-    };
+    let cpu_virtualization = cpu_virtualization(flags);
     let kvm_path = root.join("dev/kvm");
     let kvm_installed = kvm_path.exists();
     let kvm_usable = if root == Path::new("/") && kvm_installed {
@@ -617,6 +657,16 @@ fn collect_virtualization(root: &Path, flags: &[String]) -> VirtualizationInvent
         },
         nested_virtualization,
         guest_architectures: qemu_arches,
+    }
+}
+
+fn cpu_virtualization(flags: &[String]) -> Option<CpuVirtualization> {
+    if flags.iter().any(|flag| flag == "vmx") {
+        Some(CpuVirtualization::IntelVtx)
+    } else if flags.iter().any(|flag| flag == "svm") {
+        Some(CpuVirtualization::AmdV)
+    } else {
+        None
     }
 }
 
@@ -768,6 +818,8 @@ mod tests {
             "proc/sys/kernel",
             "etc",
             "sys/class/net/eth0/statistics",
+            "sys/block/nbd0",
+            "sys/block/nbd1",
             "sys/block/vda/queue",
             "sys/block/vda/device",
             "sys/module/kvm_intel/parameters",
@@ -799,6 +851,8 @@ mod tests {
         write("sys/class/net/eth0/mtu", "1500\n");
         write("sys/class/net/eth0/statistics/rx_bytes", "100\n");
         write("sys/class/net/eth0/statistics/tx_bytes", "200\n");
+        write("sys/block/nbd0/size", "0\n");
+        write("sys/block/nbd1/size", "4096\n");
         write("sys/block/vda/size", "2048\n");
         write("sys/block/vda/queue/rotational", "0\n");
         write("sys/block/vda/removable", "0\n");
@@ -815,7 +869,14 @@ mod tests {
         assert_eq!(static_info.cpu.vendor.as_deref(), Some("GenuineIntel"));
         assert_eq!(static_info.cpu.logical_threads, Some(2));
         assert_eq!(static_info.memory.ram_total_bytes, Some(8 * 1024 * 1024));
-        assert_eq!(static_info.disks[0].size_bytes, Some(2048 * 512));
+        assert_eq!(
+            static_info
+                .disks
+                .iter()
+                .find(|disk| disk.name == "vda")
+                .and_then(|disk| disk.size_bytes),
+            Some(2048 * 512)
+        );
         assert_eq!(
             static_info.virtualization.cpu_virtualization,
             Some(CpuVirtualization::IntelVtx)
@@ -831,6 +892,45 @@ mod tests {
     }
 
     #[test]
+    fn detects_amd_v_from_svm_across_cpu_records() {
+        let flags = cpu_flags(
+            "processor: 0\nvendor_id: AuthenticAMD\n\nprocessor: 1\nflags: fpu sse svm\n",
+        );
+
+        assert!(flags.iter().any(|flag| flag == "svm"));
+        assert_eq!(cpu_virtualization(&flags), Some(CpuVirtualization::AmdV));
+    }
+
+    #[test]
+    fn detects_intel_vt_x_from_vmx_across_cpu_records() {
+        let flags = cpu_flags(
+            "processor: 0\nvendor_id: GenuineIntel\n\nprocessor: 1\nflags: fpu sse VMX\n",
+        );
+
+        assert!(flags.iter().any(|flag| flag == "vmx"));
+        assert_eq!(
+            cpu_virtualization(&flags),
+            Some(CpuVirtualization::IntelVtx)
+        );
+    }
+
+    #[test]
+    fn filters_empty_nbd_but_keeps_an_in_use_nbd() {
+        let root = fixture();
+        let disks = collect_disks(&root);
+
+        assert!(!disks.iter().any(|disk| disk.name == "nbd0"));
+        assert_eq!(
+            disks
+                .iter()
+                .find(|disk| disk.name == "nbd1")
+                .and_then(|disk| disk.size_bytes),
+            Some(4096 * 512)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_known_incompatible_high_host() {
         let mut inventory = HostStaticInventory::default();
         inventory.cpu.architecture = "x86_64".into();
@@ -841,6 +941,20 @@ mod tests {
         let error =
             validate_high_vm_host(HighOsProfile::debian_ssh(), None, &inventory).unwrap_err();
         assert!(error.to_string().contains("HOST_ARCHITECTURE_UNSUPPORTED"));
+    }
+
+    #[test]
+    fn unattended_iso_install_checks_host_resources() {
+        let mut inventory = HostStaticInventory::default();
+        inventory.cpu.architecture = "x86_64".into();
+        inventory.cpu.logical_threads = Some(2);
+        inventory.memory.ram_total_bytes = Some(2 * 1024 * 1024 * 1024);
+        inventory.virtualization.kvm.usable = Some(true);
+        inventory.virtualization.qemu.installed = Some(true);
+        inventory.virtualization.libvirt.installed = Some(true);
+        let error =
+            validate_high_vm_host(HighOsProfile::ubuntu_iso_ssh(), None, &inventory).unwrap_err();
+        assert!(error.to_string().contains("HOST_MEMORY_INSUFFICIENT"));
     }
 
     #[test]
