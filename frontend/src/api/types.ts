@@ -87,6 +87,45 @@ export type TokenResponse = {
   expires_in: number
 }
 
+export type PermissionInfo = { key: string; category: string; description: string }
+export type RbacRole = {
+  id: string
+  name: string
+  description: string
+  system_key: 'owner' | 'admin' | 'analyst' | 'operator' | 'viewer' | null
+  is_system: boolean
+  created_at: string
+  updated_at: string
+}
+export type RoleView = RbacRole & { permissions: string[]; user_count: number }
+export type EffectiveAccess = { user_id: string; roles: RbacRole[]; permissions: string[] }
+export type RoleInput = { name: string; description: string; permissions: string[] }
+export type MeResponse = { user: User; roles: RbacRole[]; permissions: string[] }
+export type Invitation = {
+  id: string
+  email: string
+  created_by: string
+  creator_name: string
+  roles: RbacRole[]
+  status: 'pending' | 'accepted' | 'revoked' | 'expired'
+  created_at: string
+  expires_at: string
+  accepted_at: string | null
+  revoked_at: string | null
+}
+export type InvitationCreated = { invitation: Invitation; invite_url: string }
+export type AuditEntry = {
+  id: string
+  actor_id: string | null
+  actor_name: string | null
+  actor_email: string | null
+  action: string
+  object_id: string
+  request_id: string
+  details: Record<string, unknown>
+  created_at: string
+}
+
 export type ProfileInput = {
   name: string
   description: string

@@ -12,7 +12,7 @@ type Props = {
   profiles: Profile[]
   servers: Server[]
   traps: Trap[]
-  readOnly: boolean
+  permissions: string[]
   onChanged: () => Promise<void>
   onShowAttacks: (trapId: string) => void
   notify: ToastNotify
@@ -24,6 +24,7 @@ type Subview = 'list' | 'add-server' | 'add-trap'
 type PendingAction = { serverId: string; actionId: string } | null
 
 export default function Infrastructure(props: Props) {
+  const can = (permission: string) => props.permissions.includes(permission)
   const [tab, setTab] = useState<Tab>('servers')
   const [subview, setSubview] = useState<Subview>('list')
   const [selectedServer, setSelectedServer] = useState('all')
@@ -205,14 +206,14 @@ export default function Infrastructure(props: Props) {
     {subview !== 'list' && <button type="button" onClick={() => setSubview('list')} className="text-sm text-white/50 hover:text-orange-100">← К инфраструктуре</button>}
 
     {subview === 'list' && <div className="flex flex-wrap items-center gap-2">
-      <button type="button" disabled={props.readOnly} onClick={() => setSubview('add-server')} className="rounded-lg border border-orange-500/30 bg-orange-500/10 px-4 py-2 text-sm text-orange-100 disabled:opacity-40"><span className="mr-2 inline-block whitespace-nowrap font-mono">＋</span>Добавить сервер</button>
-      <button type="button" disabled={props.readOnly} onClick={() => setSubview('add-trap')} className="rounded-lg border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/75 hover:border-orange-500/30 disabled:opacity-40"><span className="mr-2 inline-block whitespace-nowrap font-mono">＋</span>Добавить ловушку</button>
-      {tab === 'servers' && failedServers.length > 0 && <button type="button" disabled={props.readOnly || busy || Boolean(pending)} onClick={() => void removeFailed()} className="rounded-lg border border-red-400/20 px-4 py-2 text-sm text-red-200/80 hover:bg-red-400/5 disabled:opacity-40">Удалить неподключённые · {failedServers.length}</button>}
+      <button type="button" disabled={!can('servers.connect')} onClick={() => setSubview('add-server')} className="rounded-lg border border-orange-500/30 bg-orange-500/10 px-4 py-2 text-sm text-orange-100 disabled:opacity-40"><span className="mr-2 inline-block whitespace-nowrap font-mono">＋</span>Добавить сервер</button>
+      <button type="button" disabled={!can('traps.create')} onClick={() => setSubview('add-trap')} className="rounded-lg border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/75 hover:border-orange-500/30 disabled:opacity-40"><span className="mr-2 inline-block whitespace-nowrap font-mono">＋</span>Добавить ловушку</button>
+      {tab === 'servers' && failedServers.length > 0 && <button type="button" disabled={!can('servers.disconnect') || busy || Boolean(pending)} onClick={() => void removeFailed()} className="rounded-lg border border-red-400/20 px-4 py-2 text-sm text-red-200/80 hover:bg-red-400/5 disabled:opacity-40">Удалить неподключённые · {failedServers.length}</button>}
     </div>}
 
-    {subview === 'add-server' && <ConnectServer api={props.api} readOnly={props.readOnly} onChanged={props.onChanged} notify={props.notify}/>}
-    {subview === 'add-trap' && <CreateHoneypot api={props.api} profiles={props.profiles} servers={props.servers.filter((server) => presence[server.server_id]?.connected === true)} traps={props.traps} readOnly={props.readOnly} onCreated={props.onChanged} notify={props.notify} dismissToast={props.dismissToast}/>}
-    {subview === 'list' && tab === 'traps' && <Honeypots api={props.api} traps={props.traps} servers={props.servers} readOnly={props.readOnly} onChanged={props.onChanged} onShowAttacks={props.onShowAttacks} initialServerFilter={selectedServer}/>}
+    {subview === 'add-server' && <ConnectServer api={props.api} readOnly={!can('servers.connect')} onChanged={props.onChanged} notify={props.notify}/>}
+    {subview === 'add-trap' && <CreateHoneypot api={props.api} profiles={props.profiles} servers={props.servers.filter((server) => presence[server.server_id]?.connected === true)} traps={props.traps} readOnly={!can('traps.create')} onCreated={props.onChanged} notify={props.notify} dismissToast={props.dismissToast}/>}
+    {subview === 'list' && tab === 'traps' && <Honeypots api={props.api} traps={props.traps} servers={props.servers} permissions={props.permissions} onChanged={props.onChanged} onShowAttacks={props.onShowAttacks} initialServerFilter={selectedServer}/>}
     {subview === 'list' && tab === 'servers' && <section className="overflow-hidden rounded-xl border border-white/10 bg-[#160e0c]/75">
       {props.servers.length === 0 ? <div className="p-8 text-center text-sm text-white/45">Подключённых серверов пока нет. Добавьте сервер, чтобы установить агент.</div> : <div className="divide-y divide-white/5">
         {props.servers.map((server) => {
@@ -227,9 +228,9 @@ export default function Infrastructure(props: Props) {
               <button type="button" onClick={() => { setSelectedServer(server.server_id); setTab('traps') }} className="mt-2 text-xs text-orange-200/75 hover:text-orange-100">Ловушки на сервере: {count} →</button>
             </div>
             <div className="flex shrink-0 flex-wrap gap-2">
-              {connected && !canReboot && <button type="button" disabled={props.readOnly || busy || Boolean(pending)} onClick={() => showAgentUpdateInstructions(server)} className="rounded-lg border border-amber-400/20 px-3 py-2 text-xs text-amber-100/80 hover:bg-amber-400/5 disabled:opacity-40">Как обновить агента</button>}
-              <button type="button" title={connected && !canReboot ? 'Обновите hf-agent на этом сервере для перезагрузки из панели' : undefined} disabled={props.readOnly || busy || Boolean(pending) || !canReboot} onClick={() => void reboot(server)} className="rounded-lg border border-white/10 px-3 py-2 text-xs text-white/70 hover:border-orange-400/30 hover:text-orange-100 disabled:opacity-40">{inProgress ? 'Перезагрузка…' : 'Перезагрузить'}</button>
-              <button type="button" disabled={props.readOnly || busy || Boolean(pending)} onClick={() => void remove(server)} className="rounded-lg border border-red-400/20 px-3 py-2 text-xs text-red-200/80 hover:bg-red-400/5 disabled:opacity-40">{server.status === 'error' || server.status === 'unknown' ? 'Удалить запись' : 'Удалить сервер'}</button>
+              {connected && !canReboot && <button type="button" disabled={!can('servers.manage') || busy || Boolean(pending)} onClick={() => showAgentUpdateInstructions(server)} className="rounded-lg border border-amber-400/20 px-3 py-2 text-xs text-amber-100/80 hover:bg-amber-400/5 disabled:opacity-40">Как обновить агента</button>}
+              <button type="button" title={connected && !canReboot ? 'Обновите hf-agent на этом сервере для перезагрузки из панели' : undefined} disabled={!can('servers.manage') || busy || Boolean(pending) || !canReboot} onClick={() => void reboot(server)} className="rounded-lg border border-white/10 px-3 py-2 text-xs text-white/70 hover:border-orange-400/30 hover:text-orange-100 disabled:opacity-40">{inProgress ? 'Перезагрузка…' : 'Перезагрузить'}</button>
+              <button type="button" disabled={!can('servers.disconnect') || busy || Boolean(pending)} onClick={() => void remove(server)} className="rounded-lg border border-red-400/20 px-3 py-2 text-xs text-red-200/80 hover:bg-red-400/5 disabled:opacity-40">{server.status === 'error' || server.status === 'unknown' ? 'Удалить запись' : 'Удалить сервер'}</button>
             </div>
           </article>
         })}

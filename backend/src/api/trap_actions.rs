@@ -84,7 +84,7 @@ pub async fn share_port(
     Path(trap_id): Path<Uuid>,
     Json(input): Json<SharePortRequest>,
 ) -> Result<(StatusCode, Json<TrapActionProgress>), AppError> {
-    resources::owned_tx(state.pool()?, &principal)
+    resources::owned_tx(state.pool()?, &principal, "traps.edit")
         .await?
         .commit()
         .await?;
@@ -565,10 +565,8 @@ pub async fn start(
     Extension(request_id): Extension<RequestId>,
     Json(input): Json<TrapActionRequest>,
 ) -> Result<(StatusCode, Json<TrapActionProgress>), AppError> {
-    resources::owned_tx(state.pool()?, &principal)
-        .await?
-        .commit()
-        .await?;
+    let permission = match input.action { TrapAction::Start => "traps.start", TrapAction::Stop => "traps.stop", TrapAction::Restart => "traps.reset", TrapAction::Remove => "traps.delete" };
+    resources::owned_tx(state.pool()?, &principal, permission).await?.commit().await?;
     let trap = resources::traps::get(state.pool()?, &principal, trap_id).await?;
     let agent_id: Uuid = sqlx::query_scalar("SELECT cas.agent_id FROM traps t JOIN center_agent_servers cas ON cas.server_id=t.server_id JOIN servers s ON s.server_id=t.server_id AND s.user_id=t.user_id WHERE t.trap_id=$1 AND t.user_id=$2")
         .bind(trap_id).bind(principal.user.id).fetch_optional(state.pool()?).await?.ok_or_else(AppError::not_found)?;
@@ -595,7 +593,7 @@ pub async fn start(
     // hold the server row lock here: Center's deployment handler calls back into
     // /internal/v1/center/traps and must lock this same server row before it can
     // queue the command.
-    let mut tx = resources::owned_tx(state.pool()?, &principal).await?;
+    let mut tx = resources::owned_tx(state.pool()?, &principal, permission).await?;
     resources::servers::lock_operation(&mut tx, trap.server_id).await?;
     let deletion_pending: bool = sqlx::query_scalar(
         "SELECT deletion_pending FROM servers WHERE server_id=$1 AND user_id=$2",
@@ -677,7 +675,7 @@ pub async fn status(
     Path((trap_id, action_id)): Path<(Uuid, Uuid)>,
     Extension(request_id): Extension<RequestId>,
 ) -> Result<Json<TrapActionProgress>, AppError> {
-    resources::owned_tx(state.pool()?, &principal)
+    resources::owned_tx(state.pool()?, &principal, "traps.view")
         .await?
         .commit()
         .await?;

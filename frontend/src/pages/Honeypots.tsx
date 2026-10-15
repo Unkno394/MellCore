@@ -8,7 +8,7 @@ type Props = {
   api: MellCoreApi
   traps: Trap[]
   servers: Server[]
-  readOnly: boolean
+  permissions: string[]
   onChanged: () => Promise<void>
   onShowAttacks: (trapId: string) => void
   initialServerFilter?: string
@@ -30,7 +30,7 @@ function serverTitle(server: Server | undefined) {
   return server ? `${server.name} · ${server.host}` : 'Сервер не найден'
 }
 
-export default function Honeypots({ api, traps, servers, readOnly, onChanged, onShowAttacks, initialServerFilter = 'all' }: Props) {
+export default function Honeypots({ api, traps, servers, permissions, onChanged, onShowAttacks, initialServerFilter = 'all' }: Props) {
   const [search, setSearch] = useState('')
   const [typeFilter, setTypeFilter] = useState('all')
   const [serverFilter, setServerFilter] = useState(initialServerFilter)
@@ -52,7 +52,9 @@ export default function Honeypots({ api, traps, servers, readOnly, onChanged, on
       && (stateFilter === 'all' || trap.actual_state === stateFilter)
   }), [traps, search, typeFilter, serverFilter, stateFilter, serverNames])
   const selected = filtered.find((trap) => trap.trap_id === selectedId) ?? filtered[0] ?? null
-  const actionsDisabled = Boolean(busyAction) || deletingRegistration || readOnly || selected?.actual_state === 'installing'
+  const permissionFor: Record<TrapAction, string> = { start: 'traps.start', stop: 'traps.stop', restart: 'traps.reset', remove: 'traps.delete' }
+  const canAction = (action: TrapAction) => permissions.includes(permissionFor[action])
+  const actionsDisabled = Boolean(busyAction) || deletingRegistration || selected?.actual_state === 'installing'
 
   useEffect(() => {
     if (!pending) return
@@ -88,7 +90,7 @@ export default function Honeypots({ api, traps, servers, readOnly, onChanged, on
   }, [api, onChanged, pending])
 
   async function runAction(action: TrapAction) {
-    if (!selected || readOnly || busyAction) return
+    if (!selected || !canAction(action) || busyAction) return
     if (action === 'remove' && !window.confirm(`Остановить и удалить ловушку «${selected.name}» с сервера?`)) return
     setError('')
     setMessage('')
@@ -104,7 +106,7 @@ export default function Honeypots({ api, traps, servers, readOnly, onChanged, on
   }
 
   async function deleteUnusedRegistration() {
-    if (!selected || !['unknown', 'removed'].includes(selected.actual_state) || readOnly || deletingRegistration) return
+    if (!selected || !['unknown', 'removed'].includes(selected.actual_state) || !permissions.includes('traps.delete') || deletingRegistration) return
     const warning = selected.actual_state === 'unknown'
       ? `Удалить запись «${selected.name}»? Делайте это только если ловушка не запущена на сервере.`
       : `Убрать запись удалённой ловушки «${selected.name}» из панели?`
@@ -161,26 +163,26 @@ export default function Honeypots({ api, traps, servers, readOnly, onChanged, on
               </div>
               <div className="mt-3 grid grid-cols-2 gap-2">
                 {selected.actual_state === 'removed' ? (
-                  <ActionButton label={deletingRegistration ? 'Убираю запись…' : 'Убрать запись'} disabled={actionsDisabled} onClick={() => void deleteUnusedRegistration()} tone="red"/>
+                  <ActionButton label={deletingRegistration ? 'Убираю запись…' : 'Убрать запись'} disabled={actionsDisabled || !permissions.includes('traps.delete')} onClick={() => void deleteUnusedRegistration()} tone="red"/>
                 ) : <>
-                  {selected.actual_state !== 'running' && <ActionButton label="Запустить" disabled={actionsDisabled} onClick={() => void runAction('start')} tone="green"/>}
-                  {selected.actual_state === 'running' && <ActionButton label="Остановить" disabled={actionsDisabled} onClick={() => void runAction('stop')}/>}
-                  {selected.actual_state === 'running' && <ActionButton label="Перезапустить" disabled={actionsDisabled} onClick={() => void runAction('restart')}/>}
+                  {selected.actual_state !== 'running' && <ActionButton label="Запустить" disabled={actionsDisabled || !canAction('start')} onClick={() => void runAction('start')} tone="green"/>}
+                  {selected.actual_state === 'running' && <ActionButton label="Остановить" disabled={actionsDisabled || !canAction('stop')} onClick={() => void runAction('stop')}/>}
+                  {selected.actual_state === 'running' && <ActionButton label="Перезапустить" disabled={actionsDisabled || !canAction('restart')} onClick={() => void runAction('restart')}/>}
                   {selected.actual_state === 'unknown'
-                    ? <ActionButton label={deletingRegistration ? 'Убираю запись…' : 'Убрать запись'} disabled={actionsDisabled} onClick={() => void deleteUnusedRegistration()} tone="red"/>
-                    : <ActionButton label="Удалить" disabled={actionsDisabled} onClick={() => void runAction('remove')} tone="red"/>}
+                    ? <ActionButton label={deletingRegistration ? 'Убираю запись…' : 'Убрать запись'} disabled={actionsDisabled || !permissions.includes('traps.delete')} onClick={() => void deleteUnusedRegistration()} tone="red"/>
+                    : <ActionButton label="Удалить" disabled={actionsDisabled || !canAction('remove')} onClick={() => void runAction('remove')} tone="red"/>}
                 </>}
               </div>
               {busyAction && <p role="status" className="mt-3 text-xs text-orange-200/70">{pending ? `Ожидаю подтверждение: ${actionText[busyAction].toLowerCase()}…` : 'Отправляю команду агенту…'}</p>}
               {error && <p role="alert" className="mt-3 text-xs text-red-300">{error}</p>}
               {message && !error && <p role="status" className="mt-3 text-xs text-emerald-200/75">{message}</p>}
-              {readOnly && <p className="mt-3 text-xs text-white/35">У вас доступ только для просмотра.</p>}
+              {!(['start', 'stop', 'restart', 'remove'] as TrapAction[]).some(canAction) && <p className="mt-3 text-xs text-white/35">Команды недоступны: роль допускает только просмотр.</p>}
             </section>
           </div>
         </> : <div className="flex min-h-64 flex-col items-center justify-center p-8 text-center"><div className="text-sm text-white/50">Выберите ловушку в таблице</div><p className="mt-2 text-xs text-white/30">Здесь появятся конфигурация, лимиты и команды управления.</p></div>}
       </aside>
     </div>
-    {selected && <SharedPortControl api={api} traps={traps} selected={selected} readOnly={readOnly} onChanged={onChanged}/>}
+    {selected && <SharedPortControl api={api} traps={traps} selected={selected} readOnly={!permissions.includes('traps.edit')} onChanged={onChanged}/>}
   </section>
 }
 

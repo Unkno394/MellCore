@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -17,7 +18,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
 
-use crate::{api::AppState, errors::AppError, management::User, models::Role};
+use crate::{api::AppState, errors::AppError, management::User};
 
 pub struct AuthRuntime {
     slots: Arc<Semaphore>,
@@ -176,14 +177,19 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, AppError> {
 pub struct Principal {
     pub user: User,
     pub token_id: Uuid,
+    pub permissions: HashSet<String>,
 }
 
 impl Principal {
-    pub fn require_admin(&self) -> Result<(), AppError> {
-        if self.user.role != Role::Admin {
+    pub fn require(&self, permission: &str) -> Result<(), AppError> {
+        if !self.permissions.contains(permission) {
             return Err(AppError::forbidden());
         }
         Ok(())
+    }
+
+    pub fn require_admin(&self) -> Result<(), AppError> {
+        self.require("users.manage")
     }
 }
 
@@ -201,9 +207,13 @@ impl FromRequestParts<AppState> for Principal {
         if state.config.require_email_verification && user.email_verified_at.is_none() {
             return Err(AppError::email_unverified());
         }
+        // JWTs carry identity only. Resolve current permissions on every
+        // request so role changes are immediate and default-deny.
+        let permissions = crate::rbac::effective_permissions(state.pool()?, user.id).await?;
         Ok(Self {
             user,
             token_id: claims.jti,
+            permissions,
         })
     }
 }

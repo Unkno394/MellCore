@@ -2,6 +2,7 @@ import { ApiClient } from './client'
 import type {
   AttackEvent,
   AttackGraphMatch,
+  AuditEntry,
   BaitEngagement,
   BootstrapProgress,
   BootstrapServerInput,
@@ -10,6 +11,13 @@ import type {
   PortReservation,
   Profile,
   ProfileInput,
+  EffectiveAccess,
+  Invitation,
+  InvitationCreated,
+  MeResponse,
+  PermissionInfo,
+  RoleInput,
+  RoleView,
   Server,
   ServerPresence,
   DeleteServerResult,
@@ -40,7 +48,12 @@ export function createApi(client: ApiClient) {
           method: 'POST',
           body: { name, email, password },
         }),
-      me: () => client.request<{ user: User }>('/auth/me'),
+      acceptInvitation: (token: string, name: string, password: string) =>
+        client.request<User>('/auth/accept-invitation', {
+          method: 'POST',
+          body: { token, name, password },
+        }),
+      me: () => client.request<MeResponse>('/auth/me'),
       logout: () => client.request<void>('/auth/logout', { method: 'POST' }),
       forgotPassword: (email: string) =>
         client.request<{ message: string }>('/auth/forgot-password', {
@@ -72,6 +85,33 @@ export function createApi(client: ApiClient) {
           method: 'POST',
           body: { current_password: currentPassword, new_password: newPassword },
         }),
+    },
+    users: {
+      list: () => collectPages<User>(client, '/users'),
+      access: (id: string) => client.request<EffectiveAccess>(`/users/${id}/permissions`),
+      assignRoles: (id: string, roleIds: string[]) =>
+        client.request<EffectiveAccess>(`/users/${id}/roles`, { method: 'PUT', body: { role_ids: roleIds } }),
+    },
+    roles: {
+      permissions: () => client.request<PermissionInfo[]>('/permissions'),
+      list: () => client.request<RoleView[]>('/roles'),
+      create: (input: RoleInput) => client.request<RoleView>('/roles', { method: 'POST', body: input }),
+      update: (id: string, input: RoleInput) => client.request<RoleView>(`/roles/${id}`, { method: 'PUT', body: input }),
+      copy: (id: string, name: string, description?: string) =>
+        client.request<RoleView>(`/roles/${id}/copy`, { method: 'POST', body: { name, description } }),
+      delete: (id: string) => client.request<void>(`/roles/${id}`, { method: 'DELETE' }),
+    },
+    invitations: {
+      list: () => client.request<Invitation[]>('/invitations'),
+      create: (email: string, roleIds: string[], expiresInHours = 72) =>
+        client.request<InvitationCreated>('/invitations', {
+          method: 'POST',
+          body: { email, role_ids: roleIds, expires_in_hours: expiresInHours },
+        }),
+      revoke: (id: string) => client.request<void>(`/invitations/${id}`, { method: 'DELETE' }),
+    },
+    audit: {
+      roles: (limit = 50) => client.request<AuditEntry[]>(`/audit/roles?limit=${limit}`),
     },
     profiles: {
       list: () => collectPages<Profile>(client, '/profiles'),

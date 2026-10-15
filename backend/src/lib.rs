@@ -1,4 +1,5 @@
 pub mod api;
+pub mod access_admin;
 pub mod attack_graph;
 pub mod auth;
 pub mod config;
@@ -11,6 +12,7 @@ pub mod telemetry;
 pub mod password_reset;
 
 pub mod infrastructure;
+pub mod rbac;
 pub mod resources;
 
 pub mod dispatcher;

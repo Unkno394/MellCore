@@ -138,7 +138,7 @@ pub async fn delete(
     Path(id): Path<Uuid>,
     Extension(request): Extension<RequestId>,
 ) -> Result<Json<DeleteServerResult>, AppError> {
-    let mut tx = resources::owned_tx(state.pool()?, &principal).await?;
+    let mut tx = resources::owned_tx(state.pool()?, &principal, "servers.disconnect").await?;
     resources::servers::lock(&mut tx, principal.user.id, id).await?;
     let has_traps: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM traps WHERE server_id=$1 AND user_id=$2 AND actual_state <> 'removed')")
         .bind(id).bind(principal.user.id).fetch_one(&mut *tx).await?;
@@ -268,7 +268,7 @@ pub async fn delete(
     }
 
     let delete_result: Result<(), AppError> = async {
-        let mut tx = resources::owned_tx(state.pool()?, &principal).await?;
+        let mut tx = resources::owned_tx(state.pool()?, &principal, "servers.disconnect").await?;
         resources::servers::lock(&mut tx, principal.user.id, id).await?;
         let has_traps: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM traps WHERE server_id=$1 AND user_id=$2 AND actual_state <> 'removed')")
             .bind(id).bind(principal.user.id).fetch_one(&mut *tx).await?;

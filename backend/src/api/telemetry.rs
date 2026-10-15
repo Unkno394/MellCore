@@ -169,6 +169,7 @@ pub async fn list(
     Path(trap_id): Path<Uuid>,
     Query(query): Query<EventQuery>,
 ) -> Result<Json<AttackEventPage>, AppError> {
+    principal.require("telemetry.view")?;
     let limit = match query.limit.unwrap_or(50) {
         value @ 1..=100 => value as usize,
         _ => return Err(AppError::invalid("Limit must be between 1 and 100")),
@@ -259,6 +260,7 @@ pub async fn list_attack_matches(
     principal: Principal,
     Path(trap_id): Path<Uuid>,
 ) -> Result<Json<Vec<AttackGraphMatch>>, AppError> {
+    principal.require("attacks.analyze")?;
     let pool = state.pool()?;
     crate::resources::traps::get(pool, &principal, trap_id).await?;
     let rows = sqlx::query("SELECT gp.agent_id,gp.technique_id,gp.session_key,split_part(gp.session_key,':',1) AS evidence_domain,t.technique_key,t.name,gp.status,gp.similarity,gp.active_nodes,gp.evidence_event_ids,gp.node_evidence,gp.last_occurred_at,gp.updated_at FROM attack_graph_progress gp JOIN attack_techniques t USING(technique_id) WHERE gp.trap_id=$1 ORDER BY gp.updated_at DESC LIMIT 100")
@@ -443,7 +445,7 @@ pub async fn list_graph_proposals(
     State(state): State<AppState>,
     principal: Principal,
 ) -> Result<Json<Vec<AttackGraphProposal>>, AppError> {
-    principal.require_admin()?;
+    principal.require("graph.view")?;
     let rows = sqlx::query("SELECT proposal_id,action_kind,process_class,resource_class,outcome,sample_event_id,evidence_count,suggested_technique,first_seen,last_seen FROM attack_graph_proposals WHERE status='pending' ORDER BY evidence_count DESC,last_seen DESC LIMIT 100")
         .fetch_all(state.pool()?).await?;
     use sqlx::Row;
@@ -475,7 +477,7 @@ pub async fn review_graph_proposal(
     Path(proposal_id): Path<Uuid>,
     Json(input): Json<ReviewGraphProposal>,
 ) -> Result<Json<ReviewGraphResult>, AppError> {
-    principal.require_admin()?;
+    principal.require("graph.manage")?;
     if !matches!(input.decision.as_str(), "accept" | "reject") {
         return Err(AppError::invalid("Decision must be accept or reject"));
     }

@@ -167,6 +167,7 @@ pub async fn start(
     Extension(request): Extension<RequestId>,
     Json(mut input): Json<BootstrapServerInput>,
 ) -> Result<(StatusCode, Json<BootstrapProgress>), AppError> {
+    principal.require("servers.connect")?;
     validate_auth(&input)?;
     input.server.validate()?;
     if input.server.credential_ref.is_some() || input.server.dispatcher_port.is_some() {
@@ -267,6 +268,7 @@ pub async fn status(
     principal: Principal,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<BootstrapProgress>, AppError> {
+    principal.require("servers.view")?;
     let row = sqlx::query(
         "SELECT j.job_id,j.agent_id,j.status,j.message,j.created_at FROM server_bootstrap_jobs j JOIN servers s ON s.server_id=j.server_id WHERE j.server_id=$1 AND s.user_id=$2"
     ).bind(server_id).bind(principal.user.id).fetch_optional(state.pool()?).await?

@@ -5,7 +5,7 @@ use crate::{
     auth::Principal,
     errors::AppError,
     management::{self, Page, Profile},
-    models::{ActualState, Role},
+    models::ActualState,
 };
 use chrono::{DateTime, Utc};
 use hf_core::ContainerResourceLimits as AgentContainerResourceLimits;
@@ -358,22 +358,24 @@ impl TrapInput {
     }
 }
 
-/// Lock account before the server row; current role/token are rechecked on writes.
-/// No role bypasses ownership; Viewer preserves the existing read-only contract.
+/// Lock account before the resource row and recheck the current token on writes.
+/// Permission checks are performed by each operation; ownership remains strict.
 pub async fn owned_tx<'a>(
     pool: &'a PgPool,
     principal: &Principal,
+    permission: &str,
 ) -> Result<Transaction<'a, Postgres>, AppError> {
     let mut tx = pool.begin().await?;
-    let role: Role =
-        sqlx::query_scalar("SELECT role FROM users WHERE id=$1 AND is_active FOR SHARE")
+    let active: bool =
+        sqlx::query_scalar("SELECT is_active FROM users WHERE id=$1 FOR SHARE")
             .bind(principal.user.id)
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(AppError::unauthorized)?;
-    if role == Role::Viewer {
-        return Err(AppError::forbidden());
-    }
+    if !active { return Err(AppError::unauthorized()); }
+    let allowed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_role_assignments ur JOIN rbac_role_permissions rp ON rp.role_id=ur.role_id WHERE ur.user_id=$1 AND rp.permission_key=$2)")
+        .bind(principal.user.id).bind(permission).fetch_one(&mut *tx).await?;
+    if !allowed { return Err(AppError::forbidden()); }
     let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM access_tokens WHERE id=$1 AND user_id=$2 AND expires_at>now())").bind(principal.token_id).bind(principal.user.id).fetch_one(&mut *tx).await?;
     if !valid {
         return Err(AppError::unauthorized());

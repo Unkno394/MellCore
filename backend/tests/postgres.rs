@@ -7,6 +7,8 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use honeyforge_backend::{
     api::{AppState, router_with_state},
     config::Config,
@@ -20,6 +22,64 @@ const ORIGIN: &str = "http://127.0.0.1:8080";
 const PASSWORD: &str = "test-only-long-password";
 const CENTER_TOKEN: &str = "test-only-center-secret-separate-32-bytes";
 const TELEMETRY_TOKEN: &str = "test-only-telemetry-token-32-bytes-long";
+
+/// The production backend talks to Center over its fixed loopback control
+/// socket. Integration tests provide a disposable protocol stub instead of
+/// bypassing the live-agent check in the API.
+async fn spawn_test_center() {
+    let listener = TcpListener::bind("127.0.0.1:18081")
+        .await
+        .expect("test Center control port must be available");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut request = vec![0_u8; 16 * 1024];
+                let size = match stream.read(&mut request).await {
+                    Ok(size) => size,
+                    Err(_) => return,
+                };
+                let request = String::from_utf8_lossy(&request[..size]);
+                let mut lines = request.lines();
+                let Some(first) = lines.next() else { return };
+                let mut parts = first.split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or_default();
+                let (status, body) = if path.ends_with("/presence") {
+                    (
+                        "200 OK",
+                        json!({
+                            "registered": true,
+                            "connected": true,
+                            "can_reboot": true,
+                            "can_uninstall": true,
+                            "can_share_tcp_ports": true,
+                            "last_heartbeat_age_ms": 1,
+                        }),
+                    )
+                } else if method == "POST" && path.ends_with("/commands") {
+                    ("200 OK", json!({ "message_id": Uuid::new_v4() }))
+                } else if method == "GET" && path.contains("/commands/") {
+                    ("200 OK", json!({ "status": "applied" }))
+                } else if method == "POST" && path.ends_with("/revoke") {
+                    ("200 OK", json!({}))
+                } else {
+                    ("404 Not Found", json!({ "error": "not found" }))
+                };
+                let body = serde_json::to_vec(&body).unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(response.as_bytes()).await.is_ok() {
+                    let _ = stream.write_all(&body).await;
+                }
+            });
+        }
+    });
+}
 
 struct Session {
     token: String,
@@ -105,6 +165,7 @@ async fn postgres_management_and_security_end_to_end() {
         "/honeyforge_test",
         "refusing a non-test database"
     );
+    spawn_test_center().await;
     let config = Config::from_lookup(|key| {
         Ok(match key {
             "DATABASE_URL" => Some(url.clone()),
@@ -114,6 +175,7 @@ async fn postgres_management_and_security_end_to_end() {
             "LOGIN_PER_MINUTE" => Some("100".into()),
             "TELEMETRY_INGEST_TOKEN" => Some(TELEMETRY_TOKEN.into()),
             "CENTER_INGEST_TOKEN" => Some(CENTER_TOKEN.into()),
+            "CENTER_CONTROL_TOKEN" => Some(CENTER_TOKEN.into()),
             "TELEMETRY_PUBLIC_ENDPOINT" => {
                 Some("http://127.0.0.1:8080/internal/v1/telemetry/batches".into())
             }
@@ -148,17 +210,15 @@ async fn postgres_management_and_security_end_to_end() {
     sqlx::query("INSERT INTO sessions(token_hash,csrf_hash,user_id,expires_at) VALUES ($1,$1,$2,now()+interval '1 hour')").bind(honeyforge_backend::auth::digest(&legacy_token)).bind(admin_id).execute(&pool).await.unwrap();
     let legacy_profile = Uuid::new_v4();
     sqlx::query("INSERT INTO trap_profiles(id,name,level,honeypot_type,service_type,config) VALUES ($1,'legacy','low','custom','http','{}')").bind(legacy_profile).execute(&pool).await.unwrap();
-    let mut legacy_tx = pool.begin().await.unwrap();
-    management::audit(
-        &mut legacy_tx,
-        admin_id,
-        "test.legacy_audit",
-        admin_id,
-        Uuid::new_v4(),
-    )
-    .await
-    .unwrap();
-    legacy_tx.commit().await.unwrap();
+    // Simulate the SQL emitted by the legacy binary before the additive
+    // audit-details migration exists.
+    sqlx::query("INSERT INTO audit_logs(id,actor_id,action,object_id,request_id) VALUES($1,$2,'test.legacy_audit',$2,$3)")
+        .bind(Uuid::new_v4())
+        .bind(admin_id)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
     storage::MIGRATOR.run(&pool).await.unwrap();
     storage::MIGRATOR.run(&pool).await.unwrap();
     storage::check_schema(&pool).await.unwrap();
@@ -575,13 +635,26 @@ async fn postgres_management_and_security_end_to_end() {
     .await
     .1;
     assert_eq!(third_page["items"].as_array().unwrap().len(), 2);
-    assert!(third_page["next_cursor"].is_null());
-    let unique: std::collections::HashSet<_> = [&first_page, &second_page, &third_page]
+    let fourth_page = request(
+        &app,
+        "GET",
+        &format!(
+            "/api/v1/profiles?limit=2&after={}",
+            third_page["next_cursor"].as_str().unwrap()
+        ),
+        Some(&viewer),
+        Value::Null,
+    )
+    .await
+    .1;
+    assert_eq!(fourth_page["items"].as_array().unwrap().len(), 1);
+    assert!(fourth_page["next_cursor"].is_null());
+    let unique: std::collections::HashSet<_> = [&first_page, &second_page, &third_page, &fourth_page]
         .into_iter()
         .flat_map(|page| page["items"].as_array().unwrap())
         .map(|item| item["id"].as_str().unwrap())
         .collect();
-    assert_eq!(unique.len(), 6);
+    assert_eq!(unique.len(), 7);
     assert_eq!(
         request(&app, "DELETE", &path, Some(&admin), Value::Null)
             .await
@@ -602,12 +675,8 @@ async fn postgres_management_and_security_end_to_end() {
     );
 
     let admin_path = format!("/api/v1/users/{admin_id}");
-    assert_eq!(
-        request(&app, "DELETE", &admin_path, Some(&admin), Value::Null)
-            .await
-            .0,
-        409
-    );
+    let protected_admin = request(&app, "DELETE", &admin_path, Some(&admin), Value::Null).await;
+    assert_eq!(protected_admin.0, StatusCode::CONFLICT, "{}", protected_admin.1);
     assert_eq!(
         request(
             &app,
@@ -618,7 +687,7 @@ async fn postgres_management_and_security_end_to_end() {
         )
         .await
         .0,
-        409
+        403
     );
     assert_eq!(
         request(
@@ -727,7 +796,7 @@ async fn postgres_management_and_security_end_to_end() {
         .await
         .unwrap();
     assert!(stored.starts_with("$argon2id$"));
-    let constraints = sqlx::query("INSERT INTO trap_profiles(id,name,level,honeypot_type,service_type,config) VALUES ($1,'invalid','high','cowrie','ssh','{}')").bind(Uuid::new_v4()).execute(&pool).await;
+    let constraints = sqlx::query("INSERT INTO trap_profiles(id,name,level,honeypot_type,service_type,config) VALUES ($1,'invalid','impossible','cowrie','ssh','{}')").bind(Uuid::new_v4()).execute(&pool).await;
     assert!(constraints.is_err());
 
     pool.close().await;
@@ -817,7 +886,7 @@ async fn public_auth_scenarios(
     let member = login(app, "member", PASSWORD).await;
     for (method, path, body) in [
         ("GET", "/api/v1/users", Value::Null),
-        ("POST", "/api/v1/profiles", profile("denied")),
+        ("GET", "/api/v1/roles", Value::Null),
     ] {
         assert_eq!(request(app, method, path, Some(&member), body).await.0, 403);
     }
@@ -1067,12 +1136,81 @@ async fn fresh_bootstrap(pool: &sqlx::PgPool, url: &str, config: &Config) {
             .0,
         200
     );
+    // Full RBAC lifecycle: custom roles, union, immediate permission changes,
+    // HTTP 403 default-deny, self-escalation prevention and protected roles.
+    let first_user: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email='firstuser@example.test'")
+        .fetch_one(&fresh).await.unwrap();
+    let role_a = request(&app, "POST", "/api/v1/roles", Some(&admin), json!({
+        "name":"Trap reader", "description":"test role", "permissions":["traps.view"]
+    })).await;
+    assert_eq!(role_a.0, StatusCode::CREATED, "{}", role_a.1);
+    let role_a_id = role_a.1["id"].as_str().unwrap();
+    let role_b = request(&app, "POST", "/api/v1/roles", Some(&admin), json!({
+        "name":"Telemetry reader", "description":"test role", "permissions":["telemetry.view"]
+    })).await;
+    assert_eq!(role_b.0, StatusCode::CREATED, "{}", role_b.1);
+    let role_b_id = role_b.1["id"].as_str().unwrap();
+    let assigned = request(&app, "PUT", &format!("/api/v1/users/{first_user}/roles"), Some(&admin), json!({
+        "role_ids":[role_a_id, role_b_id]
+    })).await;
+    assert_eq!(assigned.0, StatusCode::OK, "{}", assigned.1);
+    assert!(assigned.1["permissions"].as_array().unwrap().iter().any(|p| p == "traps.view"));
+    assert!(assigned.1["permissions"].as_array().unwrap().iter().any(|p| p == "telemetry.view"));
+    let member = login(&app, "firstuser", PASSWORD).await;
+    assert_eq!(request(&app, "GET", "/api/v1/users", Some(&member), Value::Null).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(request(&app, "GET", "/api/v1/servers", Some(&member), Value::Null).await.0, StatusCode::FORBIDDEN);
+    let changed = request(&app, "PUT", &format!("/api/v1/roles/{role_a_id}"), Some(&admin), json!({
+        "name":"Server reader", "description":"changed", "permissions":["servers.view"]
+    })).await;
+    assert_eq!(changed.0, StatusCode::OK, "{}", changed.1);
+    // The already-issued member JWT observes the database change immediately.
+    assert_eq!(request(&app, "GET", "/api/v1/servers", Some(&member), Value::Null).await.0, StatusCode::OK);
+    // Invitations are one-time bearer links. Their roles are checked against the
+    // inviter, assigned atomically on acceptance and included in the RBAC audit.
+    assert_eq!(request(&app, "GET", "/api/v1/audit/roles", Some(&member), Value::Null).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(request(&app, "POST", "/api/v1/invitations", Some(&member), json!({
+        "email":"blocked@example.test", "role_ids":[role_a_id]
+    })).await.0, StatusCode::FORBIDDEN);
+    let invitation = request(&app, "POST", "/api/v1/invitations", Some(&admin), json!({
+        "email":"invitee@example.test", "role_ids":[role_a_id, role_b_id], "expires_in_hours":24
+    })).await;
+    assert_eq!(invitation.0, StatusCode::CREATED, "{}", invitation.1);
+    assert_eq!(invitation.1["invitation"]["status"], "pending");
+    let invite_url = invitation.1["invite_url"].as_str().unwrap();
+    let invite_token = url::form_urlencoded::parse(
+        url::Url::parse(invite_url).unwrap().fragment().unwrap().as_bytes(),
+    )
+        .find_map(|(key, value)| (key == "token").then(|| value.into_owned())).unwrap();
+    let accepted = request(&app, "POST", "/api/v1/auth/accept-invitation", None, json!({
+        "token":invite_token, "name":"Invited analyst", "password":PASSWORD
+    })).await;
+    assert_eq!(accepted.0, StatusCode::CREATED, "{}", accepted.1);
+    assert!(accepted.1["email_verified_at"].is_string());
+    assert_eq!(request(&app, "POST", "/api/v1/auth/accept-invitation", None, json!({
+        "token":invite_token, "name":"Replay", "password":PASSWORD
+    })).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    let invited = login(&app, "invitee", PASSWORD).await;
+    let invited_me = request(&app, "GET", "/api/v1/auth/me", Some(&invited), Value::Null).await;
+    assert_eq!(invited_me.1["roles"].as_array().unwrap().len(), 2);
+    assert!(invited_me.1["permissions"].as_array().unwrap().iter().any(|p| p == "servers.view"));
+    assert!(invited_me.1["permissions"].as_array().unwrap().iter().any(|p| p == "telemetry.view"));
+    let audit = request(&app, "GET", "/api/v1/audit/roles?limit=100", Some(&admin), Value::Null).await;
+    assert_eq!(audit.0, StatusCode::OK, "{}", audit.1);
+    assert!(audit.1.as_array().unwrap().iter().any(|entry| entry["action"] == "invitation.create" && entry["details"]["email"] == "invitee@example.test"));
+    assert!(audit.1.as_array().unwrap().iter().any(|entry| entry["action"] == "invitation.accept"));
+    let admin_id: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email=$1")
+        .bind(format!("{username}@example.test")).fetch_one(&fresh).await.unwrap();
+    assert_eq!(request(&app, "PUT", &format!("/api/v1/users/{admin_id}/roles"), Some(&admin), json!({
+        "role_ids":["00000000-0000-4000-8000-000000000005"]
+    })).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(request(&app, "DELETE", "/api/v1/roles/00000000-0000-4000-8000-000000000001", Some(&admin), Value::Null).await.0, StatusCode::CONFLICT);
+    assert_eq!(request(&app, "DELETE", &format!("/api/v1/users/{admin_id}"), Some(&admin), Value::Null).await.0, StatusCode::CONFLICT);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE role='user'")
             .fetch_one(&fresh)
             .await
             .unwrap(),
-        1
+        2
     );
     fresh.close().await;
 }

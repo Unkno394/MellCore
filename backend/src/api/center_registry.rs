@@ -128,9 +128,14 @@ pub async fn register_trap(
             .await?
             .ok_or_else(AppError::not_found)?
     } else {
+        // Legacy Center registrations may not carry a server ID. Bind them to
+        // an active Owner rather than assuming the bootstrap username is
+        // literally `admin`.
         sqlx::query_scalar(
-            "SELECT id FROM users WHERE username='admin' AND role='admin' AND is_active",
+            "SELECT u.id FROM users u JOIN user_role_assignments ur ON ur.user_id=u.id
+             WHERE ur.role_id=$1 AND u.is_active ORDER BY u.created_at,u.id LIMIT 1",
         )
+        .bind(crate::rbac::OWNER_ROLE_ID)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(AppError::unavailable)?

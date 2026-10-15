@@ -81,6 +81,16 @@ pub async fn run(parent: &sqlx::PgPool, url: &str, config: &Config) {
     )
     .await;
     let profile_id = existing_profile["id"].as_str().unwrap();
+    let dispatcher_profile = call(
+        &app,
+        "POST",
+        "/api/v1/profiles",
+        Some(&admin),
+        json!({"name":"dispatcher profile","description":"test dispatcher","level":"low","honeypot_type":"kozyavka","service_type":"ssh","config":{"banner":"test"}}),
+        201,
+    )
+    .await;
+    let dispatcher_profile_id = dispatcher_profile["id"].as_str().unwrap();
     let a_user = call(
         &app,
         "POST",
@@ -267,6 +277,23 @@ pub async fn run(parent: &sqlx::PgPool, url: &str, config: &Config) {
         )
         .await;
     }
+    // Trap creation now requires the ordinary Center registration handshake.
+    // Mark only A's two servers as registered; foreign ownership checks above
+    // still run while every server is disconnected.
+    for server_id in [sid, sid2] {
+        let server_id = Uuid::parse_str(server_id).unwrap();
+        sqlx::query("UPDATE servers SET status='online' WHERE server_id=$1")
+            .bind(server_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO center_agent_servers(agent_id,server_id) VALUES($1,$2)")
+            .bind(Uuid::new_v4())
+            .bind(server_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
     let first_input = trap(profile_id, vec![binding(8080, "tcp", "direct")]);
     let ta = call(
         &app,
@@ -368,7 +395,7 @@ pub async fn run(parent: &sqlx::PgPool, url: &str, config: &Config) {
         201,
     )
     .await;
-    let backend=call(&app,"POST","/api/v1/traps",Some(&a),json!({"server_id":sid,"trap":trap(profile_id,vec![binding(9000,"tcp","dispatcher_backend")])}),201).await;
+    let backend=call(&app,"POST","/api/v1/traps",Some(&a),json!({"server_id":sid,"trap":trap(dispatcher_profile_id,vec![binding(4000,"tcp","dispatcher_backend")])}),201).await;
     let mut remove_dispatcher = server("A1");
     remove_dispatcher["dispatcher_port"] = Value::Null;
     call(
@@ -391,9 +418,11 @@ pub async fn run(parent: &sqlx::PgPool, url: &str, config: &Config) {
         409,
     )
     .await;
+    let mut connected_sa = sa.clone();
+    connected_sa["status"] = json!("online");
     assert_eq!(
         call(&app, "GET", &path, Some(&a), Value::Null, 200).await,
-        sa
+        connected_sa
     );
     // A multi-port replacement that collides with the server's dispatcher
     // listener rolls back config/version and every reservation.
@@ -496,7 +525,7 @@ pub async fn run(parent: &sqlx::PgPool, url: &str, config: &Config) {
     )
     .await;
     assert_eq!(updated_server["version"], 2);
-    assert_eq!(updated_server["status"], "unknown");
+    assert_eq!(updated_server["status"], "online");
     call(
         &app,
         "PUT",
@@ -821,18 +850,16 @@ pub async fn run(parent: &sqlx::PgPool, url: &str, config: &Config) {
         1
     );
     // Real SQL graph path: separate Center auth, incremental progress and replay.
-    let center = Session {
-        token: CENTER_TOKEN.into(),
-    };
-    let center_agent_id = Uuid::new_v4();
+    let center = Session { token: CENTER_TOKEN.into() };
+    let center_agent_id: Uuid = sqlx::query_scalar(
+        "SELECT agent_id FROM center_agent_servers WHERE server_id=$1",
+    )
+    .bind(sid2.parse::<Uuid>().unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     // An existing user-owned trap can be attached to Center by an explicit
     // control-plane binding; an agent-supplied trap ID alone is insufficient.
-    sqlx::query("INSERT INTO center_agent_servers(agent_id,server_id) VALUES($1,$2)")
-        .bind(center_agent_id)
-        .bind(sid2.parse::<Uuid>().unwrap())
-        .execute(&pool)
-        .await
-        .unwrap();
     sqlx::query("INSERT INTO center_agent_traps(trap_id,agent_id,state) VALUES($1,$2,'running')")
         .bind(middle["trap_id"].as_str().unwrap().parse::<Uuid>().unwrap())
         .bind(center_agent_id)

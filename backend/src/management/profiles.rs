@@ -12,10 +12,10 @@ pub async fn create(
     request_id: Uuid,
     input: ProfileInput,
 ) -> Result<Profile, AppError> {
-    principal.require_admin()?;
+    principal.require("profiles.create")?;
     input.validate()?;
     let resources = input.resolved_resources();
-    let mut tx = management::admin_tx(pool, principal.user.id).await?;
+    let mut tx = crate::rbac::permission_tx(pool, principal.user.id, "profiles.create").await?;
     let profile = sqlx::query_as::<_, Profile>("INSERT INTO trap_profiles(id,name,description,level,honeypot_type,service_type,config,resources) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *")
         .bind(Uuid::new_v4()).bind(input.name.trim()).bind(input.description).bind(input.level).bind(input.honeypot_type).bind(input.service_type).bind(input.config).bind(sqlx::types::Json(resources)).fetch_one(&mut *tx).await?;
     management::audit(
@@ -35,6 +35,7 @@ pub async fn list(
     _principal: &Principal,
     page: Page,
 ) -> Result<ProfilePage, AppError> {
+    _principal.require("profiles.view")?;
     let limit = page.size()?;
     let mut items = sqlx::query_as::<_, Profile>(
         "SELECT * FROM trap_profiles WHERE ($1::uuid IS NULL OR id>$1) ORDER BY id LIMIT $2",
@@ -53,6 +54,7 @@ pub async fn list(
 }
 
 pub async fn get(pool: &PgPool, _principal: &Principal, id: Uuid) -> Result<Profile, AppError> {
+    _principal.require("profiles.view")?;
     Ok(sqlx::query_as("SELECT * FROM trap_profiles WHERE id=$1")
         .bind(id)
         .fetch_one(pool)
@@ -66,12 +68,12 @@ pub async fn update(
     request_id: Uuid,
     input: UpdateProfile,
 ) -> Result<Profile, AppError> {
-    principal.require_admin()?;
+    principal.require("profiles.edit")?;
     input.profile.validate()?;
     if input.expected_version < 1 {
         return Err(AppError::invalid("expected_version must be positive"));
     }
-    let mut tx = management::admin_tx(pool, principal.user.id).await?;
+    let mut tx = crate::rbac::permission_tx(pool, principal.user.id, "profiles.edit").await?;
     let version: i64 =
         sqlx::query_scalar("SELECT version FROM trap_profiles WHERE id=$1 FOR UPDATE")
             .bind(target)
@@ -102,8 +104,8 @@ pub async fn delete(
     target: Uuid,
     request_id: Uuid,
 ) -> Result<(), AppError> {
-    principal.require_admin()?;
-    let mut tx = management::admin_tx(pool, principal.user.id).await?;
+    principal.require("profiles.delete")?;
+    let mut tx = crate::rbac::permission_tx(pool, principal.user.id, "profiles.delete").await?;
     if sqlx::query("DELETE FROM trap_profiles WHERE id=$1")
         .bind(target)
         .execute(&mut *tx)

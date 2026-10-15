@@ -195,8 +195,9 @@ pub async fn create(
     request: Uuid,
     mut input: CreateTrap,
 ) -> Result<Trap, AppError> {
+    principal.require("traps.create")?;
     input.trap.validate()?;
-    let mut tx = owned_tx(pool, principal).await?;
+    let mut tx = owned_tx(pool, principal, "traps.create").await?;
     let server = servers::lock(&mut tx, principal.user.id, input.server_id).await?;
     let deletion_pending: bool =
         sqlx::query_scalar("SELECT deletion_pending FROM servers WHERE server_id=$1")
@@ -206,6 +207,11 @@ pub async fn create(
     if deletion_pending {
         return Err(AppError::conflict(
             "This server is being deleted; trap creation is disabled.",
+        ));
+    }
+    if server.status != ServerStatus::Online {
+        return Err(AppError::conflict(
+            "Connect the server and register its agent before creating a trap",
         ));
     }
     let agent_registered: bool =
@@ -230,6 +236,7 @@ pub async fn create(
     Ok(trap)
 }
 pub async fn get(pool: &PgPool, principal: &Principal, id: Uuid) -> Result<Trap, AppError> {
+    principal.require("traps.view")?;
     Ok(sqlx::query_as(SELECT_ONE)
         .bind(id)
         .bind(principal.user.id)
@@ -241,6 +248,7 @@ pub async fn list(
     principal: &Principal,
     query: TrapQuery,
 ) -> Result<TrapPage, AppError> {
+    principal.require("traps.view")?;
     let limit = query.page().size()?;
     if let Some(server) = query.server_id {
         servers::get(pool, principal, server).await?;
@@ -281,8 +289,9 @@ pub async fn update(
     request: Uuid,
     mut input: UpdateTrap,
 ) -> Result<Trap, AppError> {
+    principal.require("traps.edit")?;
     input.trap.validate()?;
-    let mut tx = owned_tx(pool, principal).await?;
+    let mut tx = owned_tx(pool, principal, "traps.edit").await?;
     let server = lock_parent(&mut tx, principal.user.id, id).await?;
     let deletion_pending: bool =
         sqlx::query_scalar("SELECT deletion_pending FROM servers WHERE server_id=$1")
@@ -312,7 +321,8 @@ pub async fn delete(
     id: Uuid,
     request: Uuid,
 ) -> Result<(), AppError> {
-    let mut tx = owned_tx(pool, principal).await?;
+    principal.require("traps.delete")?;
+    let mut tx = owned_tx(pool, principal, "traps.delete").await?;
     lock_parent(&mut tx, principal.user.id, id).await?;
     let trap = in_tx(&mut tx, principal.user.id, id).await?;
     if !matches!(

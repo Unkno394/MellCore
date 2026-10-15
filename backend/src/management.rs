@@ -339,8 +339,22 @@ pub async fn audit(
     object: Uuid,
     request: Uuid,
 ) -> Result<(), AppError> {
-    sqlx::query("INSERT INTO audit_logs(id, actor_id, action, object_id, request_id) VALUES ($1,$2,$3,$4,$5)")
-        .bind(Uuid::new_v4()).bind(actor).bind(action).bind(object).bind(request).execute(&mut **tx).await?;
+    audit_with_details(tx, actor, action, object, request, serde_json::json!({})).await
+}
+
+pub async fn audit_with_details(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: Uuid,
+    action: &str,
+    object: Uuid,
+    request: Uuid,
+    details: serde_json::Value,
+) -> Result<(), AppError> {
+    if !details.is_object() {
+        return Err(AppError::internal());
+    }
+    sqlx::query("INSERT INTO audit_logs(id, actor_id, action, object_id, request_id, details) VALUES ($1,$2,$3,$4,$5,$6)")
+        .bind(Uuid::new_v4()).bind(actor).bind(action).bind(object).bind(request).bind(details).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -374,6 +388,11 @@ pub async fn bootstrap(
         .bind(name)
         .bind(hash)
         .bind(address)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO user_role_assignments(user_id,role_id,assigned_by) VALUES($1,$2,$1)")
+        .bind(id)
+        .bind(crate::rbac::OWNER_ROLE_ID)
         .execute(&mut *tx)
         .await?;
     audit(&mut tx, id, "user.bootstrap", id, Uuid::new_v4()).await?;
