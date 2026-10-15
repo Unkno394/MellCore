@@ -1428,6 +1428,26 @@ fn is_high_guest_ip(address: IpAddr) -> bool {
     }
 }
 
+fn requires_installed_disk_marker(profile: HighOsProfile) -> bool {
+    profile.image_kind == HighImageKind::InstallMediaAndDisk
+        && profile.image_preparation == HighImagePreparation::UnattendedInstall
+}
+
+fn preserve_installation_on_readiness_failure(profile: HighOsProfile) -> bool {
+    profile == HighOsProfile::ubuntu_iso_ssh() || profile == HighOsProfile::arch_linux_iso_ssh()
+}
+
+fn required_telemetry_unit(profile: HighOsProfile) -> Option<&'static str> {
+    if !requires_installed_disk_marker(profile) || profile.guest_os == HighGuestOs::Windows {
+        return None;
+    }
+    Some("high-telemetry.service")
+}
+
+fn valid_ssh_banner(banner: &[u8]) -> bool {
+    banner.starts_with(b"SSH-2.0-") || banner.starts_with(b"SSH-1.99-")
+}
+
 fn lifecycle_error(
     code: &'static str,
     stage: &'static str,
