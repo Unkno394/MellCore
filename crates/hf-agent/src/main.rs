@@ -472,6 +472,7 @@ impl ComposeProjectStore {
         mut deployment: HighVmDeployment,
         allow_existing_ubuntu_image: bool,
     ) -> anyhow::Result<()> {
+        Self::resolve_managed_iso_source(&mut deployment)?;
         let approved = if matches!(
             deployment.profile,
             profile if profile == HighOsProfile::ubuntu_iso_ssh()
@@ -491,21 +492,6 @@ impl ComposeProjectStore {
         } else {
             None
         };
-        if let Some(approved) = &approved {
-            deployment.image_source = Some(approved.source.clone());
-        }
-        if deployment.image_source.is_none()
-            && deployment.profile == HighOsProfile::windows_rdp_legacy_iso()
-        {
-            deployment.image_source = match high_image::windows_admin_iso_source()? {
-                Some(source) => Some(source),
-                None => {
-                    return Err(high_image::approved_iso(deployment.profile)
-                        .unwrap_err()
-                        .into());
-                }
-            };
-        }
         Self::validate_high_deployment(&deployment, allow_existing_ubuntu_image)?;
         let previous = self.load_high_manifest(deployment.trap_id)?;
         let mut manifest = HighRuntimeManifest {
@@ -606,6 +592,32 @@ impl ComposeProjectStore {
             )?,
         }
         result
+    }
+
+    fn resolve_managed_iso_source(deployment: &mut HighVmDeployment) -> anyhow::Result<()> {
+        if deployment.image_source.is_none()
+            && matches!(
+                deployment.profile,
+                profile if profile == HighOsProfile::ubuntu_iso_ssh()
+                    || profile == HighOsProfile::debian_iso_ssh()
+                    || profile == HighOsProfile::arch_linux_iso_ssh()
+            )
+        {
+            deployment.image_source = Some(high_image::approved_iso(deployment.profile)?.source);
+        }
+        if deployment.image_source.is_none()
+            && deployment.profile == HighOsProfile::windows_rdp_legacy_iso()
+        {
+            deployment.image_source = match high_image::windows_admin_iso_source()? {
+                Some(source) => Some(source),
+                None => {
+                    return Err(high_image::approved_iso(deployment.profile)
+                        .unwrap_err()
+                        .into());
+                }
+            };
+        }
+        Ok(())
     }
 
     fn validate_high_deployment(
@@ -1067,7 +1079,8 @@ impl ComposeProjectStore {
                 ensure_docker_runtime()?;
                 self.deploy_pritvoryashka(deployment, pritvoryashka_image, agent_id)
             }
-            AgentCommand::DeployHighVm(deployment) => {
+            AgentCommand::DeployHighVm(mut deployment) => {
+                Self::resolve_managed_iso_source(&mut deployment)?;
                 Self::validate_high_deployment(&deployment, false)?;
                 ensure_high_vm_runtime(deployment.profile, deployment.image_source.as_ref())?;
                 self.deploy_high(deployment, false)
@@ -3267,6 +3280,40 @@ mod tests {
         deployment.image_source = None;
         let error = ComposeProjectStore::validate_high_deployment(&deployment, false).unwrap_err();
         assert!(error.to_string().contains("code=IMAGE_SOURCE_REQUIRED"));
+    }
+
+    #[test]
+    fn standalone_command_file_resolves_managed_linux_iso_before_validation() {
+        for profile in [
+            HighOsProfile::ubuntu_iso_ssh(),
+            HighOsProfile::debian_iso_ssh(),
+            HighOsProfile::arch_linux_iso_ssh(),
+        ] {
+            let command = AgentCommand::DeployHighVm(HighVmDeployment {
+                command_id: Uuid::new_v4(),
+                trap_id: Uuid::new_v4(),
+                base_image: String::new(),
+                external_service_port: 0,
+                profile,
+                image_source: None,
+            });
+            let mut command_file = serde_json::to_value(command).unwrap();
+            command_file["image_source"] = serde_json::Value::Null;
+            let AgentCommand::DeployHighVm(mut deployment) =
+                serde_json::from_value(command_file).unwrap()
+            else {
+                unreachable!()
+            };
+
+            ComposeProjectStore::resolve_managed_iso_source(&mut deployment).unwrap();
+            ComposeProjectStore::validate_high_deployment(&deployment, false).unwrap();
+
+            let source = deployment.image_source.expect("catalog source");
+            assert_eq!(
+                source,
+                crate::high_image::approved_iso(profile).unwrap().source
+            );
+        }
     }
 
     #[test]

@@ -859,6 +859,10 @@ mod tests {
         ] {
             let approved = approved_iso(profile).unwrap();
             assert!(approved.source.url.starts_with("https://"));
+            let parsed = Url::parse(&approved.source.url).unwrap();
+            assert_eq!(parsed.scheme(), "https");
+            assert!(parsed.host_str().is_some());
+            assert!(!approved.source.url.contains(['[', ']', '(', ')']));
             assert!(!approved.source.url.contains("latest"));
             assert_eq!(approved.source.sha256.len(), 64);
             assert!(
