@@ -408,6 +408,16 @@ fn download_https(source: &HighImageSource, destination: &Path) -> Result<(), Hi
         })?
         .map(|address| address.ip())
         .collect();
+    let addresses = validated_download_addresses(addresses)?;
+    try_download_addresses(&addresses, |address| {
+        run_curl_download_attempt(&url, destination, host, port, address)
+    })
+}
+
+fn validated_download_addresses(
+    addresses: impl IntoIterator<Item = IpAddr>,
+) -> Result<Vec<IpAddr>, HighImageError> {
+    let addresses: BTreeSet<_> = addresses.into_iter().collect();
     if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(*address)) {
         return Err(error(
             "IMAGE_SOURCE_NETWORK_FORBIDDEN",
@@ -415,6 +425,47 @@ fn download_https(source: &HighImageSource, destination: &Path) -> Result<(), Hi
             "image source resolves to a local, private, reserved, or documentation address",
         ));
     }
+    let mut addresses: Vec<_> = addresses.into_iter().collect();
+    addresses.sort_by_key(|address| match address {
+        IpAddr::V4(_) => 0,
+        IpAddr::V6(_) => 1,
+    });
+    Ok(addresses)
+}
+
+fn try_download_addresses(
+    addresses: &[IpAddr],
+    mut attempt: impl FnMut(IpAddr) -> Result<(), String>,
+) -> Result<(), HighImageError> {
+    let mut failures = Vec::new();
+    for address in addresses {
+        match attempt(*address) {
+            Ok(()) => return Ok(()),
+            Err(failure) => failures.push(format!("{address}: {failure}")),
+        }
+    }
+    Err(error(
+        "IMAGE_DOWNLOAD_FAILED",
+        "download",
+        format!(
+            "HTTPS connection failed for every validated address: {}",
+            failures.join("; ")
+        ),
+    ))
+}
+
+fn run_curl_download_attempt(
+    url: &Url,
+    destination: &Path,
+    host: &str,
+    port: u16,
+    address: IpAddr,
+) -> Result<(), String> {
+    OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(destination)
+        .map_err(|failure| format!("cannot reset temporary download: {failure}"))?;
     let mut command = Command::new("curl");
     command.args([
         "--fail",
@@ -441,29 +492,29 @@ fn download_https(source: &HighImageSource, destination: &Path) -> Result<(), Hi
         "--output",
     ]);
     command.arg(destination);
-    for address in addresses {
-        let rendered = match address {
-            IpAddr::V4(value) => value.to_string(),
-            IpAddr::V6(value) => format!("[{value}]"),
-        };
-        command.args(["--resolve", &format!("{host}:{port}:{rendered}")]);
-    }
+    command.args(["--resolve", &curl_resolve_entry(host, port, address)]);
     command.arg(url.as_str());
-    let status = command.status().map_err(|failure| {
-        error(
-            "IMAGE_DOWNLOAD_FAILED",
-            "download",
-            format!("could not start HTTPS download: {failure}"),
-        )
-    })?;
-    if !status.success() {
-        return Err(error(
-            "IMAGE_DOWNLOAD_FAILED",
-            "download",
-            format!("HTTPS download exited with {status}"),
-        ));
+    let output = command
+        .output()
+        .map_err(|failure| format!("could not start curl: {failure}"))?;
+    if !output.status.success() {
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        let diagnostic: String = diagnostic.trim().chars().take(1024).collect();
+        return Err(if diagnostic.is_empty() {
+            format!("curl exited with {}", output.status)
+        } else {
+            format!("curl exited with {}: {diagnostic}", output.status)
+        });
     }
     Ok(())
+}
+
+fn curl_resolve_entry(host: &str, port: u16, address: IpAddr) -> String {
+    let rendered = match address {
+        IpAddr::V4(value) => value.to_string(),
+        IpAddr::V6(value) => format!("[{value}]"),
+    };
+    format!("{host}:{port}:{rendered}")
 }
 
 fn sha256(path: &Path) -> Result<String, HighImageError> {
@@ -921,6 +972,73 @@ mod tests {
         }
         assert!(is_public_ip("1.1.1.1".parse().unwrap()));
         assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn download_addresses_are_all_validated_and_ipv4_is_tried_first() {
+        let addresses = validated_download_addresses([
+            "2606:4700:4700::1111".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+            "1.1.1.1".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(addresses.len(), 3);
+        assert!(matches!(addresses[0], IpAddr::V4(_)));
+        assert!(matches!(addresses[1], IpAddr::V4(_)));
+        assert!(matches!(addresses[2], IpAddr::V6(_)));
+
+        let failure = validated_download_addresses([
+            "1.1.1.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+        ])
+        .unwrap_err();
+        assert_eq!(failure.code, "IMAGE_SOURCE_NETWORK_FORBIDDEN");
+    }
+
+    #[test]
+    fn https_download_retries_one_validated_address_at_a_time() {
+        let addresses = validated_download_addresses([
+            "2606:4700:4700::1111".parse().unwrap(),
+            "1.1.1.1".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+        ])
+        .unwrap();
+        let mut attempted = Vec::new();
+        try_download_addresses(&addresses, |address| {
+            attempted.push(address);
+            if address == "2606:4700:4700::1111".parse::<IpAddr>().unwrap() {
+                Ok(())
+            } else {
+                Err("connection refused".into())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(attempted, addresses);
+        assert_eq!(
+            curl_resolve_entry("releases.ubuntu.com", 443, addresses[0]),
+            "releases.ubuntu.com:443:1.1.1.1"
+        );
+        assert_eq!(
+            curl_resolve_entry("releases.ubuntu.com", 443, addresses[2]),
+            "releases.ubuntu.com:443:[2606:4700:4700::1111]"
+        );
+    }
+
+    #[test]
+    fn https_download_reports_each_failed_address() {
+        let addresses = [
+            "1.1.1.1".parse().unwrap(),
+            "2606:4700:4700::1111".parse().unwrap(),
+        ];
+        let failure = try_download_addresses(&addresses, |address| {
+            Err(format!("simulated failure for {address}"))
+        })
+        .unwrap_err();
+        assert_eq!(failure.code, "IMAGE_DOWNLOAD_FAILED");
+        assert!(failure.message.contains("1.1.1.1"));
+        assert!(failure.message.contains("2606:4700:4700::1111"));
     }
 
     #[test]
