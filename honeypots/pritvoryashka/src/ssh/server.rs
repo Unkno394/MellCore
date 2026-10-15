@@ -802,6 +802,7 @@ impl server::Handler for Handler {
             match byte {
                 3 => {
                     self.state.input.clear();
+                    self.state.shell.cancel_continuation();
                     session.data(channel, terminal_bytes("^C\n"))?;
                     session.data(channel, self.state.shell.prompt().into_bytes())?;
                 }

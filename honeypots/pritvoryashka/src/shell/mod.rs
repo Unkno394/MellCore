@@ -81,6 +81,11 @@ impl SessionShell {
             Self::Windows(shell) => shell.prompt(),
         }
     }
+    pub fn cancel_continuation(&mut self) {
+        if let Self::Windows(shell) = self {
+            shell.cancel_continuation();
+        }
+    }
     pub fn metrics(&self) -> DeceptionMetrics {
         match self {
             Self::Linux(shell) => shell.metrics(),
@@ -102,7 +107,7 @@ impl SessionShell {
     pub fn replace_filesystem_preserving_history(&mut self, fs: VirtualFileSystem) {
         match self {
             Self::Linux(shell) => shell.replace_filesystem_preserving_history(fs),
-            Self::Windows(shell) => shell.replace_filesystem(fs),
+            Self::Windows(shell) => shell.replace_filesystem_preserving_state(fs),
         }
     }
 }

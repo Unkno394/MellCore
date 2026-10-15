@@ -364,6 +364,9 @@ impl Shell {
 
     pub fn execute(&mut self, line: &str, now: DateTime<Utc>) -> ShellOutput {
         let line = line.trim_end_matches(['\r', '\n']);
+        // procfs counters and uptime are live kernel views. Refresh the
+        // synthetic snapshot before a command can read those paths.
+        self.virtual_server.sync_proc(&mut self.fs, now);
         if !line.trim().is_empty() {
             self.history.push(line.to_owned());
             if self.history.len() > 1000 {
@@ -465,7 +468,10 @@ impl Shell {
         let values = words[3..do_index]
             .iter()
             .filter(|word| word.as_str() != ";")
-            .map(|word| self.expand_value(word.strip_prefix("\u{001f}").unwrap_or(word)))
+            .flat_map(|word| {
+                let value = self.expand_value(word.strip_prefix("\u{001f}").unwrap_or(word));
+                expand_brace_sequence(&value).unwrap_or_else(|| vec![value])
+            })
             .collect::<Vec<_>>();
         if values.len() > 256 {
             return failure("bash: loop has too many iterations\n");
@@ -912,9 +918,15 @@ impl Shell {
                 "vim" => self.vim(args),
                 "nano" => self.nano(args),
                 "uname" => self.uname(args),
-                "hostname" => success(format!("{}\n", self.hostname)),
+                "hostname" => self.hostname_command(args),
                 "date" => success(format!("{}\n", now.format("%a %b %e %T UTC %Y"))),
                 "uptime" => self.uptime(now),
+                "nproc" => self.nproc(args),
+                "lsblk" => self.lsblk(args),
+                "service" => self.service(args, now),
+                "who" | "w" | "users" => self.login_users(executable, args, now),
+                "ping" => self.ping(args),
+                "lsb_release" => self.lsb_release(args),
                 "df" => self.df(args),
                 "du" => self.du(args),
                 "free" => self.free(args),
@@ -1509,6 +1521,29 @@ impl Shell {
             return failure("getent: database name required\n");
         }
         let database = args[0].as_str();
+        if database == "hosts" {
+            if args.len() > 2 {
+                return failure("getent: too many arguments\n");
+            }
+            let Ok(contents) = self.fs.read("/etc/hosts") else {
+                return failure("");
+            };
+            let key = args.get(1).map(String::as_str);
+            let hosts = String::from_utf8_lossy(contents);
+            let lines = hosts
+                .lines()
+                .filter(|line| {
+                    let mut fields = line.split_whitespace();
+                    let _address = fields.next();
+                    key.is_none_or(|key| fields.any(|field| field == key))
+                })
+                .collect::<Vec<_>>();
+            return if lines.is_empty() {
+                failure("")
+            } else {
+                success(format!("{}\n", lines.join("\n")))
+            };
+        }
         let file = match database {
             "passwd" => "/etc/passwd",
             "group" => "/etc/group",
@@ -1786,6 +1821,19 @@ impl Shell {
     }
 
     fn ls(&self, args: &[String]) -> ShellOutput {
+        if args.iter().any(|arg| arg == "--version") {
+            let version = packages::installed_version(&self.fs, "coreutils")
+                .map(|version| version.split('-').next().unwrap_or(&version).to_owned())
+                .unwrap_or_else(|| "8.32".into());
+            return success(format!(
+                "ls (GNU coreutils) {version}\nCopyright (C) Free Software Foundation, Inc.\nLicense GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.\n"
+            ));
+        }
+        if args.iter().any(|arg| arg == "--help") {
+            return success(
+                "Usage: ls [OPTION]... [FILE]...\nList information about the FILEs (the current directory by default).\n",
+            );
+        }
         let long = args
             .iter()
             .any(|arg| arg.starts_with('-') && arg.contains('l'));
@@ -2001,7 +2049,33 @@ impl Shell {
                 self.user, self.user, manager
             ));
         }
-        match args.split_first() {
+        let mut non_interactive = false;
+        let mut command_index = 0;
+        while let Some(argument) = args.get(command_index) {
+            match argument.as_str() {
+                "-n" | "--non-interactive" => non_interactive = true,
+                "-u" | "--user" => {
+                    if args.get(command_index + 1).is_none() {
+                        return failure("sudo: option requires an argument -- 'u'\n");
+                    }
+                    command_index += 1;
+                }
+                "--" => {
+                    command_index += 1;
+                    break;
+                }
+                _ if argument.starts_with('-') => {
+                    return failure(format!(
+                        "sudo: invalid option -- '{}'\n",
+                        argument.trim_start_matches('-')
+                    ));
+                }
+                _ => break,
+            }
+            command_index += 1;
+        }
+        let command_args = &args[command_index..];
+        match command_args.split_first() {
             Some((command, rest)) if command == "whoami" && rest.is_empty() => success("root\n"),
             Some((command, rest)) if command == "id" && rest.is_empty() => {
                 success("uid=0(root) gid=0(root) groups=0(root)\n")
@@ -2046,10 +2120,10 @@ impl Shell {
                         .is_some_and(|path| allowed_paths.contains(&path));
                 if !allowed {
                     if self.command_path(command).is_some() {
-                        return failure(format!(
-                            "Sorry, user {} is not allowed to execute '{command}' as root on {}.\n",
-                            self.user, self.hostname
-                        ));
+                        if non_interactive {
+                            return failure("sudo: a password is required\n");
+                        }
+                        return failure(format!("sudo: a password is required\n"));
                     }
                     return failure(format!("sudo: {command}: command not found\n"));
                 }
@@ -2974,6 +3048,193 @@ impl Shell {
         }
     }
 
+    fn hostname_command(&self, args: &[String]) -> ShellOutput {
+        match args {
+            [] => success(format!("{}\n", self.hostname)),
+            [flag] if flag == "-I" => success("10.20.4.21\n"),
+            [flag] if flag == "-i" => success("127.0.1.1\n"),
+            [flag] if flag == "-s" => success(format!(
+                "{}\n",
+                self.hostname.split('.').next().unwrap_or(&self.hostname)
+            )),
+            [flag] if flag == "-f" => success(format!("{}\n", self.hostname)),
+            [flag] if flag == "--help" => success(
+                "Usage: hostname [OPTION]... [NAME]\n  -i, --ip-address  addresses for the hostname\n  -I, --all-ip-addresses  all addresses for the host\n",
+            ),
+            _ => failure("hostname: this virtual host does not allow changing its name\n"),
+        }
+    }
+
+    fn nproc(&self, args: &[String]) -> ShellOutput {
+        if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+            return success(
+                "Usage: nproc [OPTION]...\nPrint the number of processing units available.\n",
+            );
+        }
+        let processors = self
+            .fs
+            .read("/proc/cpuinfo")
+            .map(|contents| {
+                String::from_utf8_lossy(contents)
+                    .lines()
+                    .filter(|line| line.starts_with("processor : "))
+                    .count()
+            })
+            .unwrap_or(1)
+            .max(1);
+        success(format!("{processors}\n"))
+    }
+
+    fn lsblk(&self, args: &[String]) -> ShellOutput {
+        if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+            return success(
+                "Usage: lsblk [OPTIONS] [<device> ...]\nList information about block devices.\n",
+            );
+        }
+        if args.iter().any(|arg| arg == "-f" || arg == "--fs") {
+            return success(
+                "NAME   FSTYPE FSVER LABEL UUID                                 FSAVAIL FSUSE% MOUNTPOINTS\nsda1   ext4   1.0         7c2b7d42-4b9d-4f5c-a101-6d29aa9c1841   60.0G    22% /\n",
+            );
+        }
+        success(
+            "NAME   MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS\nsda      8:0    0   80G  0 disk\n└─sda1   8:1    0   80G  0 part /\n",
+        )
+    }
+
+    fn service(&mut self, args: &[String], now: DateTime<Utc>) -> ShellOutput {
+        if args.len() < 2 {
+            return failure("Usage: service <service> <action>\n");
+        }
+        let service = args[0].trim_end_matches(".service");
+        let mut systemctl_args = vec![args[1].clone(), service.to_owned()];
+        systemctl_args.extend(args[2..].iter().cloned());
+        self.virtual_server
+            .execute("systemctl", &systemctl_args, &self.cwd, &mut self.fs, now)
+            .map(shell_output)
+            .unwrap_or_else(|| failure(format!("{service}: unrecognized service\n")))
+    }
+
+    fn login_users(&self, command: &str, args: &[String], now: DateTime<Utc>) -> ShellOutput {
+        if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+            return success(match command {
+                "who" => "Usage: who [OPTION]... [FILE | ARG1 ARG2]\n",
+                "w" => "Usage: w [options] [user]\n",
+                _ => "Usage: users [OPTION]... [FILE]\n",
+            });
+        }
+        let timestamp = now.format("%Y-%m-%d %H:%M");
+        match command {
+            "users" => success(format!("{}\n", self.user)),
+            "who" => success(format!("{} pts/0        {timestamp}\n", self.user)),
+            "w" => success(format!(
+                " {now} up 17 days,  1 user,  load average: 0.08, 0.04, 0.01\nUSER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT\n{}     pts/0    203.0.113.42     {}    0.00s  0.02s  0.00s -bash\n",
+                self.user,
+                now.format("%H:%M")
+            )),
+            _ => failure(format!("{command}: command not found\n")),
+        }
+    }
+
+    fn ping(&self, args: &[String]) -> ShellOutput {
+        let mut count = 4_u32;
+        let mut target = None;
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "-c" | "-W" | "-i" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return failure(format!(
+                            "ping: option requires an argument -- '{}'\n",
+                            args[index - 1]
+                        ));
+                    };
+                    if args[index - 1] == "-c" {
+                        let Ok(parsed) = value.parse::<u32>() else {
+                            return failure("ping: invalid count\n");
+                        };
+                        count = parsed.min(20);
+                    }
+                }
+                arg if arg.starts_with('-') => {
+                    return failure(format!(
+                        "ping: invalid option -- '{}'\n",
+                        arg.trim_start_matches('-')
+                    ));
+                }
+                host => target = Some(host),
+            }
+            index += 1;
+        }
+        let Some(target) = target else {
+            return failure("ping: usage error: Destination address required\n");
+        };
+        let count = count.max(1);
+        let mut output = format!("PING {target} ({target}) 56(84) bytes of data.\n");
+        for sequence in 1..=count {
+            output.push_str(&format!(
+                "64 bytes from {target}: icmp_seq={sequence} ttl=64 time=0.0{} ms\n",
+                sequence % 9 + 1
+            ));
+        }
+        output.push_str(&format!("\n--- {target} ping statistics ---\n{count} packets transmitted, {count} received, 0% packet loss, time {}ms\nrtt min/avg/max/mdev = 0.01/0.02/0.03/0.00 ms\n", count * 1000));
+        success(output)
+    }
+
+    fn lsb_release(&self, args: &[String]) -> ShellOutput {
+        let Some(profile) = self.fs.distribution().linux_profile() else {
+            return failure("lsb_release: command not found\n");
+        };
+        let fields = [
+            (
+                "-i",
+                "Distributor ID:",
+                if self.fs.distribution() == Distribution::Ubuntu {
+                    "Ubuntu"
+                } else {
+                    "Debian"
+                },
+            ),
+            ("-d", "Description:", profile.operating_system_name),
+            (
+                "-r",
+                "Release:",
+                if self.fs.distribution() == Distribution::Ubuntu {
+                    "22.04"
+                } else {
+                    "13"
+                },
+            ),
+            ("-c", "Codename:", profile.apt_codename),
+        ];
+        if args.is_empty() || args.iter().any(|arg| arg == "-a" || arg == "--all") {
+            return success(format!(
+                "LSB Version:\tcore-11.1.0ubuntu4-amd64:core-11.1.0ubuntu4-noarch\n{}\t{}\n{}\t{}\n{}\t{}\n{}\t{}\n",
+                fields[0].1,
+                fields[0].2,
+                fields[1].1,
+                fields[1].2,
+                fields[2].1,
+                fields[2].2,
+                fields[3].1,
+                fields[3].2
+            ));
+        }
+        let selected = fields
+            .iter()
+            .filter(|(flag, _, _)| args.iter().any(|arg| arg == flag))
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return failure("Usage: lsb_release [options]\n");
+        }
+        success(
+            selected
+                .into_iter()
+                .map(|(_, label, value)| format!("{label}\t{value}\n"))
+                .collect::<String>(),
+        )
+    }
+
     fn update_alternatives(&self, args: &[String]) -> ShellOutput {
         let action = args.first().map(String::as_str).unwrap_or("");
         let name = args
@@ -3620,34 +3881,33 @@ impl Shell {
             Ok(path) => path,
             Err(error) => return fs_failure("du", raw, error),
         };
-        fn size(fs: &VirtualFileSystem, path: &str, user: &str) -> Result<u64, FsError> {
+        fn size_kib(fs: &VirtualFileSystem, path: &str, user: &str) -> Result<u64, FsError> {
             let node = fs.node(path)?;
             if !node.is_dir() {
                 fs.authorize_read(path, user)?;
-                return Ok(node.len() as u64);
+                return Ok((node.len() as u64).div_ceil(1024).max(1));
             }
             fs.authorize_list(path, user)?;
             fs.list(path)?
                 .into_iter()
-                .try_fold(0_u64, |total, (name, child)| {
+                .try_fold(4_u64, |total, (name, child)| {
                     let child_path = if path == "/" {
                         format!("/{name}")
                     } else {
                         format!("{path}/{name}")
                     };
                     let bytes = if child.is_dir() {
-                        size(fs, &child_path, user)?
+                        size_kib(fs, &child_path, user)?
                     } else {
-                        child.len() as u64
+                        (child.len() as u64).div_ceil(1024).max(1)
                     };
                     Ok(total.saturating_add(bytes))
                 })
         }
-        let bytes = match size(&self.fs, &path, &self.user) {
-            Ok(bytes) => bytes,
+        let blocks = match size_kib(&self.fs, &path, &self.user) {
+            Ok(blocks) => blocks,
             Err(error) => return fs_failure("du", raw, error),
         };
-        let blocks = bytes.div_ceil(1024);
         let amount = if human {
             human_kib(blocks)
         } else {
@@ -4456,10 +4716,55 @@ impl Shell {
     }
 
     fn find(&self, args: &[String]) -> ShellOutput {
-        if args.len() > 1 {
-            return failure("find: only a start path is supported\n");
+        let mut raw = ".";
+        let mut max_depth = None::<usize>;
+        let mut file_type = None::<char>;
+        let mut name_pattern = None::<String>;
+        let mut index = 0;
+        let mut has_path = false;
+        while index < args.len() {
+            match args[index].as_str() {
+                "-maxdepth" | "-mindepth" => {
+                    let option = args[index].as_str();
+                    index += 1;
+                    let Some(value) = args
+                        .get(index)
+                        .and_then(|value| value.parse::<usize>().ok())
+                    else {
+                        return failure(format!("find: invalid argument to '{option}'\n"));
+                    };
+                    if option == "-maxdepth" {
+                        max_depth = Some(value);
+                    }
+                }
+                "-type" => {
+                    index += 1;
+                    let Some(value) = args.get(index).filter(|value| {
+                        value.len() == 1 && matches!(value.as_str(), "f" | "d" | "l")
+                    }) else {
+                        return failure("find: argument to -type must be one of f, d or l\n");
+                    };
+                    file_type = value.chars().next();
+                }
+                "-name" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return failure("find: missing argument to -name\n");
+                    };
+                    name_pattern = Some(value.clone());
+                }
+                "-print" | "-print0" => {}
+                arg if arg.starts_with('-') => {
+                    return failure(format!("find: unknown predicate '{arg}'\n"));
+                }
+                path if !has_path => {
+                    raw = path;
+                    has_path = true;
+                }
+                path => return failure(format!("find: paths must precede expressions: {path}\n")),
+            }
+            index += 1;
         }
-        let raw = args.first().map_or(".", String::as_str);
         let path = match self.path(raw) {
             Ok(path) => path,
             Err(error) => return fs_failure("find", raw, error),
@@ -4472,22 +4777,90 @@ impl Shell {
         } else {
             format!("{path}/")
         };
-        let output = self
+        let matches = self
             .fs
             .all_paths()
             .filter(|candidate| {
-                (*candidate == path || candidate.starts_with(&prefix))
-                    && self.fs.authorize_traverse(candidate, &self.user).is_ok()
+                if !(*candidate == path || candidate.starts_with(&prefix))
+                    || self.fs.authorize_traverse(candidate, &self.user).is_err()
+                {
+                    return false;
+                }
+                let depth = if *candidate == path {
+                    0
+                } else {
+                    candidate
+                        .strip_prefix(&prefix)
+                        .map_or(usize::MAX, |relative| relative.matches('/').count() + 1)
+                };
+                if max_depth.is_some_and(|max_depth| depth > max_depth) {
+                    return false;
+                }
+                let node_type = if self.fs.is_dir(candidate) {
+                    'd'
+                } else if self
+                    .fs
+                    .lstat(candidate)
+                    .is_ok_and(|node| matches!(&node.kind, NodeKind::Symlink(_)))
+                {
+                    'l'
+                } else {
+                    'f'
+                };
+                if file_type.is_some_and(|expected| expected != node_type) {
+                    return false;
+                }
+                let name = candidate.rsplit('/').next().unwrap_or(candidate);
+                name_pattern.as_deref().is_none_or(|pattern| {
+                    pattern == "*"
+                        || (pattern.starts_with('*') && name.ends_with(&pattern[1..]))
+                        || (pattern.ends_with('*')
+                            && name.starts_with(&pattern[..pattern.len() - 1]))
+                        || name == pattern
+                })
             })
-            .collect::<Vec<_>>()
-            .join("\n");
-        with_action(
-            success(format!("{output}\n")),
-            FsActionKind::Accessed,
-            "find",
-            path,
-        )
+            .collect::<Vec<_>>();
+        let output = if matches.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", matches.join("\n"))
+        };
+        with_action(success(output), FsActionKind::Accessed, "find", path)
     }
+}
+
+fn expand_brace_sequence(value: &str) -> Option<Vec<String>> {
+    let inner = value.strip_prefix('{')?.strip_suffix('}')?;
+    let mut parts = inner.split("..");
+    let start = parts.next()?.parse::<i64>().ok()?;
+    let end = parts.next()?.parse::<i64>().ok()?;
+    let step = parts
+        .next()
+        .map(str::parse::<i64>)
+        .transpose()
+        .ok()?
+        .unwrap_or_else(|| if start <= end { 1 } else { -1 });
+    if parts.next().is_some() || step == 0 || (end > start && step < 0) || (end < start && step > 0)
+    {
+        return None;
+    }
+    let mut values = Vec::new();
+    let mut current = start;
+    loop {
+        values.push(current.to_string());
+        if values.len() > 256 {
+            return None;
+        }
+        if current == end {
+            break;
+        }
+        let next = current.checked_add(step)?;
+        if (step > 0 && next > end) || (step < 0 && next < end) {
+            break;
+        }
+        current = next;
+    }
+    Some(values)
 }
 
 fn valid_variable_name(name: &str) -> bool {

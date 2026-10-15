@@ -144,11 +144,39 @@ fn process_command_name(command: &str) -> &str {
 fn process_parent(pid: u32) -> u32 {
     match pid {
         1 => 0,
+        2 => 0,
         1312 => 684,
         1224 => 901,
         1134 | 1188 => 1,
         30000..=30099 => 901,
         _ => 1,
+    }
+}
+
+fn process_uid_gid(distribution: Distribution, user: &str) -> (u32, u32) {
+    match (distribution, user) {
+        (_, "root") => (0, 0),
+        (Distribution::Arch, "dbus") => (81, 81),
+        (Distribution::Arch, "systemd-resolve") => (975, 975),
+        (Distribution::Arch, "http") => (33, 33),
+        (Distribution::Arch, "sshd") => (50, 50),
+        (Distribution::Arch, "postgres") => (967, 967),
+        (Distribution::Arch, "valkey") => (971, 971),
+        (_, "mysql") => (106, 112),
+        (_, "messagebus") => (100, 104),
+        (_, "syslog") => (101, 105),
+        (_, "systemd-resolve") => (102, 102),
+        (_, "systemd-timesync") => (103, 103),
+        (_, "www-data") => (33, 33),
+        (_, "postgres") => (114, 120),
+        (_, "redis") => (117, 124),
+        (_, "app") => (1001, 1001),
+        (_, "admin") => (1000, 1000),
+        (_, "daemon") => (1, 1),
+        (_, "bin") => (2, 2),
+        (_, "sys") => (3, 3),
+        (_, "adm") => (4, 4),
+        _ => (1000, 1000),
     }
 }
 
@@ -185,21 +213,8 @@ fn ps_column(
         "pid" => pid.to_string(),
         "ppid" => ppid.to_string(),
         "user" | "uname" | "euser" => user.to_owned(),
-        "uid" | "euid" => match (distribution, user) {
-            (_, "root") => "0",
-            (Distribution::Arch, "dbus") => "81",
-            (Distribution::Arch, "systemd-resolve") => "975",
-            (Distribution::Arch, "http") => "33",
-            (Distribution::Arch, "sshd") => "50",
-            (Distribution::Arch, "postgres") => "967",
-            (Distribution::Arch, "valkey") => "971",
-            (Distribution::Arch, "app") => "1001",
-            (Distribution::Ubuntu | Distribution::Debian, "postgres") => "114",
-            (Distribution::Ubuntu | Distribution::Debian, "redis") => "117",
-            (_, "app") => "1001",
-            _ => "1000",
-        }
-        .to_owned(),
+        "uid" | "euid" => process_uid_gid(distribution, user).0.to_string(),
+        "gid" | "egid" => process_uid_gid(distribution, user).1.to_string(),
         "stat" | "state" => state.to_string(),
         "comm" => command
             .split_whitespace()
@@ -221,7 +236,8 @@ fn ps_column(
                 "?".into()
             }
         }
-        "etime" | "time" | "cputime" => process_cpu_time(pid),
+        "etime" => "17-00:12:00".into(),
+        "time" | "cputime" => process_cpu_time(pid),
         "start" | "lstart" => "Oct12".into(),
         _ => "?".into(),
     }
@@ -1505,6 +1521,19 @@ impl VirtualServer {
                     all = true;
                     ef = true;
                 }
+                "-eo" => {
+                    all = true;
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return VirtualCommand::failure(
+                            "processes",
+                            "list",
+                            None,
+                            "ps: option requires an argument -- 'o'\n",
+                        );
+                    };
+                    columns = Some(parse_ps_columns(value));
+                }
                 "-e" | "-A" | "--everyone" => all = true,
                 "-f" => ef = true,
                 "--no-headers" => no_headers = true,
@@ -1560,6 +1589,10 @@ impl VirtualServer {
                     }
                     pid_filter = Some(parsed);
                     all = true;
+                }
+                _ if arg.starts_with("-eo") && arg.len() > 3 => {
+                    all = true;
+                    columns = Some(parse_ps_columns(&arg[3..]));
                 }
                 _ if arg.starts_with("-o") && arg.len() > 2 => {
                     columns = Some(parse_ps_columns(&arg[2..]))
@@ -1865,6 +1898,9 @@ impl VirtualServer {
             "link" => {
                 "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN\n2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP\n3: docker0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 state DOWN\n"
             }
+            "neigh" | "neighbor" => {
+                "10.20.4.1 dev eth0 lladdr 02:42:0a:14:04:01 REACHABLE\n172.17.0.1 dev docker0 lladdr 02:42:ac:11:00:01 STALE\n"
+            }
             _ => {
                 return VirtualCommand::failure(
                     "network",
@@ -1882,6 +1918,9 @@ impl VirtualServer {
             arg == "--processes"
                 || (arg.starts_with('-') && arg.chars().skip(1).any(|flag| flag == 'p'))
         });
+        let listen_only = args
+            .iter()
+            .any(|arg| arg.starts_with('-') && arg.chars().skip(1).any(|flag| flag == 'l'));
         let mut rows = Vec::new();
         for (name, service) in &self.services {
             if service.active
@@ -1970,6 +2009,15 @@ impl VirtualServer {
                     ));
                 }
             }
+            if !listen_only {
+                if show_process && self.username == "root" {
+                    text.push_str("tcp   ESTAB  0      0      10.20.4.21:22       203.0.113.42:51432 users:((\"sshd\",pid=684,fd=4))\n");
+                } else {
+                    text.push_str(
+                        "tcp   ESTAB  0      0      10.20.4.21:22       203.0.113.42:51432\n",
+                    );
+                }
+            }
             text
         } else {
             let mut text = if show_process {
@@ -1988,6 +2036,13 @@ impl VirtualServer {
                     text.push_str(&format!("{protocol:<10} 0      0 {address}:{port:<5}          0.0.0.0:*               {state:<11} {pid}/{name}\n"));
                 } else {
                     text.push_str(&format!("{protocol:<10} 0      0 {address}:{port:<5}          0.0.0.0:*               {state}\n"));
+                }
+            }
+            if !listen_only {
+                if show_process && self.username == "root" {
+                    text.push_str("tcp        0      0 10.20.4.21:22            203.0.113.42:51432       ESTABLISHED 684/sshd\n");
+                } else {
+                    text.push_str("tcp        0      0 10.20.4.21:22            203.0.113.42:51432       ESTABLISHED\n");
                 }
             }
             text
@@ -2279,12 +2334,17 @@ impl VirtualServer {
                             timestamp.format("%a %Y-%m-%d %H:%M:%S")
                         )
                     };
-                    return VirtualCommand::success(
+                    let mut result = VirtualCommand::success(
                         "persistence",
                         "systemd_status",
                         Some(name.into()),
                         output,
                     );
+                    if !active {
+                        result.exit_status = 3;
+                        result.interaction.success = false;
+                    }
+                    return result;
                 }
                 "is-active" => {
                     let mut result = VirtualCommand::success(
@@ -4218,6 +4278,11 @@ impl VirtualServer {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let cpu_count = cpuinfo
+            .lines()
+            .filter(|line| line.starts_with("processor : "))
+            .count()
+            .max(1);
         fs.put_file("/proc/cpuinfo", cpuinfo, now);
         fs.put_file(
             "/proc/mounts",
@@ -4265,37 +4330,35 @@ impl VirtualServer {
         for process in self.processes.values() {
             let dir = format!("/proc/{}", process.pid);
             ensure_dir(fs, &dir, now);
+            let parent_pid = process_parent(process.pid);
+            let process_name = process
+                .command
+                .split_whitespace()
+                .next()
+                .unwrap_or("process")
+                .rsplit('/')
+                .next()
+                .unwrap_or("process");
+            let (process_uid, process_gid) = process_uid_gid(self.distribution, process.user);
+            let uid = format!("{process_uid}\t{process_uid}\t{process_uid}\t{process_uid}");
+            let gid = format!("{process_gid}\t{process_gid}\t{process_gid}\t{process_gid}");
+            let groups = if process.user == "admin" { "4\t27" } else { "" };
+            let voluntary_switches = process.pid.wrapping_mul(17) % 5000 + 120;
+            let involuntary_switches = process.pid.wrapping_mul(7) % 1000 + 10;
+            let vm_size = process.rss_kib.saturating_mul(4);
+            let vm_peak = vm_size;
+            let vm_hwm = process.rss_kib;
+            let rss_anon = process.rss_kib.saturating_mul(3) / 4;
+            let rss_file = process.rss_kib / 4;
+            let vm_data = process.rss_kib.saturating_mul(2);
+            let vm_lib = process.rss_kib / 8;
+            let pid = process.pid;
+            let state = process.state.description();
             fs.put_file(
                 &format!("{dir}/status"),
                 format!(
-                    "Name:\t{}\nState:\t{}\nPid:\t{}\nUid:\t{}\nVmRSS:\t{} kB\n",
-                    process
-                        .command
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("process")
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("process"),
-                    process.state.description(),
-                    process.pid,
-                    match process.user {
-                        "root" => "0\t0\t0\t0",
-                        "dbus" if self.distribution == Distribution::Arch => "81\t81\t81\t81",
-                        "systemd-resolve" if self.distribution == Distribution::Arch =>
-                            "975\t975\t975\t975",
-                        "http" if self.distribution == Distribution::Arch => "33\t33\t33\t33",
-                        "sshd" if self.distribution == Distribution::Arch => "50\t50\t50\t50",
-                        "postgres" if self.distribution == Distribution::Arch =>
-                            "967\t967\t967\t967",
-                        "mysql" => "106\t112\t112\t112",
-                        "valkey" if self.distribution == Distribution::Arch => "971\t971\t971\t971",
-                        "app" => "1001\t1001\t1001\t1001",
-                        "postgres" => "114\t114\t114\t114",
-                        "redis" => "999\t999\t999\t999",
-                        _ => "1000\t1000\t1000\t1000",
-                    },
-                    process.rss_kib
+                    "Name:\t{process_name}\nUmask:\t0022\nState:\t{state}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{parent_pid}\nTracerPid:\t0\nUid:\t{uid}\nGid:\t{gid}\nFDSize:\t64\nGroups:\t{groups}\nNStgid:\t{pid}\nNSpid:\t{pid}\nNSpgid:\t{pid}\nNSsid:\t{pid}\nThreads:\t1\nSigQ:\t0/15384\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000000000\nSigIgn:\t0000000000000000\nSigCgt:\t0000000000000000\nCapInh:\t0000000000000000\nCapPrm:\t0000003fffffffff\nCapEff:\t0000003fffffffff\nCapBnd:\t0000003fffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSpeculation_Store_Bypass:\tthread vulnerable\nCpus_allowed:\t0000000f\nCpus_allowed_list:\t0-3\nMems_allowed:\t00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t{voluntary_switches}\nnonvoluntary_ctxt_switches:\t{involuntary_switches}\nVmPeak:\t{vm_peak} kB\nVmSize:\t{vm_size} kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t{vm_hwm} kB\nVmRSS:\t{} kB\nRssAnon:\t{rss_anon} kB\nRssFile:\t{rss_file} kB\nRssShmem:\t       0 kB\nVmData:\t{vm_data} kB\nVmStk:\t     132 kB\nVmExe:\t       8 kB\nVmLib:\t{vm_lib} kB\nVmPTE:\t      48 kB\nVmSwap:\t       0 kB\n",
+                    process.rss_kib,
                 ),
                 now,
             );
@@ -4396,11 +4459,55 @@ impl VirtualServer {
             .num_milliseconds()
             .max(0) as f64
             / 1000.0;
+        let idle_seconds = uptime_seconds * cpu_count as f64 * 0.994;
         fs.put_file(
             "/proc/uptime",
-            format!("{uptime_seconds:.2} 5839142.44\n"),
+            format!("{uptime_seconds:.2} {idle_seconds:.2}\n"),
             now,
         );
+        fs.put_file(
+            "/proc/loadavg",
+            format!(
+                "0.08 0.04 0.01 1/{} {}\n",
+                self.processes.len()
+                    + self
+                        .virtual_processes
+                        .iter()
+                        .filter(|process| process.running)
+                        .count(),
+                self.processes.keys().next_back().copied().unwrap_or(1312) + 1
+            ),
+            now,
+        );
+        let total_ticks = (uptime_seconds * cpu_count as f64 * 100.0) as u64;
+        let idle_ticks = (idle_seconds * 100.0) as u64;
+        let user_ticks = total_ticks / 500;
+        let nice_ticks = total_ticks / 2_000;
+        let system_ticks = total_ticks / 300;
+        let iowait_ticks = total_ticks / 10_000;
+        let cpu_line = format!(
+            "{user_ticks} {nice_ticks} {system_ticks} {idle_ticks} {iowait_ticks} 0 0 0 0 0"
+        );
+        let per_cpu_line = format!(
+            "{} {} {} {} {} 0 0 0 0 0",
+            user_ticks / cpu_count as u64,
+            nice_ticks / cpu_count as u64,
+            system_ticks / cpu_count as u64,
+            idle_ticks / cpu_count as u64,
+            iowait_ticks / cpu_count as u64,
+        );
+        let mut stat = format!("cpu {cpu_line}\n");
+        for cpu in 0..cpu_count {
+            stat.push_str(&format!("cpu{cpu} {per_cpu_line}\n"));
+        }
+        let boot_time = self.booted_at.timestamp();
+        stat.push_str(&format!(
+            "intr {}\nctxt {}\nbtime {boot_time}\nprocesses {}\nprocs_running 1\nprocs_blocked 0\n",
+            total_ticks.saturating_mul(8),
+            total_ticks.saturating_mul(3),
+            self.processes.len() + self.virtual_processes.len()
+        ));
+        fs.put_file("/proc/stat", stat, now);
         fs.put_file(
             "/proc/version",
             format!("{}\n", fs.distribution().proc_version()),
@@ -4424,6 +4531,9 @@ impl VirtualServer {
                 slot = slot.saturating_add(1);
             }
         }
+        tcp.push_str(
+            "  20: 1504140A:0016 2A7100CB:C8E8 01 00000000:00000000 00:00000000 00000000     0        0 300004\n",
+        );
         fs.put_file("/proc/net/tcp", tcp, now);
     }
 }

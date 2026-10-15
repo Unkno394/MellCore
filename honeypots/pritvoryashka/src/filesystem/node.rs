@@ -71,6 +71,16 @@ impl Node {
         }
     }
 
+    /// Bytes physically stored in the snapshot, excluding virtual metadata
+    /// sizes used to make `ls` and `du` look realistic.
+    pub fn stored_len(&self) -> usize {
+        match &self.kind {
+            NodeKind::Directory => 0,
+            NodeKind::File(data) => data.len(),
+            NodeKind::Symlink(target) => target.len(),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         matches!(&self.kind, NodeKind::File(data) if data.is_empty())
     }

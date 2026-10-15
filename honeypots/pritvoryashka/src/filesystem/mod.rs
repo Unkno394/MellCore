@@ -2,7 +2,7 @@ pub mod node;
 pub mod permissions;
 pub mod persistence;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::Distribution;
 use chrono::{DateTime, Duration, Utc};
@@ -123,10 +123,14 @@ pub const VIRTUAL_SYSTEM_BINARIES: &[(&str, &str)] = &[
     ("/usr/bin/wc", "GNU coreutils"),
     ("/usr/bin/sort", "GNU coreutils"),
     ("/usr/bin/rmdir", "GNU coreutils"),
+    ("/usr/bin/nproc", "GNU coreutils"),
+    ("/usr/bin/who", "GNU coreutils"),
+    ("/usr/bin/users", "GNU coreutils"),
     ("/usr/bin/file", "file"),
     ("/usr/bin/mount", "util-linux"),
     ("/usr/bin/findmnt", "util-linux"),
     ("/usr/bin/lscpu", "util-linux"),
+    ("/usr/bin/lsblk", "util-linux"),
     ("/usr/bin/grep", "GNU grep"),
     ("/usr/bin/printf", "GNU coreutils"),
     ("/usr/bin/chmod", "GNU coreutils"),
@@ -139,6 +143,9 @@ pub const VIRTUAL_SYSTEM_BINARIES: &[(&str, &str)] = &[
     ("/usr/bin/which", "which"),
     ("/usr/bin/readlink", "GNU coreutils"),
     ("/usr/bin/hostnamectl", "systemd"),
+    ("/usr/sbin/service", "sysvinit-utils"),
+    ("/usr/bin/ping", "iputils-ping"),
+    ("/usr/bin/lsb_release", "lsb-release"),
     ("/usr/bin/nano", "GNU nano"),
     ("/usr/bin/whoami", "GNU coreutils"),
     ("/usr/bin/id", "GNU coreutils"),
@@ -163,6 +170,7 @@ pub const VIRTUAL_SYSTEM_BINARIES: &[(&str, &str)] = &[
     ("/usr/bin/ps", "procps"),
     ("/usr/bin/top", "procps"),
     ("/usr/bin/kill", "procps"),
+    ("/usr/bin/w", "procps"),
     ("/usr/bin/ip", "iproute2"),
     ("/usr/bin/ss", "iproute2"),
     ("/usr/bin/netstat", "net-tools"),
@@ -208,6 +216,17 @@ fn baseline_dpkg_status(distribution: Distribution) -> String {
             ("grep", "3.11-4", "GNU grep, egrep and fgrep"),
             ("findutils", "4.10.0-3", "utilities for finding files"),
             ("util-linux", "2.41-5", "miscellaneous system utilities"),
+            ("sysvinit-utils", "3.14-4", "System-V-like utilities"),
+            (
+                "iputils-ping",
+                "3:20240905-1",
+                "Tools to test the reachability of network hosts",
+            ),
+            (
+                "lsb-release",
+                "12.0-2",
+                "Linux Standard Base version reporting utility",
+            ),
             (
                 "sudo",
                 "1.9.16p2-3",
@@ -330,6 +349,22 @@ fn baseline_dpkg_status(distribution: Distribution) -> String {
                 "2.37.2-4ubuntu3",
                 "miscellaneous system utilities",
             ),
+            ("sysvinit-utils", "3.01-1ubuntu1", "System-V-like utilities"),
+            (
+                "iputils-ping",
+                "3:20211215-1ubuntu0.1",
+                "Tools to test the reachability of network hosts",
+            ),
+            (
+                "lsb-release",
+                "11.1.0ubuntu4",
+                "Linux Standard Base version reporting utility",
+            ),
+            (
+                "openssh-server",
+                "1:8.9p1-3ubuntu0.10",
+                "secure shell (SSH) server",
+            ),
             (
                 "sudo",
                 "1.9.9-1ubuntu2.4",
@@ -365,6 +400,45 @@ fn baseline_dpkg_status(distribution: Distribution) -> String {
 }
 
 impl VirtualFileSystem {
+    /// Adds missing directory ancestors from older snapshots without changing
+    /// existing files or replacing paths that already exist as non-directories.
+    pub(crate) fn repair_missing_parent_directories(&mut self) -> usize {
+        let mut missing = BTreeSet::new();
+        for path in self.nodes.keys() {
+            if path == "/" {
+                continue;
+            }
+            let mut parent = path
+                .rsplit_once('/')
+                .map(|(parent, _)| if parent.is_empty() { "/" } else { parent });
+            while let Some(parent_path) = parent {
+                if parent_path == "/" {
+                    break;
+                }
+                match self.nodes.get(parent_path) {
+                    Some(node) if node.is_dir() => break,
+                    Some(_) => break,
+                    None => {
+                        missing.insert(parent_path.to_owned());
+                        parent = parent_path
+                            .rsplit_once('/')
+                            .map(|(ancestor, _)| if ancestor.is_empty() { "/" } else { ancestor });
+                    }
+                }
+            }
+        }
+        let mut missing = missing.into_iter().collect::<Vec<_>>();
+        missing.sort_by_key(|path| path.matches('/').count());
+        let count = missing.len();
+        let now = Utc::now();
+        for path in missing {
+            self.nodes
+                .entry(path)
+                .or_insert_with(|| Node::directory(now));
+        }
+        count
+    }
+
     pub(crate) fn validate_snapshot(&self) -> Result<(), String> {
         if self.nodes.len() > MAX_NODES || !self.nodes.get("/").is_some_and(Node::is_dir) {
             return Err("virtual filesystem snapshot has an invalid root or too many nodes".into());
@@ -377,7 +451,7 @@ impl VirtualFileSystem {
             if node.is_dir() {
                 continue;
             }
-            let size = node.len();
+            let size = node.stored_len();
             if size > MAX_FILE_BYTES {
                 return Err("virtual filesystem snapshot contains an oversized file".into());
             }
@@ -386,6 +460,7 @@ impl VirtualFileSystem {
                 return Err("virtual filesystem snapshot exceeds the storage limit".into());
             }
         }
+        let mut invalid_parents = Vec::new();
         for path in self.nodes.keys().filter(|path| path.as_str() != "/") {
             let parent = path
                 .rsplit_once('/')
@@ -394,10 +469,14 @@ impl VirtualFileSystem {
                     "virtual filesystem snapshot contains a parentless path".to_owned()
                 })?;
             if !self.nodes.get(parent).is_some_and(Node::is_dir) {
-                return Err(format!(
-                    "virtual filesystem snapshot has a missing or invalid parent: {path:?} requires directory {parent:?}"
-                ));
+                invalid_parents.push(format!("{path:?} requires directory {parent:?}"));
             }
+        }
+        if !invalid_parents.is_empty() {
+            return Err(format!(
+                "virtual filesystem snapshot has missing or invalid parents: {}",
+                invalid_parents.join(", ")
+            ));
         }
         Ok(())
     }
@@ -485,6 +564,7 @@ impl VirtualFileSystem {
         );
         for path in [
             "/C/Windows/System32/cmd.exe",
+            "/C/Windows/System32/wevtutil.exe",
             "/C/Windows/System32/OpenSSH/ssh.exe",
             "/C/Windows/System32/OpenSSH/sshd.exe",
             "/C/Windows/System32/OpenSSH/ssh-keygen.exe",
@@ -509,6 +589,7 @@ impl VirtualFileSystem {
         ] {
             let size = match path.to_ascii_lowercase().as_str() {
                 "/c/windows/system32/cmd.exe" | "/c/windows/syswow64/cmd.exe" => 289_792,
+                "/c/windows/system32/wevtutil.exe" => 81_920,
                 "/c/windows/system32/whoami.exe"
                 | "/c/windows/syswow64/whoami.exe"
                 | "/c/windows/system32/hostname.exe" => 45_056,
@@ -681,6 +762,7 @@ impl VirtualFileSystem {
             "/boot",
             "/dev",
             "/etc",
+            "/etc/ssh",
             "/home",
             "/lib",
             "/lib64",
@@ -805,11 +887,11 @@ impl VirtualFileSystem {
             "# /etc/shells: valid login shells\n/bin/sh\n/bin/bash\n/bin/rbash\n",
             now,
         );
-        fs.put_file("/etc/passwd", format!("root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nbin:x:2:2:bin:/bin:/usr/sbin/nologin\nsys:x:3:3:sys:/dev:/usr/sbin/nologin\nadm:x:4:4:adm:/var/log:/usr/sbin/nologin\nmessagebus:x:100:104::/nonexistent:/usr/sbin/nologin\nsyslog:x:101:105::/home/syslog:/usr/sbin/nologin\nsystemd-resolve:x:102:102:systemd Resolver:/run/systemd:/usr/sbin/nologin\nsystemd-timesync:x:103:103:systemd Time Synchronization,,,:/run/systemd:/usr/sbin/nologin\nwww-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\npostgres:x:114:120:PostgreSQL administrator,,,:/var/lib/postgresql:/bin/bash\nredis:x:117:124:Redis server,,,:/var/lib/redis:/usr/sbin/nologin\napp:x:1001:1001:Application service:/srv/billing-api:/usr/sbin/nologin\n{username}:x:1000:1000:Operator:{home}:/bin/bash\n"), now);
-        fs.put_file("/etc/group", format!("root:x:0:\ndaemon:x:1:\nbin:x:2:\nsys:x:3:\nadm:x:4:{username}\ntty:x:5:\ndisk:x:6:\nshadow:x:42:\nsudo:x:27:{username}\nwww-data:x:33:\nsystemd-resolve:x:102:\nsystemd-timesync:x:103:\nmessagebus:x:104:\nsyslog:x:105:\npostgres:x:120:\nredis:x:124:\napp:x:1001:\n{username}:x:1000:\n"), now);
+        fs.put_file("/etc/passwd", format!("root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nbin:x:2:2:bin:/bin:/usr/sbin/nologin\nsys:x:3:3:sys:/dev:/usr/sbin/nologin\nadm:x:4:4:adm:/var/log:/usr/sbin/nologin\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\nmessagebus:x:100:104::/nonexistent:/usr/sbin/nologin\nsyslog:x:101:105::/home/syslog:/usr/sbin/nologin\nsystemd-resolve:x:102:102:systemd Resolver:/run/systemd:/usr/sbin/nologin\nsystemd-timesync:x:103:103:systemd Time Synchronization,,,:/run/systemd:/usr/sbin/nologin\nwww-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\npostgres:x:114:120:PostgreSQL administrator,,,:/var/lib/postgresql:/bin/bash\nredis:x:117:124:Redis server,,,:/var/lib/redis:/usr/sbin/nologin\napp:x:1001:1001:Application service:/srv/billing-api:/usr/sbin/nologin\n{username}:x:1000:1000:Operator:{home}:/bin/bash\n"), now);
+        fs.put_file("/etc/group", format!("root:x:0:\ndaemon:x:1:\nbin:x:2:\nsys:x:3:\nadm:x:4:{username}\ntty:x:5:\ndisk:x:6:\nshadow:x:42:\nnogroup:x:65534:\nsudo:x:27:{username}\nwww-data:x:33:\nsystemd-resolve:x:102:\nsystemd-timesync:x:103:\nmessagebus:x:104:\nsyslog:x:105:\npostgres:x:120:\nredis:x:124:\napp:x:1001:\n{username}:x:1000:\n"), now);
         fs.put_file(
             "/etc/shadow",
-            format!("root:!:19200:0:99999:7:::\n{username}:!:19200:0:99999:7:::\n"),
+            format!("root:!:19200:0:99999:7:::\nnobody:!:19200:0:99999:7:::\n{username}:!:19200:0:99999:7:::\n"),
             now,
         );
         let sudoers = if distribution == Distribution::Arch {
@@ -840,7 +922,11 @@ impl VirtualFileSystem {
             shadow.group = "shadow".into();
         }
         for (path, package) in VIRTUAL_SYSTEM_BINARIES {
-            if distribution == Distribution::Arch && *path == "/usr/bin/dash" {
+            if distribution == Distribution::Arch
+                && (*path == "/usr/bin/dash"
+                    || *path == "/usr/sbin/service"
+                    || *path == "/usr/bin/lsb_release")
+            {
                 continue;
             }
             if distribution.is_apt() && *path == "/usr/bin/nologin" {
@@ -1692,12 +1778,12 @@ impl VirtualFileSystem {
         if !self.nodes.contains_key(&destination) && self.nodes.len() >= MAX_NODES {
             return Err(FsError::NoSpace);
         }
-        let previous = self.nodes.get(&destination).map_or(0, Node::len);
+        let previous = self.nodes.get(&destination).map_or(0, Node::stored_len);
         let total: usize = self
             .nodes
             .values()
             .filter(|node| !node.is_dir())
-            .map(Node::len)
+            .map(Node::stored_len)
             .sum();
         if total.saturating_sub(previous).saturating_add(data.len()) > MAX_TOTAL_FILE_BYTES {
             return Err(FsError::NoSpace);

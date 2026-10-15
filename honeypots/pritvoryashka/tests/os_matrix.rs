@@ -110,6 +110,109 @@ fn linux_profiles_keep_identity_commands_and_package_files_consistent() {
 }
 
 #[test]
+fn ubuntu_shell_commands_and_procfs_state_match_the_virtual_system() {
+    let mut guest = shell(Distribution::Ubuntu, &[], &[]);
+
+    assert_eq!(
+        run(&mut guest, "for i in {1..5}; do echo number=$i; done"),
+        "number=1\nnumber=2\nnumber=3\nnumber=4\nnumber=5\n"
+    );
+    assert_eq!(run(&mut guest, "hostname -I").trim(), "10.20.4.21");
+    assert!(run(&mut guest, "ls --version").starts_with("ls (GNU coreutils) 8.32"));
+    assert!(run(&mut guest, "getent hosts localhost").contains("127.0.0.1 localhost"));
+
+    let find = run(&mut guest, "find /etc -maxdepth 1 -type f");
+    assert!(find.lines().any(|path| path == "/etc/passwd"));
+    assert!(!find.lines().any(|path| path == "/etc/apt"));
+    assert!(run(&mut guest, "id nobody").contains("uid=65534(nobody) gid=65534(nogroup)"));
+
+    let ps = run(&mut guest, "ps -eo pid,ppid,user,stat,etime,time,comm");
+    assert!(ps.starts_with("PID PPID USER STAT ETIME TIME COMM\n"));
+    assert!(ps.lines().any(|line| line.starts_with("2 0 root S ")));
+    assert_eq!(
+        run(&mut guest, "ps -p 2 -o pid,ppid,comm").trim(),
+        "PID PPID COMM\n2 0 [kthreadd]"
+    );
+    assert!(run(&mut guest, "cat /proc/2/status").contains("PPid:\t0\n"));
+    let init_status = run(&mut guest, "cat /proc/1/status");
+    assert!(init_status.contains("Threads:\t1\n"));
+    assert!(init_status.contains("VmSize:"));
+    assert!(run(&mut guest, "cat /proc/stat").contains("cpu3 "));
+    let proc_stat = run(&mut guest, "cat /proc/stat");
+    let aggregate_cpu = proc_stat
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let per_cpu_sum = proc_stat
+        .lines()
+        .filter(|line| {
+            line.starts_with("cpu") && line.chars().nth(3).is_some_and(|ch| ch.is_ascii_digit())
+        })
+        .map(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        })
+        .sum::<u64>();
+    assert!(aggregate_cpu >= per_cpu_sum && aggregate_cpu - per_cpu_sum < 4);
+    assert!(run(&mut guest, "cat /proc/loadavg").contains("0.08 0.04 0.01"));
+    assert!(run(&mut guest, "cat /proc/net/tcp").contains("1504140A:0016 2A7100CB:C8E8 01"));
+    assert!(run(&mut guest, "ss -tan").contains("ESTAB"));
+    assert!(!run(&mut guest, "ss -tuln").contains("ESTAB"));
+    let uptime_before = run(&mut guest, "cat /proc/uptime");
+    let uptime_after = guest
+        .execute("cat /proc/uptime", now() + chrono::Duration::seconds(2))
+        .output;
+    let idle_before = uptime_before
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse::<f64>()
+        .unwrap();
+    let idle_after = uptime_after
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse::<f64>()
+        .unwrap();
+    assert!(idle_after > idle_before);
+
+    assert_eq!(run(&mut guest, "nproc").trim(), "4");
+    assert!(run(&mut guest, "lsblk").contains("sda1"));
+    assert!(run(&mut guest, "service ssh status").contains("active (running)"));
+    assert!(run(&mut guest, "who").contains("admin pts/0"));
+    assert!(run(&mut guest, "w").contains("admin     pts/0"));
+    assert_eq!(run(&mut guest, "users").trim(), "admin");
+    assert!(run(&mut guest, "ping -c 2 127.0.0.1").contains("2 packets transmitted, 2 received"));
+    assert!(run(&mut guest, "ip neigh").contains("10.20.4.1 dev eth0"));
+    assert!(run(&mut guest, "lsb_release -a").contains("Codename:\tjammy"));
+    assert!(run(&mut guest, "dpkg -s openssh-server").contains("Status: install ok installed"));
+    assert_ne!(
+        run(&mut guest, "du -sh /etc").split_whitespace().next(),
+        Some("3K")
+    );
+    assert_ne!(
+        run(&mut guest, "du -sh /var/log").split_whitespace().next(),
+        Some("0K")
+    );
+
+    let sudo = guest.execute("sudo -n true", now());
+    assert_ne!(sudo.exit_status, 0);
+    assert!(sudo.output.contains("sudo: a password is required"));
+    assert!(!sudo.output.contains("command not found"));
+    let missing_rm = guest.execute("rm /tmp/mellcore-no-such-file", now());
+    assert_ne!(missing_rm.exit_status, 0);
+    assert!(missing_rm.output.contains("No such file or directory"));
+}
+
+#[test]
 fn linux_distribution_profile_and_bash_package_version_are_consistent() {
     for (os, expected_manager, expected_bash, expected_package_version) in [
         (Distribution::Ubuntu, "apt", "5.1.16", "5.1-6ubuntu1.1"),
@@ -371,10 +474,15 @@ fn debian_release_registry_matches_installed_binaries_and_services() {
 
     assert_eq!(run(&mut guest, "which sshd").trim(), "/usr/sbin/sshd");
     for service in ["ssh", "postgresql", "docker", "cron"] {
-        assert!(
-            run(&mut guest, &format!("systemctl status {service}")).contains("active (running)"),
-            "{service} service is not active"
-        );
+        let status = run(&mut guest, &format!("systemctl status {service}"));
+        if service == "postgresql" {
+            assert!(status.contains("active (exited)"), "{service}: {status}");
+            assert!(
+                run(&mut guest, "systemctl status postgresql@17-main").contains("active (running)")
+            );
+        } else {
+            assert!(status.contains("active (running)"), "{service}: {status}");
+        }
     }
     let systemctl_version = run(&mut guest, "systemctl --version");
     assert!(systemctl_version.starts_with("systemd 257 (257.9-1~deb13u1)"));
@@ -1158,7 +1266,10 @@ fn linux_system_tools_share_virtual_proc_network_and_service_state() {
         assert!(!default_ss.contains("10.20.4.12:5432"));
         if os == Distribution::Ubuntu {
             assert!(default_ss.contains("127.0.0.1:5432"));
-            assert!(run(&mut guest, "ss -lntp").contains("users:((\"postgresql\""));
+            let process_sockets = run(&mut guest, "ss -lntp");
+            assert!(process_sockets.contains("127.0.0.1:5432"));
+            assert!(!process_sockets.contains("users:((\"postgresql\""));
+            assert!(!process_sockets.contains("pid="));
         }
         assert!(run(&mut guest, "ls /bin").contains("bash"));
     }

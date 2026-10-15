@@ -23,7 +23,7 @@ pub struct PersistentVirtualFileSystem {
 impl PersistentVirtualFileSystem {
     pub fn open(path: impl AsRef<Path>, initial: VirtualFileSystem) -> io::Result<Self> {
         let path = path.as_ref().to_owned();
-        let filesystem = match fs::symlink_metadata(&path) {
+        let (filesystem, migrated) = match fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_file() || metadata.len() > MAX_SNAPSHOT_BYTES {
                     return Err(io::Error::new(
@@ -50,22 +50,29 @@ impl PersistentVirtualFileSystem {
                         "virtual filesystem snapshot belongs to a different Linux distribution",
                     ));
                 }
-                snapshot
-                    .filesystem
+                let mut filesystem = snapshot.filesystem;
+                let repaired_directories = filesystem.repair_missing_parent_directories();
+                if repaired_directories > 0 {
+                    tracing::warn!(
+                        repaired_directories,
+                        "repaired missing virtual filesystem parent directories from an older snapshot"
+                    );
+                }
+                filesystem
                     .validate_snapshot()
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                snapshot.filesystem
+                (filesystem, repaired_directories > 0)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 initial
                     .validate_snapshot()
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                initial
+                (initial, false)
             }
             Err(error) => return Err(error),
         };
         let store = Self { path, filesystem };
-        if !store.path.exists() {
+        if migrated || !store.path.exists() {
             store.persist()?;
         }
         Ok(store)
@@ -139,5 +146,43 @@ impl PersistentVirtualFileSystem {
             let _ = fs::remove_file(&temporary);
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    #[test]
+    fn open_repairs_missing_parent_directories_in_older_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("virtual-filesystem.json");
+        let filesystem = VirtualFileSystem::linux("matrix-host", Utc::now());
+        let mut serialized = serde_json::to_value(Snapshot {
+            version: SNAPSHOT_VERSION,
+            filesystem,
+        })
+        .unwrap();
+        serialized["filesystem"]["nodes"]
+            .as_object_mut()
+            .unwrap()
+            .remove("/etc/ssh");
+        fs::write(&path, serde_json::to_vec(&serialized).unwrap()).unwrap();
+
+        let loaded = PersistentVirtualFileSystem::open(
+            &path,
+            VirtualFileSystem::linux("matrix-host", Utc::now()),
+        )
+        .unwrap();
+        assert!(loaded.filesystem().is_dir("/etc/ssh"));
+        assert!(loaded.filesystem().exists("/etc/ssh/sshd_config"));
+
+        let reopened = PersistentVirtualFileSystem::open(
+            &path,
+            VirtualFileSystem::linux("matrix-host", Utc::now()),
+        )
+        .unwrap();
+        assert!(reopened.filesystem().is_dir("/etc/ssh"));
     }
 }

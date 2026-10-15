@@ -24,7 +24,9 @@ pub struct WindowsShell {
     processes: Vec<VirtualProcess>,
     vulnerability_profiles: BTreeSet<String>,
     variables: BTreeMap<String, PsValue>,
+    functions: BTreeMap<String, PsFunction>,
     max_input_bytes: usize,
+    pending_input: String,
 }
 
 #[cfg(test)]
@@ -173,6 +175,8 @@ mod scenario_command_tests {
 struct ParsedScript {
     error: Option<String>,
     #[serde(default)]
+    incomplete: bool,
+    #[serde(default)]
     items: Vec<PsStatement>,
 }
 
@@ -299,6 +303,17 @@ enum PsStatement {
         expression: String,
         body: Vec<PsStatement>,
     },
+    For {
+        initializer: String,
+        condition: String,
+        iterator: String,
+        body: Vec<PsStatement>,
+    },
+    Function {
+        name: String,
+        parameters: Vec<String>,
+        body: Vec<PsStatement>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -307,11 +322,31 @@ struct PsClause {
     body: Vec<PsStatement>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+struct PsRedirection {
+    target: String,
+    append: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PsFunction {
+    parameters: Vec<String>,
+    body: Vec<PsStatement>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PsElement {
-    Command { words: Vec<String> },
-    Expression { text: String },
+    Command {
+        words: Vec<String>,
+        #[serde(default)]
+        redirections: Vec<PsRedirection>,
+    },
+    Expression {
+        text: String,
+        #[serde(default)]
+        redirections: Vec<PsRedirection>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -391,6 +426,33 @@ fn process_nonpaged_pool_kb(process: &WinProcess) -> u32 {
     match process.name.to_ascii_lowercase().as_str() {
         "system" | "registry" => 0,
         _ => 4 + process.id.wrapping_mul(13) % 112,
+    }
+}
+
+fn process_thread_count(process: &WinProcess) -> i64 {
+    match process
+        .name
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "system" => 8,
+        "registry" => 8,
+        "smss" => 3,
+        "csrss" => 12,
+        "wininit" => 8,
+        "services" => 22,
+        "lsass" => 14,
+        "winlogon" => 10,
+        "svchost" => 14 + i64::from(process.id % 7),
+        "dwm" => 16,
+        "explorer" => 44,
+        "taskhostw" => 12,
+        "sshd" => 18,
+        "powershell" => 23,
+        "conhost" => 10,
+        "msmpeng" => 48,
+        _ => 6 + i64::from(process.id % 11),
     }
 }
 
@@ -669,46 +731,6 @@ fn service_value(service: WinService) -> PsValue {
     ]))
 }
 
-fn network_value(network: &WinNetwork) -> PsValue {
-    PsValue::Object(BTreeMap::from([
-        ("Name".into(), PsValue::String(network.adapter.clone())),
-        ("Status".into(), PsValue::String("Up".into())),
-        ("LinkSpeed".into(), PsValue::String("1 Gbps".into())),
-        (
-            "InterfaceAlias".into(),
-            PsValue::String(network.adapter.clone()),
-        ),
-        (
-            "InterfaceIndex".into(),
-            PsValue::Number(network.interface_index as i64),
-        ),
-        ("MacAddress".into(), PsValue::String(network.mac.clone())),
-        ("IPAddress".into(), PsValue::String(network.ipv4.clone())),
-        (
-            "PrefixLength".into(),
-            PsValue::Number(network.prefix as i64),
-        ),
-        (
-            "DefaultGateway".into(),
-            PsValue::String(network.gateway.clone()),
-        ),
-        ("IPv4Address".into(), PsValue::String(network.ipv4.clone())),
-        (
-            "IPv4DefaultGateway".into(),
-            PsValue::String(network.gateway.clone()),
-        ),
-        (
-            "DNSServer".into(),
-            PsValue::Array(network.dns.iter().cloned().map(PsValue::String).collect()),
-        ),
-        ("DhcpEnabled".into(), PsValue::Bool(network.dhcp)),
-        (
-            "DnsSuffix".into(),
-            PsValue::String(network.dns_suffix.clone()),
-        ),
-    ]))
-}
-
 fn format_values(values: &[PsValue]) -> String {
     if values.is_empty() {
         return String::new();
@@ -731,10 +753,97 @@ fn format_values(values: &[PsValue]) -> String {
             return String::new();
         };
         let preferred: &[&str] =
-            if first.contains_key("Status") && first.contains_key("DisplayName") {
+            if first.contains_key("LocalAddress") && first.contains_key("RemoteAddress") {
+                &[
+                    "State",
+                    "LocalAddress",
+                    "LocalPort",
+                    "RemoteAddress",
+                    "RemotePort",
+                    "OwningProcess",
+                ]
+            } else if first.contains_key("DestinationPrefix") {
+                &[
+                    "DestinationPrefix",
+                    "NextHop",
+                    "InterfaceIndex",
+                    "RouteMetric",
+                    "Protocol",
+                ]
+            } else if first.contains_key("CreationTime") && first.contains_key("LocalPort") {
+                &["LocalAddress", "LocalPort", "OwningProcess", "CreationTime"]
+            } else if first.contains_key("DiskNumber") && first.contains_key("PartitionNumber") {
+                &[
+                    "DiskNumber",
+                    "PartitionNumber",
+                    "DriveLetter",
+                    "Type",
+                    "Size",
+                ]
+            } else if first.contains_key("Number") && first.contains_key("PartitionStyle") {
+                &[
+                    "Number",
+                    "FriendlyName",
+                    "HealthStatus",
+                    "OperationalStatus",
+                    "PartitionStyle",
+                    "Size",
+                ]
+            } else if first.contains_key("DefaultInboundAction") {
+                &[
+                    "Name",
+                    "Enabled",
+                    "DefaultInboundAction",
+                    "DefaultOutboundAction",
+                ]
+            } else if first.contains_key("Name")
+                && first.contains_key("Type")
+                && first.contains_key("IPAddress")
+            {
+                &["Name", "Type", "IPAddress", "TTL", "Section"]
+            } else if first.contains_key("NumberOfLogicalProcessors") {
+                &[
+                    "Name",
+                    "Manufacturer",
+                    "NumberOfCores",
+                    "NumberOfLogicalProcessors",
+                    "MaxClockSpeed",
+                ]
+            } else if first.contains_key("Status") && first.contains_key("DisplayName") {
                 &["Status", "Name", "DisplayName"]
             } else if first.contains_key("Id") && first.contains_key("CPU") {
                 &["Handles", "NPM", "WS", "CPU", "Id", "Name"]
+            } else if first.contains_key("ServerAddresses") {
+                &[
+                    "InterfaceAlias",
+                    "InterfaceIndex",
+                    "AddressFamily",
+                    "ServerAddresses",
+                ]
+            } else if first.contains_key("Name")
+                && first.contains_key("InterfaceDescription")
+                && first.contains_key("LinkSpeed")
+            {
+                &[
+                    "Name",
+                    "InterfaceDescription",
+                    "InterfaceIndex",
+                    "Status",
+                    "MacAddress",
+                    "LinkSpeed",
+                ]
+            } else if first.contains_key("InterfaceAlias")
+                && first.contains_key("AddressFamily")
+                && first.contains_key("IPAddress")
+            {
+                &[
+                    "IPAddress",
+                    "InterfaceIndex",
+                    "InterfaceAlias",
+                    "AddressFamily",
+                    "PrefixLength",
+                    "Type",
+                ]
             } else if first.contains_key("InterfaceAlias") {
                 &[
                     "InterfaceAlias",
@@ -756,13 +865,6 @@ fn format_values(values: &[PsValue]) -> String {
                     "OperationalStatus",
                     "SizeRemaining",
                     "Size",
-                ]
-            } else if first.contains_key("ServerAddresses") {
-                &[
-                    "InterfaceAlias",
-                    "InterfaceIndex",
-                    "AddressFamily",
-                    "ServerAddresses",
                 ]
             } else if first.contains_key("TimeCreated") && first.contains_key("ProviderName") {
                 &[
@@ -803,7 +905,7 @@ fn format_values(values: &[PsValue]) -> String {
                     .iter()
                     .map(|name| {
                         value_property(object, name)
-                            .map(PsValue::text)
+                            .map(format_cell)
                             .unwrap_or_default()
                     })
                     .collect::<Vec<_>>()
@@ -851,10 +953,33 @@ fn format_values(values: &[PsValue]) -> String {
         .collect()
 }
 
-fn parse_with_powershell(line: &str) -> Result<Vec<PsStatement>, String> {
+fn format_cell(value: &PsValue) -> String {
+    match value {
+        PsValue::Array(values) => values
+            .iter()
+            .map(PsValue::text)
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => value.text(),
+    }
+}
+
+fn parse_output_value(value: &str) -> PsValue {
+    if value.eq_ignore_ascii_case("true") {
+        PsValue::Bool(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        PsValue::Bool(false)
+    } else if let Ok(number) = value.parse::<i64>() {
+        PsValue::Number(number)
+    } else {
+        PsValue::String(value.to_owned())
+    }
+}
+
+fn parse_with_powershell(line: &str) -> Result<Option<Vec<PsStatement>>, String> {
     let parser = POWERSHELL_PARSER.get_or_init(|| Mutex::new(ParserWorkerState::Uninitialized));
     let Ok(mut state) = parser.lock() else {
-        return parse_fallback_script(line);
+        return parse_fallback_result(line);
     };
     if matches!(*state, ParserWorkerState::Uninitialized) {
         *state = match ParserWorker::spawn() {
@@ -863,7 +988,7 @@ fn parse_with_powershell(line: &str) -> Result<Vec<PsStatement>, String> {
         };
     }
     let parsed: ParsedScript = match &mut *state {
-        ParserWorkerState::Unavailable => return parse_fallback_script(line),
+        ParserWorkerState::Unavailable => return parse_fallback_result(line),
         ParserWorkerState::Uninitialized => unreachable!(),
         ParserWorkerState::Running(worker) => match worker.request(line) {
             Ok(response) => match serde_json::from_str(&response) {
@@ -879,10 +1004,58 @@ fn parse_with_powershell(line: &str) -> Result<Vec<PsStatement>, String> {
             }
         },
     };
+    if parsed.incomplete {
+        return Ok(None);
+    }
     if let Some(error) = parsed.error {
         return Err(error);
     }
-    Ok(parsed.items)
+    Ok(Some(parsed.items))
+}
+
+fn parse_fallback_result(source: &str) -> Result<Option<Vec<PsStatement>>, String> {
+    match parse_fallback_script(source) {
+        Ok(items) => Ok(Some(items)),
+        Err(_) if fallback_input_is_incomplete(source) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn fallback_input_is_incomplete(source: &str) -> bool {
+    let mut stack = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in source.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote == Some('"') && ch == '`' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '{' | '[' => stack.push(ch),
+            ')' if stack.last() == Some(&'(') => {
+                stack.pop();
+            }
+            '}' if stack.last() == Some(&'{') => {
+                stack.pop();
+            }
+            ']' if stack.last() == Some(&'[') => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    quote.is_some() || escaped || !stack.is_empty()
 }
 
 fn parse_fallback_script(source: &str) -> Result<Vec<PsStatement>, String> {
@@ -890,6 +1063,42 @@ fn parse_fallback_script(source: &str) -> Result<Vec<PsStatement>, String> {
     for statement in split_script_statements(source) {
         let statement = statement.trim();
         if statement.is_empty() {
+            continue;
+        }
+        if starts_with_keyword(statement, "function") {
+            let rest = statement[8..].trim_start();
+            let Some(open_brace) = rest.find('{') else {
+                return Err("Missing '{' in PowerShell function definition.".into());
+            };
+            let name = rest[..open_brace].trim();
+            if name.is_empty() || name.split_whitespace().count() != 1 {
+                return Err("Invalid PowerShell function name.".into());
+            }
+            let close_brace = matching_delimiter(rest, open_brace, '{', '}')
+                .ok_or_else(|| "Missing '}' in PowerShell function body.".to_owned())?;
+            if !rest[close_brace + 1..].trim().is_empty() {
+                return Err("Unexpected input after PowerShell function body.".into());
+            }
+            let mut function_body = rest[open_brace + 1..close_brace].trim();
+            let mut parameters = Vec::new();
+            if starts_with_keyword(function_body, "param") {
+                let param_rest = function_body[5..].trim_start();
+                if let Some(open) = param_rest.find('(') {
+                    let close = matching_delimiter(param_rest, open, '(', ')')
+                        .ok_or_else(|| "Missing ')' in function param block.".to_owned())?;
+                    parameters = split_array_items(&param_rest[open + 1..close])
+                        .into_iter()
+                        .map(|param| param.trim().trim_start_matches('$').to_owned())
+                        .filter(|param| !param.is_empty())
+                        .collect();
+                    function_body = param_rest[close + 1..].trim();
+                }
+            }
+            items.push(PsStatement::Function {
+                name: name.to_owned(),
+                parameters,
+                body: parse_fallback_script(function_body)?,
+            });
             continue;
         }
         if starts_with_keyword(statement, "if") {
@@ -964,12 +1173,65 @@ fn parse_fallback_script(source: &str) -> Result<Vec<PsStatement>, String> {
             });
             continue;
         }
+        if starts_with_keyword(statement, "for") {
+            let rest = statement[3..].trim_start();
+            let Some(open_paren) = rest.find('(') else {
+                return Err("Missing '(' after 'for' in PowerShell expression.".into());
+            };
+            let close_paren = matching_delimiter(rest, open_paren, '(', ')')
+                .ok_or_else(|| "Missing ')' in PowerShell for expression.".to_owned())?;
+            let clauses = split_top_level(&rest[open_paren + 1..close_paren], ';');
+            if clauses.len() != 3 {
+                return Err("Invalid PowerShell for expression.".into());
+            }
+            let after_iterator = rest[close_paren + 1..].trim_start();
+            let Some(open_brace) = after_iterator.find('{') else {
+                return Err("Missing '{' after PowerShell for expression.".into());
+            };
+            let close_brace = matching_delimiter(after_iterator, open_brace, '{', '}')
+                .ok_or_else(|| "Missing '}' in PowerShell for body.".to_owned())?;
+            if !after_iterator[..open_brace].trim().is_empty()
+                || !after_iterator[close_brace + 1..].trim().is_empty()
+            {
+                return Err("Unexpected input around PowerShell for body.".into());
+            }
+            items.push(PsStatement::For {
+                initializer: clauses[0].trim().to_owned(),
+                condition: clauses[1].trim().to_owned(),
+                iterator: clauses[2].trim().to_owned(),
+                body: parse_fallback_script(&after_iterator[open_brace + 1..close_brace])?,
+            });
+            continue;
+        }
         if starts_with_keyword(statement, "exit") || starts_with_keyword(statement, "logout") {
             items.push(PsStatement::Pipeline {
                 elements: vec![PsElement::Command {
                     words: vec![statement.split_whitespace().next().unwrap().to_owned()],
+                    redirections: Vec::new(),
                 }],
             });
+            continue;
+        }
+        if let Some((command, operator, target)) = split_at_top_level(statement, &[">>", ">"]) {
+            if target.trim().is_empty() {
+                return Err("A file path is required after the redirection operator.".into());
+            }
+            let mut parsed_command = parse_fallback_script(command.trim())?;
+            let Some(PsStatement::Pipeline { elements }) = parsed_command.last_mut() else {
+                return Err("PowerShell output redirection requires a pipeline.".into());
+            };
+            let Some(element) = elements.last_mut() else {
+                return Err("PowerShell output redirection requires a pipeline element.".into());
+            };
+            let redirection = PsRedirection {
+                target: target.trim().to_owned(),
+                append: operator == ">>",
+            };
+            match element {
+                PsElement::Command { redirections, .. }
+                | PsElement::Expression { redirections, .. } => redirections.push(redirection),
+            }
+            items.extend(parsed_command);
             continue;
         }
         if let Some(equal) = top_level_assignment_operator(statement) {
@@ -994,13 +1256,17 @@ fn parse_fallback_script(source: &str) -> Result<Vec<PsStatement>, String> {
             if is_expression_text(part) {
                 elements.push(PsElement::Expression {
                     text: part.to_owned(),
+                    redirections: Vec::new(),
                 });
             } else {
                 let words = split_powershell_words(part);
                 if words.is_empty() {
                     return Err("Empty PowerShell command.".into());
                 }
-                elements.push(PsElement::Command { words });
+                elements.push(PsElement::Command {
+                    words,
+                    redirections: Vec::new(),
+                });
             }
         }
         items.push(PsStatement::Pipeline { elements });
@@ -1049,9 +1315,16 @@ fn split_script_statements(source: &str) -> Vec<&str> {
             ']' => brackets = brackets.saturating_sub(1),
             '{' => braces += 1,
             '}' => braces = braces.saturating_sub(1),
-            ';' | '\n' if parens == 0 && brackets == 0 && braces == 0 => {
+            ';' if parens == 0 && brackets == 0 && braces == 0 => {
                 parts.push(&source[start..index]);
                 start = index + ch.len_utf8();
+            }
+            '\n' if parens == 0 && brackets == 0 && braces == 0 => {
+                let next = source[index + ch.len_utf8()..].trim_start();
+                if !starts_with_keyword(next, "else") && !starts_with_keyword(next, "elseif") {
+                    parts.push(&source[start..index]);
+                    start = index + ch.len_utf8();
+                }
             }
             _ => {}
         }
@@ -1255,7 +1528,8 @@ fn split_powershell_words(source: &str) -> Vec<String> {
 pub fn check_parser() -> Result<(), String> {
     let parsed = parse_with_powershell(
         "$test = 123; if ($test -eq 123) { Get-Process | Select-Object Name }; \"hello\"; 1 + 2; @(1, 2, 3)",
-    )?;
+    )?
+    .ok_or_else(|| "PowerShell parser returned an incomplete script unexpectedly.".to_owned())?;
     if parsed.len() == 5
         && matches!(parsed.first(), Some(PsStatement::Assignment { left, .. }) if left.eq_ignore_ascii_case("$test"))
         && matches!(parsed.get(1), Some(PsStatement::If { .. }))
@@ -1303,7 +1577,9 @@ impl WindowsShell {
             processes: processes.to_vec(),
             vulnerability_profiles: vulnerability_profiles.iter().cloned().collect(),
             variables: BTreeMap::new(),
+            functions: BTreeMap::new(),
             max_input_bytes,
+            pending_input: String::new(),
         };
         shell.initialize_windows_state(now);
         shell.initialize_variables();
@@ -1311,7 +1587,15 @@ impl WindowsShell {
     }
 
     pub fn prompt(&self) -> String {
-        format!("PS {}> ", Self::display_path(&self.cwd))
+        if self.pending_input.is_empty() {
+            format!("PS {}> ", Self::display_path(&self.cwd))
+        } else {
+            ">> ".into()
+        }
+    }
+
+    pub fn cancel_continuation(&mut self) {
+        self.pending_input.clear();
     }
     pub fn metrics(&self) -> DeceptionMetrics {
         DeceptionMetrics::default()
@@ -1325,6 +1609,12 @@ impl WindowsShell {
         self.fs = fs;
         self.initialize_windows_state(now);
         self.initialize_variables();
+    }
+
+    pub fn replace_filesystem_preserving_state(&mut self, fs: VirtualFileSystem) {
+        let variables = self.variables.clone();
+        self.replace_filesystem(fs);
+        self.variables.extend(variables);
     }
 
     fn display_path(path: &str) -> String {
@@ -1659,6 +1949,66 @@ impl WindowsShell {
         }
     }
 
+    fn principal_sid(&self, principal: &str) -> String {
+        let name = principal
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(principal)
+            .trim();
+        if name.eq_ignore_ascii_case("SYSTEM") || name.eq_ignore_ascii_case("root") {
+            return "SY".into();
+        }
+        if name.eq_ignore_ascii_case("Administrators") {
+            return "BA".into();
+        }
+        if name.eq_ignore_ascii_case("Users") {
+            return "BU".into();
+        }
+        if name.eq_ignore_ascii_case("Authenticated Users") {
+            return "AU".into();
+        }
+        if name.eq_ignore_ascii_case("Everyone") {
+            return "WD".into();
+        }
+        if name.eq_ignore_ascii_case("INTERACTIVE") {
+            return "IU".into();
+        }
+
+        let users = serde_json::from_slice::<serde_json::Value>(
+            self.fs.read("/State/users.json").unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        if let Some(sid) = users
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|entry| {
+                entry["name"]
+                    .as_str()
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+            })
+            .and_then(|entry| entry["sid"].as_str())
+        {
+            return sid.to_owned();
+        }
+        let rid = if name.eq_ignore_ascii_case("Administrator") {
+            500
+        } else if name.eq_ignore_ascii_case("Guest") {
+            501
+        } else if name.eq_ignore_ascii_case(&self.user) {
+            if name.eq_ignore_ascii_case("admin") {
+                1001
+            } else {
+                500
+            }
+        } else {
+            1100 + name.bytes().fold(0u32, |hash, byte| {
+                hash.wrapping_mul(31).wrapping_add(u32::from(byte))
+            }) % 800
+        };
+        format!("S-1-5-21-3967214721-1742538666-854245398-{rid}")
+    }
+
     fn initialize_variables(&mut self) {
         let version = PsValue::Object(BTreeMap::from([
             ("Major".into(), PsValue::Number(5)),
@@ -1846,7 +2196,7 @@ impl WindowsShell {
                     "Microsoft Defender Antivirus Service",
                     "Running",
                     "Automatic",
-                    948,
+                    4012,
                 ),
                 (
                     "WinRM",
@@ -1943,6 +2293,14 @@ impl WindowsShell {
                 ("sshd", 3712, 0, 17100, "OpenSSH SSH Server", true),
                 ("powershell", 3920, 2, 44800, "Windows PowerShell", true),
                 ("conhost", 3940, 0, 6800, "Console Window Host", true),
+                (
+                    "MsMpEng",
+                    4012,
+                    2,
+                    182000,
+                    "Antimalware Service Executable",
+                    true,
+                ),
             ]
             .into_iter()
             .map(
@@ -1957,6 +2315,26 @@ impl WindowsShell {
                 },
             )
             .collect();
+        }
+        if !processes
+            .iter()
+            .any(|process| process.name.eq_ignore_ascii_case("MsMpEng"))
+        {
+            processes.push(WinProcess {
+                name: "MsMpEng".into(),
+                id: 4012,
+                cpu_seconds: 2,
+                working_set_kb: 182_000,
+                path: "Antimalware Service Executable".into(),
+                services: vec!["WinDefend".into()],
+                running: true,
+            });
+        }
+        if let Some(service) = services
+            .iter_mut()
+            .find(|service| service.name.eq_ignore_ascii_case("WinDefend"))
+        {
+            service.process_id = 4012;
         }
         if self
             .vulnerability_profiles
@@ -2235,6 +2613,24 @@ impl WindowsShell {
             .to_ascii_lowercase()
             .replace("[system.environment]", "[environment]");
         match static_member.as_str() {
+            "[environment]::osversion" => {
+                return PsValue::Object(BTreeMap::from([
+                    ("Platform".into(), PsValue::String("Win32NT".into())),
+                    (
+                        "Version".into(),
+                        PsValue::Object(BTreeMap::from([
+                            ("Major".into(), PsValue::Number(10)),
+                            ("Minor".into(), PsValue::Number(0)),
+                            ("Build".into(), PsValue::Number(20348)),
+                            ("Revision".into(), PsValue::Number(2402)),
+                        ])),
+                    ),
+                    (
+                        "VersionString".into(),
+                        PsValue::String("Microsoft Windows NT 10.0.20348.0".into()),
+                    ),
+                ]));
+            }
             "[environment]::osversion.versionstring" => {
                 return PsValue::String("Microsoft Windows NT 10.0.20348.0".into());
             }
@@ -2562,8 +2958,8 @@ impl WindowsShell {
                         )
                     } else {
                         let value = self.evaluate_expression(right);
-                        self.variables.insert(name, value.clone());
-                        Self::output(format!("{}\n", value.text()))
+                        self.variables.insert(name, value);
+                        ShellOutput::default()
                     }
                 }
                 PsStatement::Pipeline { elements } => self.execute_pipeline(elements, now),
@@ -2612,6 +3008,29 @@ impl WindowsShell {
                     }
                     loop_result
                 }
+                PsStatement::For {
+                    initializer,
+                    condition,
+                    iterator,
+                    body,
+                } => self.execute_for_statement(initializer, condition, iterator, body, now),
+                PsStatement::Function {
+                    name,
+                    parameters,
+                    body,
+                } => {
+                    self.functions.insert(
+                        name.to_ascii_lowercase(),
+                        PsFunction {
+                            parameters: parameters
+                                .iter()
+                                .map(|name| name.trim_start_matches('$').to_ascii_lowercase())
+                                .collect(),
+                            body: body.clone(),
+                        },
+                    );
+                    ShellOutput::default()
+                }
             };
             combined.fs_actions.extend(result.fs_actions);
             combined.bait_opens.extend(result.bait_opens);
@@ -2634,20 +3053,149 @@ impl WindowsShell {
         combined
     }
 
+    fn invoke_function(
+        &mut self,
+        function: &PsFunction,
+        args: &[String],
+        now: DateTime<Utc>,
+    ) -> ShellOutput {
+        let previous_variables = self.variables.clone();
+        for (index, parameter) in function.parameters.iter().enumerate() {
+            let value = args
+                .get(index)
+                .map(|value| self.evaluate_expression(value))
+                .unwrap_or(PsValue::Null);
+            self.variables.insert(parameter.clone(), value);
+        }
+        let result = self.execute_items(&function.body, now);
+        self.variables = previous_variables;
+        result
+    }
+
+    fn execute_for_statement(
+        &mut self,
+        initializer: &str,
+        condition: &str,
+        iterator: &str,
+        body: &[PsStatement],
+        now: DateTime<Utc>,
+    ) -> ShellOutput {
+        if let Err(error) = self.execute_for_update(initializer) {
+            return Self::error(format!("ParserError: {error}\n"));
+        }
+        let mut loop_result = ShellOutput::default();
+        for _ in 0..10_000 {
+            if !condition.trim().is_empty() && !self.evaluate_condition(condition) {
+                break;
+            }
+            let iteration = self.execute_items(body, now);
+            loop_result.fs_actions.extend(iteration.fs_actions);
+            loop_result.bait_opens.extend(iteration.bait_opens);
+            loop_result
+                .virtual_interactions
+                .extend(iteration.virtual_interactions);
+            loop_result
+                .vulnerability_attempts
+                .extend(iteration.vulnerability_attempts);
+            if iteration.deception.is_some() {
+                loop_result.deception = iteration.deception;
+            }
+            loop_result.output.push_str(&iteration.output);
+            if iteration.close {
+                loop_result.close = true;
+                return loop_result;
+            }
+            if iteration.exit_status != 0 {
+                loop_result.exit_status = iteration.exit_status;
+                return loop_result;
+            }
+            if let Err(error) = self.execute_for_update(iterator) {
+                return Self::error(format!("ParserError: {error}\n"));
+            }
+        }
+        loop_result
+    }
+
+    fn execute_for_update(&mut self, expression: &str) -> Result<(), &'static str> {
+        let expression = expression.trim();
+        if expression.is_empty() {
+            return Ok(());
+        }
+        if let Some(variable) = expression.strip_suffix("++") {
+            return self.increment_for_variable(variable.trim(), 1);
+        }
+        if let Some(variable) = expression.strip_suffix("--") {
+            return self.increment_for_variable(variable.trim(), -1);
+        }
+        let Some(equal) = top_level_assignment_operator(expression) else {
+            return Err("Only simple variable updates are supported in a PowerShell for loop.");
+        };
+        let mut left = expression[..equal].trim();
+        let right = expression[equal + 1..].trim();
+        let operation = if let Some(name) = left.strip_suffix('+') {
+            left = name.trim();
+            Some(1)
+        } else if let Some(name) = left.strip_suffix('-') {
+            left = name.trim();
+            Some(-1)
+        } else {
+            None
+        };
+        let name = left.trim().trim_start_matches('$').to_ascii_lowercase();
+        if name.is_empty() || name.contains([' ', '.', '[', ']']) || right.is_empty() {
+            return Err("Only simple variable updates are supported in a PowerShell for loop.");
+        }
+        let mut value = self.evaluate_expression(right);
+        if let Some(step) = operation {
+            let Some(previous) = self.variables.get(&name) else {
+                return Err("The PowerShell for loop variable is not numeric.");
+            };
+            let Some(previous) = previous.text().parse::<i64>().ok() else {
+                return Err("The PowerShell for loop variable is not numeric.");
+            };
+            let Some(delta) = value.text().parse::<i64>().ok() else {
+                return Err("The PowerShell for loop increment is not numeric.");
+            };
+            value = PsValue::Number(if step > 0 {
+                previous.saturating_add(delta)
+            } else {
+                previous.saturating_sub(delta)
+            });
+        }
+        self.variables.insert(name, value);
+        Ok(())
+    }
+
+    fn increment_for_variable(&mut self, variable: &str, step: i64) -> Result<(), &'static str> {
+        let name = variable.trim().trim_start_matches('$').to_ascii_lowercase();
+        if name.is_empty() || name.contains([' ', '.', '[', ']']) {
+            return Err("Only simple variable updates are supported in a PowerShell for loop.");
+        }
+        let Some(previous) = self.variables.get(&name) else {
+            return Err("The PowerShell for loop variable is not numeric.");
+        };
+        let Some(previous) = previous.text().parse::<i64>().ok() else {
+            return Err("The PowerShell for loop variable is not numeric.");
+        };
+        self.variables
+            .insert(name, PsValue::Number(previous.saturating_add(step)));
+        Ok(())
+    }
+
     fn execute_pipeline(&mut self, elements: &[PsElement], now: DateTime<Utc>) -> ShellOutput {
         let mut aggregate = ShellOutput::default();
         let mut values = Vec::<PsValue>::new();
         let mut last = ShellOutput::default();
         for (index, element) in elements.iter().enumerate() {
-            let result = match element {
-                PsElement::Expression { text } => {
+            let mut result = match element {
+                PsElement::Expression { text, .. } => {
                     values = match self.evaluate_expression(text) {
                         PsValue::Array(items) => items,
                         value => vec![value],
                     };
                     Self::output(format_values(&values))
                 }
-                PsElement::Command { words } => {
+                PsElement::Command { words, .. } => {
                     let prepared = words
                         .iter()
                         .map(|word| {
@@ -2667,6 +3215,7 @@ impl WindowsShell {
                         "where" => "where-object",
                         "sort" => "sort-object",
                         "measure" => "measure-object",
+                        "%" => "foreach-object",
                         other => other,
                     };
                     if matches!(
@@ -2675,6 +3224,7 @@ impl WindowsShell {
                             | "where-object"
                             | "sort-object"
                             | "measure-object"
+                            | "foreach-object"
                             | "out-string"
                     ) && (index > 0 || !values.is_empty())
                     {
@@ -2682,6 +3232,7 @@ impl WindowsShell {
                             pipeline_command,
                             &prepared[1..],
                             &mut values,
+                            now,
                         )
                     } else {
                         let pipe_text = if index == 0 {
@@ -2703,6 +3254,9 @@ impl WindowsShell {
                                 | "get-netipaddress"
                                 | "get-netipconfiguration"
                                 | "get-netadapter"
+                                | "get-nettcpconnection"
+                                | "get-netroute"
+                                | "get-netudpendpoint"
                                 | "get-ciminstance"
                                 | "gwmi"
                                 | "get-wmiobject"
@@ -2711,6 +3265,13 @@ impl WindowsShell {
                                 | "get-eventlog"
                                 | "get-counter"
                                 | "get-dnsclientserveraddress"
+                                | "resolve-dnsname"
+                                | "test-netconnection"
+                                | "get-netfirewallprofile"
+                                | "get-mpcomputerstatus"
+                                | "get-mppreference"
+                                | "get-disk"
+                                | "get-partition"
                         ) {
                             values = self.pipeline_source_values(&command, &prepared[1..], now);
                         } else if result.output.is_empty() {
@@ -2731,6 +3292,28 @@ impl WindowsShell {
                     }
                 }
             };
+            if result.exit_status == 0 {
+                let redirections = match element {
+                    PsElement::Expression { redirections, .. }
+                    | PsElement::Command { redirections, .. } => redirections,
+                };
+                for redirection in redirections {
+                    let target = self.evaluate_expression(&redirection.target).text();
+                    let redirected = self.write_redirected_output(
+                        &target,
+                        redirection.append,
+                        &format_values(&values),
+                        now,
+                    );
+                    result.fs_actions.extend(redirected.fs_actions);
+                    if redirected.exit_status != 0 {
+                        result.output = redirected.output;
+                        result.exit_status = redirected.exit_status;
+                        break;
+                    }
+                    result.output.clear();
+                }
+            }
             aggregate.fs_actions.extend(result.fs_actions.clone());
             aggregate.bait_opens.extend(result.bait_opens.clone());
             aggregate
@@ -2748,7 +3331,7 @@ impl WindowsShell {
             last = result;
         }
         if !elements.is_empty()
-            && !matches!(elements.last(), Some(PsElement::Command { words }) if words.first().is_some_and(|word| matches!(word.to_ascii_lowercase().as_str(), "write-output" | "write-host" | "echo" | "out-string" | "select-object" | "select" | "where-object" | "where" | "sort-object" | "sort" | "measure-object" | "measure")))
+            && !matches!(elements.last(), Some(PsElement::Command { words, .. }) if words.first().is_some_and(|word| matches!(word.to_ascii_lowercase().as_str(), "write-output" | "write-host" | "echo" | "out-string" | "select-object" | "select" | "where-object" | "where" | "sort-object" | "sort" | "measure-object" | "measure" | "foreach-object" | "%")))
         {
             last.output = format_values(&values);
         }
@@ -2756,11 +3339,57 @@ impl WindowsShell {
         aggregate
     }
 
+    fn write_redirected_output(
+        &mut self,
+        raw_path: &str,
+        append: bool,
+        output: &str,
+        now: DateTime<Utc>,
+    ) -> ShellOutput {
+        let Some(path) = self.path(raw_path) else {
+            return Self::error("The redirection target path is invalid.\n");
+        };
+        if self.is_protected_path(&path) {
+            return Self::error(format!(
+                "Access to the path '{}' is denied.\n",
+                Self::display_path(&path)
+            ));
+        }
+        if self.fs.is_dir(&path) {
+            return Self::error(format!(
+                "The path '{}' is a directory.\n",
+                Self::display_path(&path)
+            ));
+        }
+        let mut data = if append && self.fs.exists(&path) {
+            match self.fs.read(&path) {
+                Ok(data) => data.to_vec(),
+                Err(error) => return Self::error(format!("{error}\n")),
+            }
+        } else {
+            Vec::new()
+        };
+        data.extend_from_slice(output.as_bytes());
+        match self.fs.write(&path, data, now) {
+            Ok(()) => {
+                let mut result = ShellOutput::default();
+                result.fs_actions.push(FsAction {
+                    kind: FsActionKind::Modified,
+                    operation: if append { "append" } else { "write" },
+                    path,
+                });
+                result
+            }
+            Err(error) => Self::error(format!("{error}\n")),
+        }
+    }
+
     fn transform_pipeline_values(
-        &self,
+        &mut self,
         command: &str,
         args: &[String],
         values: &mut Vec<PsValue>,
+        now: DateTime<Utc>,
     ) -> ShellOutput {
         match command {
             "select-object" | "select" => {
@@ -2793,22 +3422,27 @@ impl WindowsShell {
                     arg.eq_ignore_ascii_case("-Property")
                         || arg.eq_ignore_ascii_case("-ExpandProperty")
                 });
-                let props = property_index
-                    .and_then(|index| args.get(index + 1))
-                    .map(|value| {
-                        value
-                            .trim_matches(['\'', '"'])
-                            .split(',')
-                            .map(str::trim)
-                            .map(str::to_owned)
+                let property_args = property_index
+                    .map(|index| {
+                        args.iter()
+                            .skip(index + 1)
+                            .take_while(|arg| !arg.starts_with('-'))
+                            .map(String::as_str)
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_else(|| {
                         args.iter()
                             .filter(|arg| !arg.starts_with('-') && arg.parse::<usize>().is_err())
-                            .map(|arg| arg.trim_matches(['\'', '"']).to_owned())
+                            .map(String::as_str)
                             .collect()
                     });
+                let props = property_args
+                    .join(" ")
+                    .split(|ch: char| ch == ',' || ch.is_whitespace())
+                    .map(|property| property.trim_matches(['\'', '"', '{', '}']))
+                    .filter(|property| !property.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
                 if props.is_empty() {
                     return Self::output(format_values(values));
                 }
@@ -2846,15 +3480,23 @@ impl WindowsShell {
             "sort-object" => {
                 let prop = args
                     .iter()
-                    .find(|arg| !arg.starts_with('-'))
-                    .map(String::as_str);
-                values.sort_by_key(|value| match (value, prop) {
+                    .position(|arg| arg.eq_ignore_ascii_case("-Property"))
+                    .and_then(|index| args.get(index + 1))
+                    .or_else(|| args.iter().find(|arg| !arg.starts_with('-')))
+                    .map(|arg| arg.trim_matches(['\'', '"', ',']).to_owned());
+                let descending = args
+                    .iter()
+                    .any(|arg| arg.eq_ignore_ascii_case("-Descending"));
+                values.sort_by_key(|value| match (value, prop.as_deref()) {
                     (PsValue::Object(object), Some(name)) => value_property(object, name)
                         .map(PsValue::text)
                         .unwrap_or_default()
                         .to_ascii_lowercase(),
                     _ => value.text().to_ascii_lowercase(),
                 });
+                if descending {
+                    values.reverse();
+                }
                 Self::output(format_values(values))
             }
             "where-object" => {
@@ -2905,6 +3547,38 @@ impl WindowsShell {
                         });
                     }
                 }
+                Self::output(format_values(values))
+            }
+            "foreach-object" | "%" => {
+                let Some(script_block) = args.iter().find(|arg| !arg.starts_with('-')) else {
+                    values.clear();
+                    return ShellOutput::default();
+                };
+                let body = script_block
+                    .trim()
+                    .strip_prefix('{')
+                    .and_then(|body| body.strip_suffix('}'))
+                    .unwrap_or(script_block)
+                    .trim();
+                let Ok(body_items) = parse_fallback_script(body) else {
+                    values.clear();
+                    return Self::error("ForEach-Object: The script block could not be parsed.\n");
+                };
+                let previous = self.variables.get("_").cloned();
+                let mut output_values = Vec::new();
+                for value in values.drain(..).take(10_000) {
+                    self.variables.insert("_".into(), value);
+                    let iteration = self.execute_items(&body_items, now);
+                    for line in iteration.output.lines() {
+                        output_values.push(parse_output_value(line));
+                    }
+                }
+                if let Some(previous) = previous {
+                    self.variables.insert("_".into(), previous);
+                } else {
+                    self.variables.remove("_");
+                }
+                *values = output_values;
                 Self::output(format_values(values))
             }
             "measure-object" => {
@@ -3134,10 +3808,7 @@ impl WindowsShell {
                     .unwrap_or_default()
             }
             "get-netipaddress" | "get-netipconfiguration" | "get-netadapter" => {
-                let network: WinNetwork =
-                    serde_json::from_slice(self.fs.read("/State/network.json").unwrap_or_default())
-                        .unwrap_or_default();
-                vec![network_value(&network)]
+                self.network_values(command)
             }
             "get-ciminstance" | "gwmi" | "get-wmiobject" => {
                 let class = args
@@ -3153,6 +3824,16 @@ impl WindowsShell {
             "get-winevent" | "get-eventlog" => self.event_values(command, args, now),
             "get-counter" => self.counter_values(args, now),
             "get-dnsclientserveraddress" => self.dns_client_values(args),
+            "get-netroute" => self.net_route_values(),
+            "get-netudpendpoint" => self.net_udp_values(),
+            "get-nettcpconnection" => self.tcp_connection_values(args),
+            "resolve-dnsname" => self.resolve_dns_values(args).unwrap_or_default(),
+            "test-netconnection" => self.net_connection_test_values(args),
+            "get-netfirewallprofile" => self.firewall_values(),
+            "get-mpcomputerstatus" => self.defender_status_values(now),
+            "get-mppreference" => self.defender_preference_values(),
+            "get-disk" => self.disk_values(),
+            "get-partition" => self.partition_values(args),
             _ => {
                 let _ = now;
                 Vec::new()
@@ -3162,12 +3843,34 @@ impl WindowsShell {
 
     pub fn execute(&mut self, line: &str, now: DateTime<Utc>) -> ShellOutput {
         if line.len() > self.max_input_bytes {
+            self.pending_input.clear();
             return Self::error("The command line is too long.\n");
         }
-        let items = match parse_with_powershell(line) {
-            Ok(items) => items,
-            Err(error) => return Self::error(format!("ParserError: {error}\n")),
+        let source = if self.pending_input.is_empty() {
+            line.to_owned()
+        } else {
+            format!("{}\n{line}", self.pending_input)
         };
+        let maximum_script_bytes = self
+            .max_input_bytes
+            .saturating_mul(16)
+            .max(self.max_input_bytes);
+        if source.len() > maximum_script_bytes {
+            self.pending_input.clear();
+            return Self::error("The command line is too long.\n");
+        }
+        let items = match parse_with_powershell(&source) {
+            Ok(Some(items)) => items,
+            Ok(None) => {
+                self.pending_input = source;
+                return ShellOutput::default();
+            }
+            Err(error) => {
+                self.pending_input.clear();
+                return Self::error(format!("ParserError: {error}\n"));
+            }
+        };
+        self.pending_input.clear();
         self.variables
             .insert("pwd".into(), PsValue::String(Self::display_path(&self.cwd)));
         let mut result = self.execute_items(&items, now);
@@ -3317,7 +4020,7 @@ impl WindowsShell {
                 "Host Name:                 {}\nOS Name:                   Microsoft Windows Server 2022 Standard\nSystem Type:               x64-based PC\n",
                 self.hostname
             )),
-            "ipconfig" | "ipconfig.exe" => self.ipconfig(args),
+            "ipconfig" | "ipconfig.exe" => self.ipconfig(args, now),
             "route" | "route.exe" => self.route_print(),
             "arp" | "arp.exe" => self.arp_table(),
             "get-ciminstance" | "gwmi" | "get-wmiobject" => {
@@ -3327,18 +4030,15 @@ impl WindowsShell {
                     .and_then(|index| args.get(index + 1))
                     .map(String::as_str)
                     .unwrap_or(arg);
-                if class.eq_ignore_ascii_case("Win32_OperatingSystem") {
-                    Self::output(format!(
-                        "Caption           : Microsoft Windows Server 2022 Standard\nCSName            : {}\nOSArchitecture    : 64-bit\n",
-                        self.hostname
-                    ))
-                } else if class.eq_ignore_ascii_case("Win32_ComputerSystem") {
-                    Self::output(format!(
-                        "Name              : {}\nUserName          : {}\\{}\n",
-                        self.hostname, self.hostname, self.user
-                    ))
-                } else if class.eq_ignore_ascii_case("Win32_BIOS")
-                    || class.eq_ignore_ascii_case("Win32_Process")
+                if [
+                    "Win32_OperatingSystem",
+                    "Win32_ComputerSystem",
+                    "Win32_Processor",
+                    "Win32_BIOS",
+                    "Win32_Process",
+                ]
+                .iter()
+                .any(|known| class.eq_ignore_ascii_case(known))
                 {
                     Self::output(format_values(&self.cim_values(class, args)))
                 } else {
@@ -3352,6 +4052,35 @@ impl WindowsShell {
             "get-counter" => Self::output(format_values(&self.counter_values(args, now))),
             "get-dnsclientserveraddress" => {
                 Self::output(format_values(&self.dns_client_values(args)))
+            }
+            "get-netipconfiguration" | "get-netipaddress" | "get-netadapter" => {
+                Self::output(format_values(&self.network_values(&cmd)))
+            }
+            "get-netroute" => Self::output(format_values(&self.net_route_values())),
+            "get-netudpendpoint" => Self::output(format_values(&self.net_udp_values())),
+            "get-nettcpconnection" => {
+                Self::output(format_values(&self.tcp_connection_values(args)))
+            }
+            "resolve-dnsname" => match self.resolve_dns_values(args) {
+                Ok(values) => Self::output(format_values(&values)),
+                Err(error) => Self::error(error),
+            },
+            "test-netconnection" => {
+                Self::output(format_values(&self.net_connection_test_values(args)))
+            }
+            "get-netfirewallprofile" => Self::output(format_values(&self.firewall_values())),
+            "get-mpcomputerstatus" => {
+                Self::output(format_values(&self.defender_status_values(now)))
+            }
+            "get-mppreference" => Self::output(format_values(&self.defender_preference_values())),
+            "get-disk" => Self::output(format_values(&self.disk_values())),
+            "get-partition" => Self::output(format_values(&self.partition_values(args))),
+            "wevtutil" | "wevtutil.exe"
+                if args
+                    .first()
+                    .is_some_and(|arg| arg.eq_ignore_ascii_case("el")) =>
+            {
+                Self::output("Application\nSecurity\nSetup\nSystem\nWindows PowerShell\n")
             }
             "ssh" | "ssh.exe" => {
                 if args.iter().any(|arg| arg == "-V") {
@@ -3369,10 +4098,7 @@ impl WindowsShell {
             "get-psdrive" => Self::output(
                 "Name Used (GB) Free (GB) Provider   Root\n---- --------- --------- --------   ----\nC       18.42     81.58 FileSystem C:\\\n",
             ),
-            "get-netipconfiguration" | "get-netipaddress" | "get-netadapter" => {
-                self.network_command(&cmd)
-            }
-            "get-nettcpconnection" | "netstat" | "netstat.exe" => self.tcp_connections(args),
+            "netstat" | "netstat.exe" => self.tcp_connections(args),
             "get-smbshare" if self.vulnerability_profiles.contains("win_guest_share") => {
                 Self::output(
                     "Name        ScopeName Path                           Description\n----        --------- ----                           -----------\nPublicShare *         C:\\ProgramData\\PublicShare    Operations documents\n",
@@ -3660,6 +4386,12 @@ impl WindowsShell {
                 let Some(path) = self.path(arg) else {
                     return Self::error("Remove-Item: Specify a valid path.\n");
                 };
+                if !self.fs.exists(&path) {
+                    return Self::error(format!(
+                        "Remove-Item : Cannot find path '{}' because it does not exist.\n",
+                        Self::display_path(&path)
+                    ));
+                }
                 if self.is_protected_path(&path) {
                     return Self::error(format!(
                         "Remove-Item : Access to the path '{}' is denied.\n",
@@ -3821,10 +4553,16 @@ impl WindowsShell {
                 close: true,
                 ..ShellOutput::default()
             },
-            _ => Self::error(format!(
-                "{}: The term '{}' is not recognized as the name of a cmdlet, function, script file, or operable program.\n",
-                command, command
-            )),
+            _ => {
+                if let Some(function) = self.functions.get(&cmd).cloned() {
+                    self.invoke_function(&function, args, now)
+                } else {
+                    Self::error(format!(
+                        "{}: The term '{}' is not recognized as the name of a cmdlet, function, script file, or operable program.\n",
+                        command, command
+                    ))
+                }
+            }
         }
     }
 
@@ -3898,6 +4636,70 @@ impl WindowsShell {
     }
 
     fn cim_values(&self, class: &str, args: &[String]) -> Vec<PsValue> {
+        if class.eq_ignore_ascii_case("Win32_OperatingSystem") {
+            return vec![PsValue::Object(BTreeMap::from([
+                (
+                    "Caption".into(),
+                    PsValue::String("Microsoft Windows Server 2022 Standard".into()),
+                ),
+                ("CSName".into(), PsValue::String(self.hostname.clone())),
+                ("OSArchitecture".into(), PsValue::String("64-bit".into())),
+                ("Version".into(), PsValue::String("10.0.20348".into())),
+                ("BuildNumber".into(), PsValue::String("20348".into())),
+                (
+                    "WindowsDirectory".into(),
+                    PsValue::String("C:\\Windows".into()),
+                ),
+                (
+                    "SystemDirectory".into(),
+                    PsValue::String("C:\\Windows\\system32".into()),
+                ),
+                (
+                    "NumberOfProcesses".into(),
+                    PsValue::Number(self.processes_state().len() as i64),
+                ),
+            ]))];
+        }
+        if class.eq_ignore_ascii_case("Win32_ComputerSystem") {
+            return vec![PsValue::Object(BTreeMap::from([
+                ("Name".into(), PsValue::String(self.hostname.clone())),
+                ("Domain".into(), PsValue::String("corp.local".into())),
+                (
+                    "Manufacturer".into(),
+                    PsValue::String("Microsoft Corporation".into()),
+                ),
+                ("Model".into(), PsValue::String("Virtual Machine".into())),
+                ("SystemType".into(), PsValue::String("x64-based PC".into())),
+                ("TotalPhysicalMemory".into(), PsValue::Number(8_589_934_592)),
+                (
+                    "UserName".into(),
+                    PsValue::String(format!("{}\\{}", self.hostname, self.user)),
+                ),
+                ("PartOfDomain".into(), PsValue::Bool(true)),
+            ]))];
+        }
+        if class.eq_ignore_ascii_case("Win32_Processor") {
+            return vec![PsValue::Object(BTreeMap::from([
+                (
+                    "Name".into(),
+                    PsValue::String("Intel(R) Xeon(R) Platinum 8272CL CPU @ 2.60GHz".into()),
+                ),
+                (
+                    "Manufacturer".into(),
+                    PsValue::String("GenuineIntel".into()),
+                ),
+                ("NumberOfCores".into(), PsValue::Number(2)),
+                ("NumberOfLogicalProcessors".into(), PsValue::Number(4)),
+                ("MaxClockSpeed".into(), PsValue::Number(2600)),
+                ("AddressWidth".into(), PsValue::Number(64)),
+                ("DataWidth".into(), PsValue::Number(64)),
+                ("Architecture".into(), PsValue::Number(9)),
+                (
+                    "ProcessorId".into(),
+                    PsValue::String("Intel64 Family 6 Model 85 Stepping 7".into()),
+                ),
+            ]))];
+        }
         if class.eq_ignore_ascii_case("Win32_BIOS") {
             return vec![PsValue::Object(BTreeMap::from([
                 (
@@ -4005,8 +4807,14 @@ impl WindowsShell {
                             "WorkingSetSize".into(),
                             PsValue::Number(process.working_set_kb as i64 * 1024),
                         ),
-                        ("ThreadCount".into(), PsValue::Number(8)),
-                        ("SessionId".into(), PsValue::Number(0)),
+                        (
+                            "ThreadCount".into(),
+                            PsValue::Number(process_thread_count(&process)),
+                        ),
+                        (
+                            "SessionId".into(),
+                            PsValue::Number(i64::from(tasklist_session(&process).1)),
+                        ),
                     ]))
                 })
                 .collect();
@@ -4246,6 +5054,452 @@ impl WindowsShell {
         ]))]
     }
 
+    fn network_values(&self, command: &str) -> Vec<PsValue> {
+        let network = self.network_state();
+        let value = match command {
+            "get-netadapter" => BTreeMap::from([
+                ("Name".into(), PsValue::String(network.adapter.clone())),
+                (
+                    "InterfaceDescription".into(),
+                    PsValue::String("Intel(R) Ethernet Connection".into()),
+                ),
+                (
+                    "InterfaceIndex".into(),
+                    PsValue::Number(network.interface_index as i64),
+                ),
+                ("Status".into(), PsValue::String("Up".into())),
+                ("MacAddress".into(), PsValue::String(network.mac.clone())),
+                ("LinkSpeed".into(), PsValue::String("1 Gbps".into())),
+                (
+                    "DriverInformation".into(),
+                    PsValue::String("vEthernet".into()),
+                ),
+            ]),
+            "get-netipaddress" => BTreeMap::from([
+                ("IPAddress".into(), PsValue::String(network.ipv4.clone())),
+                (
+                    "InterfaceIndex".into(),
+                    PsValue::Number(network.interface_index as i64),
+                ),
+                (
+                    "InterfaceAlias".into(),
+                    PsValue::String(network.adapter.clone()),
+                ),
+                ("AddressFamily".into(), PsValue::String("IPv4".into())),
+                (
+                    "PrefixLength".into(),
+                    PsValue::Number(network.prefix as i64),
+                ),
+                ("Type".into(), PsValue::String("Unicast".into())),
+                (
+                    "PrefixOrigin".into(),
+                    PsValue::String(if network.dhcp { "Dhcp" } else { "Manual" }.into()),
+                ),
+                (
+                    "SuffixOrigin".into(),
+                    PsValue::String(if network.dhcp { "Dhcp" } else { "Manual" }.into()),
+                ),
+                ("AddressState".into(), PsValue::String("Preferred".into())),
+            ]),
+            _ => BTreeMap::from([
+                (
+                    "InterfaceAlias".into(),
+                    PsValue::String(network.adapter.clone()),
+                ),
+                (
+                    "InterfaceIndex".into(),
+                    PsValue::Number(network.interface_index as i64),
+                ),
+                (
+                    "InterfaceDescription".into(),
+                    PsValue::String("Intel(R) Ethernet Connection".into()),
+                ),
+                (
+                    "NetAdapter".into(),
+                    PsValue::String(network.adapter.clone()),
+                ),
+                (
+                    "IPv4Address".into(),
+                    PsValue::String(format!("{}/{}", network.ipv4, network.prefix)),
+                ),
+                (
+                    "IPv4DefaultGateway".into(),
+                    PsValue::String(network.gateway.clone()),
+                ),
+                (
+                    "DNSServer".into(),
+                    PsValue::Array(network.dns.iter().cloned().map(PsValue::String).collect()),
+                ),
+                (
+                    "NetProfile.Name".into(),
+                    PsValue::String(network.dns_suffix.clone()),
+                ),
+            ]),
+        };
+        vec![PsValue::Object(value)]
+    }
+
+    fn net_route_values(&self) -> Vec<PsValue> {
+        let network = self.network_state();
+        let octets = network
+            .ipv4
+            .split('.')
+            .filter_map(|part| part.parse::<u8>().ok())
+            .collect::<Vec<_>>();
+        let mut values = vec![PsValue::Object(BTreeMap::from([
+            (
+                "DestinationPrefix".into(),
+                PsValue::String("0.0.0.0/0".into()),
+            ),
+            ("NextHop".into(), PsValue::String(network.gateway.clone())),
+            (
+                "InterfaceIndex".into(),
+                PsValue::Number(network.interface_index as i64),
+            ),
+            ("RouteMetric".into(), PsValue::Number(25)),
+            ("Protocol".into(), PsValue::String("NetMgmt".into())),
+            ("PolicyStore".into(), PsValue::String("ActiveStore".into())),
+        ]))];
+        if octets.len() == 4 {
+            let address = u32::from_be_bytes([octets[0], octets[1], octets[2], octets[3]]);
+            let prefix = network.prefix.min(32);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            let subnet = (address & mask).to_be_bytes();
+            values.push(PsValue::Object(BTreeMap::from([
+                (
+                    "DestinationPrefix".into(),
+                    PsValue::String(format!(
+                        "{}.{}.{}.{}/{}",
+                        subnet[0], subnet[1], subnet[2], subnet[3], prefix
+                    )),
+                ),
+                ("NextHop".into(), PsValue::String("0.0.0.0".into())),
+                (
+                    "InterfaceIndex".into(),
+                    PsValue::Number(network.interface_index as i64),
+                ),
+                ("RouteMetric".into(), PsValue::Number(281)),
+                ("Protocol".into(), PsValue::String("Local".into())),
+                ("PolicyStore".into(), PsValue::String("ActiveStore".into())),
+            ])));
+        }
+        values
+    }
+
+    fn net_udp_values(&self) -> Vec<PsValue> {
+        self.services_state()
+            .iter()
+            .filter(|service| service.status.eq_ignore_ascii_case("Running"))
+            .filter_map(|service| {
+                let port_and_pid = match service.name.to_ascii_lowercase().as_str() {
+                    "dnscache" => Some((5353, service.process_id)),
+                    "dhcp" => Some((68, service.process_id)),
+                    _ => None,
+                }?;
+                Some(PsValue::Object(BTreeMap::from([
+                    ("LocalAddress".into(), PsValue::String("0.0.0.0".into())),
+                    ("LocalPort".into(), PsValue::Number(port_and_pid.0)),
+                    (
+                        "OwningProcess".into(),
+                        PsValue::Number(port_and_pid.1 as i64),
+                    ),
+                    (
+                        "CreationTime".into(),
+                        PsValue::String("10/13/2026 10:15:02 PM".into()),
+                    ),
+                ])))
+            })
+            .collect()
+    }
+
+    fn net_connection_test_values(&self, args: &[String]) -> Vec<PsValue> {
+        let network = self.network_state();
+        let computer_name = args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case("-ComputerName"))
+            .and_then(|index| args.get(index + 1))
+            .or_else(|| args.iter().find(|arg| !arg.starts_with('-')))
+            .map(String::as_str)
+            .unwrap_or("localhost");
+        let remote_address =
+            if computer_name.eq_ignore_ascii_case("localhost") || computer_name == "127.0.0.1" {
+                "127.0.0.1".to_owned()
+            } else if computer_name.eq_ignore_ascii_case(&self.hostname)
+                || computer_name == network.ipv4
+            {
+                network.ipv4.clone()
+            } else {
+                self.resolve_dns_values(&[computer_name.to_owned()])
+                    .ok()
+                    .and_then(|values| values.first().cloned())
+                    .and_then(|value| match value {
+                        PsValue::Object(object) => {
+                            value_property(&object, "IPAddress").map(PsValue::text)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| computer_name.to_owned())
+            };
+        let port = args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case("-Port"))
+            .and_then(|index| args.get(index + 1))
+            .and_then(|value| value.parse::<i64>().ok());
+        let tcp_succeeded = port.is_some_and(|port| {
+            self.tcp_connection_values(&["-LocalPort".into(), port.to_string()])
+                .iter()
+                .any(|connection| match connection {
+                    PsValue::Object(object) => value_property(object, "State")
+                        .is_some_and(|state| state.text().eq_ignore_ascii_case("Listen")),
+                    _ => false,
+                })
+        });
+        vec![PsValue::Object(BTreeMap::from([
+            (
+                "ComputerName".into(),
+                PsValue::String(computer_name.to_owned()),
+            ),
+            (
+                "RemoteAddress".into(),
+                PsValue::String(remote_address.clone()),
+            ),
+            (
+                "RemotePort".into(),
+                port.map(PsValue::Number).unwrap_or(PsValue::Null),
+            ),
+            ("InterfaceAlias".into(), PsValue::String(network.adapter)),
+            ("SourceAddress".into(), PsValue::String(network.ipv4)),
+            ("PingSucceeded".into(), PsValue::Bool(true)),
+            ("TcpTestSucceeded".into(), PsValue::Bool(tcp_succeeded)),
+        ]))]
+    }
+
+    fn tcp_connection_values(&self, args: &[String]) -> Vec<PsValue> {
+        let network = self.network_state();
+        let services = self.services_state();
+        let ssh_running = services.iter().any(|entry| {
+            entry.name.eq_ignore_ascii_case("Sshd") && entry.status.eq_ignore_ascii_case("Running")
+        });
+        let mut connections = Vec::new();
+        if ssh_running {
+            connections.push((
+                network.ipv4.clone(),
+                22i64,
+                "10.20.0.50".to_owned(),
+                52144i64,
+                "Established".to_owned(),
+                3712i64,
+            ));
+        }
+        for (service, local_port, process_id) in [
+            ("Sshd", 22i64, 3712i64),
+            ("WinRM", 5985, 1088),
+            ("LanmanServer", 445, 1088),
+            ("TermService", 3389, 804),
+        ] {
+            if services.iter().any(|entry| {
+                entry.name.eq_ignore_ascii_case(service)
+                    && entry.status.eq_ignore_ascii_case("Running")
+            }) {
+                connections.push((
+                    "0.0.0.0".into(),
+                    local_port,
+                    "0.0.0.0".into(),
+                    0,
+                    "Listen".into(),
+                    process_id,
+                ));
+            }
+        }
+        let local_port = args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case("-LocalPort"))
+            .and_then(|index| args.get(index + 1))
+            .and_then(|value| value.parse::<i64>().ok());
+        let state = args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case("-State"))
+            .and_then(|index| args.get(index + 1));
+        connections
+            .into_iter()
+            .filter(|(_, port, _, _, connection_state, _)| {
+                local_port.is_none_or(|filter| filter == *port)
+                    && state.is_none_or(|filter| connection_state.eq_ignore_ascii_case(filter))
+            })
+            .map(
+                |(local_address, local_port, remote_address, remote_port, state, process_id)| {
+                    PsValue::Object(BTreeMap::from([
+                        ("State".into(), PsValue::String(state)),
+                        ("LocalAddress".into(), PsValue::String(local_address)),
+                        ("LocalPort".into(), PsValue::Number(local_port)),
+                        ("RemoteAddress".into(), PsValue::String(remote_address)),
+                        ("RemotePort".into(), PsValue::Number(remote_port)),
+                        ("OwningProcess".into(), PsValue::Number(process_id)),
+                        ("AppliedSetting".into(), PsValue::String("Internet".into())),
+                    ]))
+                },
+            )
+            .collect()
+    }
+
+    fn resolve_dns_values(&self, args: &[String]) -> Result<Vec<PsValue>, String> {
+        let name = args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case("-Name"))
+            .and_then(|index| args.get(index + 1))
+            .or_else(|| args.iter().find(|arg| !arg.starts_with('-')))
+            .map(|name| name.trim_matches(['\'', '"']).to_owned())
+            .ok_or_else(|| "Resolve-DnsName: Specify a DNS name.".to_owned())?;
+        let network = self.network_state();
+        let normalized = name.trim_end_matches('.').to_ascii_lowercase();
+        let records = if normalized == "localhost" {
+            vec![("A", "127.0.0.1")]
+        } else if normalized == self.hostname.to_ascii_lowercase()
+            || normalized == format!("{}.corp.local", self.hostname.to_ascii_lowercase())
+        {
+            vec![("A", network.ipv4.as_str())]
+        } else if normalized == "corp.local" {
+            vec![("A", network.gateway.as_str())]
+        } else {
+            return Err(format!(
+                "Resolve-DnsName : {} : DNS name does not exist.\n",
+                name
+            ));
+        };
+        Ok(records
+            .into_iter()
+            .map(|(record_type, address)| {
+                PsValue::Object(BTreeMap::from([
+                    ("Name".into(), PsValue::String(name.clone())),
+                    ("Type".into(), PsValue::String(record_type.into())),
+                    ("TTL".into(), PsValue::Number(300)),
+                    ("Section".into(), PsValue::String("Answer".into())),
+                    ("IPAddress".into(), PsValue::String(address.into())),
+                ]))
+            })
+            .collect())
+    }
+
+    fn firewall_values(&self) -> Vec<PsValue> {
+        ["Domain", "Private", "Public"]
+            .into_iter()
+            .map(|profile| {
+                PsValue::Object(BTreeMap::from([
+                    ("Name".into(), PsValue::String(profile.into())),
+                    ("Enabled".into(), PsValue::Bool(true)),
+                    (
+                        "DefaultInboundAction".into(),
+                        PsValue::String("Block".into()),
+                    ),
+                    (
+                        "DefaultOutboundAction".into(),
+                        PsValue::String("Allow".into()),
+                    ),
+                    ("NotifyOnListen".into(), PsValue::Bool(true)),
+                    ("AllowLocalFirewallRules".into(), PsValue::Bool(true)),
+                ]))
+            })
+            .collect()
+    }
+
+    fn defender_status_values(&self, now: DateTime<Utc>) -> Vec<PsValue> {
+        vec![PsValue::Object(BTreeMap::from([
+            ("AMServiceEnabled".into(), PsValue::Bool(true)),
+            ("AntivirusEnabled".into(), PsValue::Bool(true)),
+            ("AntispywareEnabled".into(), PsValue::Bool(true)),
+            ("RealTimeProtectionEnabled".into(), PsValue::Bool(true)),
+            ("BehaviorMonitorEnabled".into(), PsValue::Bool(true)),
+            ("NISEnabled".into(), PsValue::Bool(true)),
+            (
+                "AntivirusSignatureVersion".into(),
+                PsValue::String("1.441.112.0".into()),
+            ),
+            (
+                "AntivirusSignatureLastUpdated".into(),
+                PsValue::String(
+                    (now - chrono::Duration::hours(3))
+                        .format("%m/%d/%Y %I:%M:%S %p")
+                        .to_string(),
+                ),
+            ),
+            ("QuickScanAge".into(), PsValue::Number(0)),
+            ("FullScanAge".into(), PsValue::Number(-1)),
+        ]))]
+    }
+
+    fn defender_preference_values(&self) -> Vec<PsValue> {
+        vec![PsValue::Object(BTreeMap::from([
+            ("DisableRealtimeMonitoring".into(), PsValue::Bool(false)),
+            ("MAPSReporting".into(), PsValue::Number(2)),
+            ("SubmitSamplesConsent".into(), PsValue::Number(1)),
+            ("PUAProtection".into(), PsValue::Number(1)),
+            ("EnableControlledFolderAccess".into(), PsValue::Number(0)),
+            ("ExclusionPath".into(), PsValue::Array(Vec::new())),
+            ("ExclusionExtension".into(), PsValue::Array(Vec::new())),
+        ]))]
+    }
+
+    fn disk_values(&self) -> Vec<PsValue> {
+        vec![PsValue::Object(BTreeMap::from([
+            ("Number".into(), PsValue::Number(0)),
+            (
+                "FriendlyName".into(),
+                PsValue::String("Msft Virtual Disk".into()),
+            ),
+            (
+                "SerialNumber".into(),
+                PsValue::String("60022480A1B2C3D4E5F60708".into()),
+            ),
+            ("HealthStatus".into(), PsValue::String("Healthy".into())),
+            ("OperationalStatus".into(), PsValue::String("Online".into())),
+            ("PartitionStyle".into(), PsValue::String("GPT".into())),
+            ("IsBoot".into(), PsValue::Bool(true)),
+            ("IsSystem".into(), PsValue::Bool(true)),
+            ("Size".into(), PsValue::Number(137_438_953_472)),
+        ]))]
+    }
+
+    fn partition_values(&self, args: &[String]) -> Vec<PsValue> {
+        let partitions = [
+            (1, "", "System", 104_857_600i64, false, true),
+            (2, "", "Reserved", 16_777_216, false, false),
+            (3, "C", "Basic", 107_374_182_400, true, false),
+            (4, "", "Recovery", 644_245_094, false, false),
+        ];
+        let number_filter = args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case("-PartitionNumber"))
+            .and_then(|index| args.get(index + 1))
+            .and_then(|number| number.parse::<i64>().ok());
+        partitions
+            .into_iter()
+            .filter(|(number, _, _, _, _, _)| number_filter.is_none_or(|n| n == *number))
+            .map(|(number, drive_letter, kind, size, is_boot, is_system)| {
+                PsValue::Object(BTreeMap::from([
+                    ("DiskNumber".into(), PsValue::Number(0)),
+                    ("PartitionNumber".into(), PsValue::Number(number)),
+                    (
+                        "DriveLetter".into(),
+                        if drive_letter.is_empty() {
+                            PsValue::Null
+                        } else {
+                            PsValue::String(drive_letter.into())
+                        },
+                    ),
+                    ("Type".into(), PsValue::String(kind.into())),
+                    ("Size".into(), PsValue::Number(size)),
+                    ("IsBoot".into(), PsValue::Bool(is_boot)),
+                    ("IsSystem".into(), PsValue::Bool(is_system)),
+                    ("IsHidden".into(), PsValue::Bool(drive_letter.is_empty())),
+                ]))
+            })
+            .collect()
+    }
+
     fn get_command(&self, args: &[String]) -> ShellOutput {
         let name = args
             .iter()
@@ -4303,6 +5557,15 @@ impl WindowsShell {
             ("Get-NetIPAddress", "Cmdlet", "Get-NetIPAddress"),
             ("Get-NetAdapter", "Cmdlet", "Get-NetAdapter"),
             ("Get-NetTCPConnection", "Cmdlet", "Get-NetTCPConnection"),
+            ("Get-NetRoute", "Cmdlet", "Get-NetRoute"),
+            ("Get-NetUDPEndpoint", "Cmdlet", "Get-NetUDPEndpoint"),
+            ("Resolve-DnsName", "Cmdlet", "Resolve-DnsName"),
+            ("Test-NetConnection", "Cmdlet", "Test-NetConnection"),
+            ("Get-NetFirewallProfile", "Cmdlet", "Get-NetFirewallProfile"),
+            ("Get-MpComputerStatus", "Cmdlet", "Get-MpComputerStatus"),
+            ("Get-MpPreference", "Cmdlet", "Get-MpPreference"),
+            ("Get-Disk", "Cmdlet", "Get-Disk"),
+            ("Get-Partition", "Cmdlet", "Get-Partition"),
             ("arp.exe", "Application", "C:\\Windows\\System32\\arp.exe"),
             (
                 "route.exe",
@@ -4310,6 +5573,11 @@ impl WindowsShell {
                 "C:\\Windows\\System32\\route.exe",
             ),
             ("cmd.exe", "Application", "C:\\Windows\\System32\\cmd.exe"),
+            (
+                "wevtutil.exe",
+                "Application",
+                "C:\\Windows\\System32\\wevtutil.exe",
+            ),
             (
                 "ssh.exe",
                 "Application",
@@ -4377,6 +5645,17 @@ impl WindowsShell {
         for (command, kind, source) in selected {
             matches += 1;
             output.push_str(&format!("{kind:<11} {command:<23} {source}\n"));
+        }
+        for function in self
+            .functions
+            .keys()
+            .filter(|function| name.is_none_or(|filter| function.eq_ignore_ascii_case(filter)))
+        {
+            matches += 1;
+            output.push_str(&format!(
+                "{:<11} {:<23} {}\n",
+                "Function", function, function
+            ));
         }
         if self.vulnerability_profiles.contains("win_guest_share")
             && name.is_none_or(|filter| filter.eq_ignore_ascii_case("Get-SmbShare"))
@@ -4456,7 +5735,6 @@ impl WindowsShell {
             return Self::error("Get-Acl : Access is denied.\n");
         }
         let owner = self.owner_principal(&node.owner);
-        let owner_ace = format!("{owner} Allow  FullControl");
         let users_rights = if self
             .vulnerability_profiles
             .contains("win_writable_service_binary")
@@ -4470,12 +5748,34 @@ impl WindowsShell {
         } else {
             "ReadAndExecute"
         };
-        let ace = format!(
-            "{owner_ace}; NT AUTHORITY\\SYSTEM Allow  FullControl; {}\\Administrators Allow  FullControl; {}\\Users Allow  {}",
-            self.hostname, self.hostname, users_rights
-        );
+        let owner_sid = self.principal_sid(&node.owner);
+        let group_sid = self.principal_sid(&node.group);
+        let mut sddl_aces = Vec::new();
+        let mut access_aces = Vec::new();
+        if !owner_sid.eq_ignore_ascii_case("SY") && !owner_sid.eq_ignore_ascii_case("BA") {
+            sddl_aces.push(format!("(A;;FA;;;{owner_sid})"));
+            access_aces.push(format!("{} Allow  FullControl", owner));
+        }
+        sddl_aces.push("(A;;FA;;;SY)".to_owned());
+        access_aces.push("NT AUTHORITY\\SYSTEM Allow  FullControl".to_owned());
+        sddl_aces.push("(A;;FA;;;BA)".to_owned());
+        access_aces.push(format!(
+            "{}\\Administrators Allow  FullControl",
+            self.hostname
+        ));
+        access_aces.push(format!("{}\\Users Allow  {}", self.hostname, users_rights));
+        sddl_aces.push(format!(
+            "(A;;{};;;BU)",
+            if users_rights == "Modify" {
+                "0x1301bf"
+            } else {
+                "FRFX"
+            }
+        ));
+        let sddl = format!("O:{owner_sid}G:{group_sid}D:{}", sddl_aces.join(""));
+        let ace = access_aces.join("; ");
         Self::output(format!(
-            "\n\n    Directory: {}\n\nPath  : {}\nOwner : {}\nGroup : {}\nAccess: {}\nAudit :\nSddl  : O:{}G:SYD:(A;;FA;;;SY)(A;;FRFX;;;BU)\n",
+            "\n\n    Directory: {}\n\nPath  : {}\nOwner : {}\nGroup : {}\nAccess: {}\nAudit :\nSddl  : {}\n",
             Self::display_path(
                 path.rsplit_once('/')
                     .map(|(parent, _)| parent)
@@ -4485,7 +5785,7 @@ impl WindowsShell {
             owner,
             self.owner_principal(&node.group),
             ace,
-            if node.is_dir() { "D" } else { "" }
+            sddl
         ))
     }
 
@@ -4713,6 +6013,7 @@ impl WindowsShell {
             .iter()
             .position(|arg| arg.eq_ignore_ascii_case("-Group"))
             .and_then(|i| args.get(i + 1))
+            .or_else(|| args.iter().find(|arg| !arg.starts_with('-')))
             .map(String::as_str)
             .unwrap_or("Users");
         let member_name = format!("{}\\{}", self.hostname, self.user);
@@ -4810,10 +6111,9 @@ impl WindowsShell {
         }
     }
 
-    fn ipconfig(&self, args: &[String]) -> ShellOutput {
+    fn ipconfig(&self, args: &[String], now: DateTime<Utc>) -> ShellOutput {
         let network = self.network_state();
         let all = args.iter().any(|arg| arg.eq_ignore_ascii_case("/all"));
-        let octets = network.ipv4.split('.').collect::<Vec<_>>();
         let mask = if network.prefix == 24 {
             "255.255.255.0"
         } else if network.prefix == 16 {
@@ -4821,39 +6121,38 @@ impl WindowsShell {
         } else {
             "255.255.255.255"
         };
-        let mut output = format!("Windows IP Configuration\n\n");
+        let mut output = "Windows IP Configuration\n\n".to_owned();
         if all {
             output.push_str(&format!("   Host Name . . . . . . . . . . . . : {}\n   Primary Dns Suffix  . . . . . . . : {}\n   Node Type . . . . . . . . . . . . : Hybrid\n   IP Routing Enabled. . . . . . . . : No\n   WINS Proxy Enabled. . . . . . . . : No\n\n", self.hostname, network.dns_suffix));
-            output.push_str(&format!("{} adapter {}:\n\n   Connection-specific DNS Suffix  . : {}\n   Description . . . . . . . . . . . : Intel(R) Ethernet Connection\n   Physical Address. . . . . . . . . : {}\n   DHCP Enabled. . . . . . . . . . . : {}\n   Autoconfiguration Enabled . . . . : Yes\n   IPv4 Address. . . . . . . . . . . : {}\n   Subnet Mask . . . . . . . . . . . : {}\n   Lease Obtained. . . . . . . . . . : Tuesday, October 13, 2026 10:15:02 PM\n   Lease Expires . . . . . . . . . . : Wednesday, October 14, 2026 10:15:02 PM\n   Default Gateway . . . . . . . . . : {}\n   DHCP Server . . . . . . . . . . . : {}\n   DNS Servers . . . . . . . . . . . : {}\n", if network.dhcp { "Ethernet" } else { "Ethernet" }, network.adapter, network.dns_suffix, network.mac, if network.dhcp { "Yes" } else { "No" }, network.ipv4, mask, network.gateway, network.gateway, network.dns.join("\n                                       ")));
+            output.push_str(&format!("Ethernet adapter {}:\n\n   Connection-specific DNS Suffix  . : {}\n   Description . . . . . . . . . . . : Intel(R) Ethernet Connection\n   Physical Address. . . . . . . . . : {}\n   DHCP Enabled. . . . . . . . . . . : {}\n   Autoconfiguration Enabled. . . . . : {}\n   IPv4 Address. . . . . . . . . . . : {}\n   Subnet Mask . . . . . . . . . . . : {}\n", network.adapter, network.dns_suffix, network.mac, if network.dhcp { "Yes" } else { "No" }, if network.dhcp { "Yes" } else { "No" }, network.ipv4, mask));
+            if network.dhcp {
+                let lease_obtained =
+                    (now - chrono::Duration::hours(12)).format("%A, %B %-d, %Y %-I:%M:%S %p");
+                let lease_expires =
+                    (now + chrono::Duration::hours(12)).format("%A, %B %-d, %Y %-I:%M:%S %p");
+                output.push_str(&format!(
+                    "   Lease Obtained. . . . . . . . . . : {lease_obtained}\n   Lease Expires . . . . . . . . . . : {lease_expires}\n"
+                ));
+            }
+            output.push_str(&format!(
+                "   Default Gateway . . . . . . . . . : {}\n",
+                network.gateway
+            ));
+            if network.dhcp {
+                output.push_str(&format!(
+                    "   DHCP Server . . . . . . . . . . . : {}\n",
+                    network.gateway
+                ));
+            }
+            output.push_str(&format!(
+                "   DNS Servers . . . . . . . . . . . : {}\n",
+                network
+                    .dns
+                    .join("\n                                       ")
+            ));
         } else {
             output.push_str(&format!("Ethernet adapter {}:\n\n   Connection-specific DNS Suffix  . : {}\n   IPv4 Address. . . . . . . . . . . : {}\n   Subnet Mask . . . . . . . . . . . : {}\n   Default Gateway . . . . . . . . . : {}\n", network.adapter, network.dns_suffix, network.ipv4, mask, network.gateway));
         }
-        let _ = octets;
-        Self::output(output)
-    }
-
-    fn network_command(&self, command: &str) -> ShellOutput {
-        let network = self.network_state();
-        let output = match command {
-            "get-netadapter" => format!(
-                "Name       InterfaceDescription                  ifIndex Status MacAddress       LinkSpeed\n----       --------------------                  ------- ------ ----------       ---------\n{} Intel(R) Ethernet Connection {}      Up     {} 1 Gbps\n",
-                network.adapter, network.interface_index, network.mac
-            ),
-            "get-netipaddress" => format!(
-                "IPAddress         InterfaceIndex InterfaceAlias AddressFamily PrefixLength Type\n---------         -------------- -------------- ------------- ------------ ----\n{} {:<14} {:<14} IPv4          {:<12} Unicast\n",
-                network.ipv4, network.interface_index, network.adapter, network.prefix
-            ),
-            _ => format!(
-                "InterfaceAlias       : {}\nInterfaceIndex       : {}\nNetAdapter            : {}\nIPv4Address           : {}\nIPv4DefaultGateway    : {}\nDNSServer             : {}\nNetProfile.Name       : {}\n",
-                network.adapter,
-                network.interface_index,
-                network.adapter,
-                network.ipv4,
-                network.gateway,
-                network.dns.join(", "),
-                network.dns_suffix
-            ),
-        };
         Self::output(output)
     }
 
@@ -4917,6 +6216,16 @@ impl WindowsShell {
     }
 
     fn process_command(&self, command: &str, args: &[String]) -> ShellOutput {
+        let requested_name = args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case("-Name"))
+            .and_then(|index| args.get(index + 1))
+            .or_else(|| {
+                (!args.iter().any(|arg| arg.eq_ignore_ascii_case("-Id")))
+                    .then(|| args.iter().find(|arg| !arg.starts_with('-')))
+                    .flatten()
+            })
+            .map(|name| name.trim_matches(['\'', '"']).to_owned());
         let mut processes = self
             .processes_state()
             .into_iter()
@@ -4947,16 +6256,13 @@ impl WindowsShell {
             }
             if processes.is_empty()
                 && (args.iter().any(|arg| arg.eq_ignore_ascii_case("-Name"))
-                    || args.iter().any(|arg| arg.eq_ignore_ascii_case("-Id")))
+                    || args.iter().any(|arg| arg.eq_ignore_ascii_case("-Id"))
+                    || requested_name.is_some())
             {
-                if let Some(name) = args
-                    .iter()
-                    .position(|arg| arg.eq_ignore_ascii_case("-Name"))
-                    .and_then(|index| args.get(index + 1))
-                {
+                if let Some(name) = requested_name {
                     return Self::error(format!(
                         "Get-Process : Cannot find a process with the name \"{}\". Verify the process name and call the cmdlet again.\n",
-                        name.trim_matches(['\'', '"'])
+                        name
                     ));
                 }
                 if let Some(id) = args
@@ -5212,13 +6518,27 @@ impl WindowsShell {
     fn tcp_connections(&self, args: &[String]) -> ShellOutput {
         let services = self.services_state();
         let processes = self.processes_state();
-        let mut rows = vec![(
-            "TCP".to_owned(),
-            "0.0.0.0:22".to_owned(),
-            "0.0.0.0:0".to_owned(),
-            "LISTENING".to_owned(),
-            3712u32,
-        )];
+        let ssh_running = services.iter().any(|entry| {
+            entry.name.eq_ignore_ascii_case("Sshd") && entry.status.eq_ignore_ascii_case("Running")
+        });
+        let network = self.network_state();
+        let mut rows = Vec::new();
+        if ssh_running {
+            rows.push((
+                "TCP".to_owned(),
+                "0.0.0.0:22".to_owned(),
+                "0.0.0.0:0".to_owned(),
+                "LISTENING".to_owned(),
+                3712u32,
+            ));
+            rows.push((
+                "TCP".to_owned(),
+                format!("{}:22", network.ipv4),
+                "10.20.0.50:52144".to_owned(),
+                "ESTABLISHED".to_owned(),
+                3712u32,
+            ));
+        }
         for (service, local, pid) in [
             ("WinRM", "0.0.0.0:5985", 1088),
             ("LanmanServer", "0.0.0.0:445", 1088),
