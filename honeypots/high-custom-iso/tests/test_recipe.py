@@ -313,7 +313,9 @@ class CustomIsoRecipeTests(unittest.TestCase):
             fake_bin = root / "bin"
             fake_bin.mkdir()
             executable(fake_bin / "curl", "#!/bin/sh\nexit 22\n")
-            with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}:{os.environ['PATH']}"}):
+            with mock.patch.dict(
+                os.environ, {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+            ), mock.patch.object(repository.time, "sleep") as sleep_mock:
                 with self.assertRaises(repository.RepositoryError) as caught:
                     repository.download(
                         "https://archive.archlinux.org/missing.pkg.tar.zst.sig",
@@ -323,6 +325,100 @@ class CustomIsoRecipeTests(unittest.TestCase):
                         "ARCH_REPO_PACKAGE_SIGNATURE_MISSING",
                     )
             self.assertEqual(caught.exception.code, "ARCH_REPO_PACKAGE_SIGNATURE_MISSING")
+            self.assertIn("failed after 3 attempts", str(caught.exception))
+            self.assertEqual(sleep_mock.call_count, 2)
+
+    def test_arch_download_retries_slow_or_corrupt_responses_with_speed_limits(self):
+        repository = load_arch_repository_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            destination = root / "package.pkg.tar.zst"
+            expected_content = b"verified package"
+            expected = hashlib.sha256(expected_content).hexdigest()
+            attempts = 0
+
+            def run(command, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                output = pathlib.Path(command[command.index("--output") + 1])
+                if attempts == 1:
+                    output.write_bytes(b"corrupt package")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+                if attempts == 2:
+                    output.write_bytes(b"partial")
+                    return subprocess.CompletedProcess(
+                        command, 28, stdout="", stderr="curl: (28) operation too slow"
+                    )
+                output.write_bytes(expected_content)
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with mock.patch.object(
+                repository.subprocess, "run", side_effect=run
+            ) as run_mock, mock.patch.object(repository.time, "sleep") as sleep_mock:
+                repository.download(
+                    "https://archive.archlinux.org/package.pkg.tar.zst",
+                    destination,
+                    1024,
+                    expected,
+                )
+            self.assertEqual(destination.read_bytes(), expected_content)
+            self.assertFalse((root / ".package.pkg.tar.zst.part").exists())
+            self.assertEqual(run_mock.call_count, 3)
+            self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [1, 2])
+            for call in run_mock.call_args_list:
+                command = call.args[0]
+                self.assertEqual(command[command.index("--speed-limit") + 1], "1024")
+                self.assertEqual(command[command.index("--speed-time") + 1], "60")
+
+    def test_arch_download_exhaustion_removes_partial_and_reports_last_failure(self):
+        repository = load_arch_repository_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            destination = root / "libisl.pkg.tar.zst"
+
+            def fail(command, **_kwargs):
+                output = pathlib.Path(command[command.index("--output") + 1])
+                output.write_bytes(b"incomplete")
+                return subprocess.CompletedProcess(
+                    command, 28, stdout="", stderr="curl: (28) speed below 1024 bytes/sec"
+                )
+
+            with mock.patch.object(
+                repository.subprocess, "run", side_effect=fail
+            ) as run_mock, mock.patch.object(repository.time, "sleep"):
+                with self.assertRaises(repository.RepositoryError) as caught:
+                    repository.download(
+                        "https://archive.archlinux.org/libisl.pkg.tar.zst",
+                        destination,
+                        1024,
+                        "a" * 64,
+                    )
+            self.assertEqual(caught.exception.code, "ARCH_REPO_DOWNLOAD_FAILED")
+            self.assertIn("failed after 3 attempts", str(caught.exception))
+            self.assertIn("speed below 1024 bytes/sec", str(caught.exception))
+            self.assertEqual(run_mock.call_count, 3)
+            self.assertFalse((root / ".libisl.pkg.tar.zst.part").exists())
+            self.assertFalse(destination.exists())
+
+    def test_arch_download_reuses_verified_cache_and_cleans_stale_partial(self):
+        repository = load_arch_repository_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            destination = root / "cached.pkg.tar.zst"
+            content = b"already verified"
+            destination.write_bytes(content)
+            partial = root / ".cached.pkg.tar.zst.part"
+            partial.write_bytes(b"stale interrupted data")
+            with mock.patch.object(repository.subprocess, "run") as run_mock:
+                repository.download(
+                    "https://archive.archlinux.org/cached.pkg.tar.zst",
+                    destination,
+                    1024,
+                    hashlib.sha256(content).hexdigest(),
+                )
+            run_mock.assert_not_called()
+            self.assertEqual(destination.read_bytes(), content)
+            self.assertFalse(partial.exists())
 
     def test_arch_signature_status_rejects_expired_revoked_and_untrusted_keys(self):
         repository = load_arch_repository_module()

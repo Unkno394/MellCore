@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +57,8 @@ MAX_DATABASE_BYTES = 64 * 1024 * 1024
 MAX_PACKAGE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_BUNDLE_BYTES = 8 * 1024 * 1024 * 1024
 DOWNLOAD_HEADROOM_BYTES = 512 * 1024 * 1024
+DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_RETRY_DELAY_SECONDS = 1
 SAFE_FILENAME = re.compile(r"^[A-Za-z0-9@._+:-]+$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -110,6 +113,8 @@ def download(
     ensure_safe_regular(destination)
     checksum_path = destination.with_suffix(destination.suffix + ".sha256")
     ensure_safe_regular(checksum_path)
+    partial = destination.with_name(f".{destination.name}.part")
+    ensure_safe_regular(partial)
     expected = expected_sha256
     if expected is None and checksum_path.is_file():
         candidate = checksum_path.read_text(encoding="ascii").strip().split()[0].lower()
@@ -117,49 +122,72 @@ def download(
             expected = candidate
     if destination.is_file() and expected and destination.stat().st_size <= maximum:
         if sha256_file(destination) == expected:
+            partial.unlink(missing_ok=True)
             return
     if destination.exists():
         destination.unlink()
+    partial.unlink(missing_ok=True)
 
-    partial = destination.with_name(f".{destination.name}.part")
-    ensure_safe_regular(partial)
-    if partial.exists():
-        partial.unlink()
-    command = [
-        "curl",
-        "--fail",
-        "--silent",
-        "--show-error",
-        "--proto",
-        "=https",
-        "--proto-redir",
-        "=https",
-        "--tlsv1.2",
-        "--connect-timeout",
-        "20",
-        "--max-time",
-        "1800",
-        "--max-filesize",
-        str(maximum),
-        "--output",
-        str(partial),
-        url,
-    ]
-    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    if result.returncode:
+    last_error = "download did not start"
+    final_code = failure_code
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
         partial.unlink(missing_ok=True)
-        detail = result.stderr.strip().splitlines()[-1:] or [f"curl exit {result.returncode}"]
-        raise RepositoryError(failure_code, detail[0][:400])
-    if not partial.is_file() or partial.stat().st_size == 0 or partial.stat().st_size > maximum:
+        command = [
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--tlsv1.2",
+            "--connect-timeout",
+            "20",
+            "--max-time",
+            "1800",
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "60",
+            "--max-filesize",
+            str(maximum),
+            "--output",
+            str(partial),
+            url,
+        ]
+        result = subprocess.run(
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+        )
+        if result.returncode:
+            detail = result.stderr.strip().splitlines()[-1:]
+            last_error = (detail or [f"curl exit {result.returncode}"])[0][:400]
+            final_code = failure_code
+        elif (
+            not partial.is_file()
+            or partial.stat().st_size == 0
+            or partial.stat().st_size > maximum
+        ):
+            last_error = f"invalid size for {destination.name}"
+            final_code = failure_code
+        else:
+            actual = sha256_file(partial)
+            if expected and actual != expected:
+                last_error = f"SHA-256 mismatch for {destination.name}"
+                final_code = "ARCH_PACKAGE_CHECKSUM_MISMATCH"
+            else:
+                os.chmod(partial, 0o600)
+                os.replace(partial, destination)
+                atomic_text(checksum_path, f"{actual}  {destination.name}\n")
+                return
         partial.unlink(missing_ok=True)
-        raise RepositoryError(failure_code, f"invalid size for {destination.name}")
-    actual = sha256_file(partial)
-    if expected_sha256 and actual != expected_sha256:
-        partial.unlink(missing_ok=True)
-        raise RepositoryError("ARCH_PACKAGE_CHECKSUM_MISMATCH", destination.name)
-    os.chmod(partial, 0o600)
-    os.replace(partial, destination)
-    atomic_text(checksum_path, f"{actual}  {destination.name}\n")
+        if attempt < DOWNLOAD_ATTEMPTS:
+            time.sleep(DOWNLOAD_RETRY_DELAY_SECONDS * attempt)
+
+    raise RepositoryError(
+        final_code,
+        f"{destination.name}: failed after {DOWNLOAD_ATTEMPTS} attempts; last error: {last_error}",
+    )
 
 
 def repository_manifest(databases: dict[str, Path], packages: list[Package]) -> dict[str, object]:
