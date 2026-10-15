@@ -283,6 +283,7 @@ pub enum HighImagePreparation {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HighLifecycleState {
+    Downloading,
     VmCreated,
     Installing,
     Rebooting,
@@ -671,6 +672,10 @@ mod tests {
 
     #[test]
     fn high_lifecycle_states_use_backend_facing_names() {
+        assert_eq!(
+            serde_json::to_string(&HighLifecycleState::Downloading).unwrap(),
+            "\"DOWNLOADING\""
+        );
         assert_eq!(
             serde_json::to_string(&HighLifecycleState::VmCreated).unwrap(),
             "\"VM_CREATED\""

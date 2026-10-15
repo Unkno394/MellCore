@@ -23,7 +23,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
     def test_installer_is_isolated_and_has_no_publication(self):
         launch = (RECIPE / "scripts" / "launch-iso.sh").read_text()
         check = (RECIPE / "scripts" / "check-ssh-isolated.sh").read_text()
-        self.assertIn("network=hf-high-isolated", launch)
+        self.assertIn("network=$HF_HIGH_NETWORK_NAME", launch)
         self.assertIn('--cdrom "$install_iso" --boot cdrom,hd', launch)
         self.assertIn("spice,listen=127.0.0.1", launch)
         self.assertNotIn("publish-ssh", launch)
@@ -122,8 +122,14 @@ class CustomIsoRecipeTests(unittest.TestCase):
                         "autoinstall:",
                         (instance / "iso-payload/nocloud/user-data").read_text(),
                     )
+                    self.assertIn(
+                        "fallback: offline-install",
+                        (instance / "iso-payload/nocloud/user-data").read_text(),
+                    )
                 if flavor == "debian":
-                    self.assertIn("preseed/late_command", (instance / "preseed.cfg").read_text())
+                    preseed = (instance / "preseed.cfg").read_text()
+                    self.assertIn("preseed/late_command", preseed)
+                    self.assertIn("apt-setup/use_mirror boolean false", preseed)
 
 
 if __name__ == "__main__":

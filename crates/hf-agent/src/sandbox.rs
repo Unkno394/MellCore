@@ -105,6 +105,7 @@ impl HighVm {
 pub struct LibvirtSandboxManager {
     adapters: Vec<HighOsAdapter>,
     high_root: PathBuf,
+    network_name: &'static str,
 }
 
 #[derive(Clone)]
@@ -409,6 +410,10 @@ impl LibvirtSandboxManager {
                 },
             ],
             high_root: high_root.into(),
+            network_name: high_network_name_from_scope(
+                std::env::var_os("HF_HIGH_NETWORK_SCOPE").as_deref(),
+            )
+            .unwrap_or("invalid-high-network-scope"),
         }
     }
 
@@ -883,6 +888,7 @@ impl LibvirtSandboxManager {
             &String::from_utf8_lossy(&output.stdout),
             &telemetry_socket,
             vm.profile,
+            self.network_name,
         ))
     }
 
@@ -1046,11 +1052,13 @@ fn domain_xml_matches_security_profile(
     xml: &str,
     telemetry_socket: &Path,
     profile: HighOsProfile,
+    network_name: &str,
 ) -> bool {
     let expected_socket = format!("path='{}'", telemetry_socket.display());
+    let expected_network = format!("<source network='{network_name}'");
     let common = xml.matches("<interface type=").count() == 1
         && xml.contains("<interface type='network'>")
-        && xml.contains("<source network='hf-high-isolated'")
+        && xml.contains(&expected_network)
         && xml.contains("name='org.honeyforge.telemetry.0'")
         && xml.contains(&expected_socket);
     common
@@ -1120,6 +1128,29 @@ fn high_running_health(
 
 pub const DEFAULT_HIGH_RECIPES_ROOT: &str = "/usr/local/lib/honeyforge";
 pub const HIGH_RECIPES_ROOT_ENV: &str = "HF_HIGH_RECIPES_ROOT";
+
+fn high_network_name_from_scope(scope: Option<&std::ffi::OsStr>) -> anyhow::Result<&'static str> {
+    match scope
+        .and_then(|value| value.to_str())
+        .unwrap_or("production")
+    {
+        "production" => Ok("hf-high-isolated"),
+        "e2e" => Ok("hf-high-iso-e2e"),
+        value => anyhow::bail!(
+            "HF_HIGH_ERROR code=NETWORK_SCOPE_INVALID stage=configuration: HF_HIGH_NETWORK_SCOPE must be production or e2e, got {value}"
+        ),
+    }
+}
+
+pub fn validate_high_network_scope(standalone_high: bool) -> anyhow::Result<()> {
+    let scope = std::env::var_os("HF_HIGH_NETWORK_SCOPE");
+    let network = high_network_name_from_scope(scope.as_deref())?;
+    anyhow::ensure!(
+        network != "hf-high-iso-e2e" || standalone_high,
+        "HF_HIGH_ERROR code=NETWORK_SCOPE_FORBIDDEN stage=configuration: e2e network scope is allowed only with --standalone-high"
+    );
+    Ok(())
+}
 
 fn recipe_dir_from_override(root: Option<std::ffi::OsString>) -> anyhow::Result<PathBuf> {
     let root = match root {
@@ -1379,24 +1410,28 @@ mod tests {
         assert!(domain_xml_matches_security_profile(
             valid,
             socket,
-            HighOsProfile::ubuntu_ssh()
+            HighOsProfile::ubuntu_ssh(),
+            "hf-high-isolated"
         ));
         assert!(!domain_xml_matches_security_profile(
             &valid.replace("hf-high-isolated", "default"),
             socket,
-            HighOsProfile::ubuntu_ssh()
+            HighOsProfile::ubuntu_ssh(),
+            "hf-high-isolated"
         ));
         assert!(!domain_xml_matches_security_profile(
             &valid.replace("telemetry.sock", "spoof.sock"),
             socket,
-            HighOsProfile::ubuntu_ssh()
+            HighOsProfile::ubuntu_ssh(),
+            "hf-high-isolated"
         ));
         let second_interface =
             valid.replace("</interface>", "</interface><interface type='bridge'/>");
         assert!(!domain_xml_matches_security_profile(
             &second_interface,
             socket,
-            HighOsProfile::ubuntu_ssh()
+            HighOsProfile::ubuntu_ssh(),
+            "hf-high-isolated"
         ));
 
         let windows = valid.replace(
@@ -1406,13 +1441,31 @@ mod tests {
         assert!(domain_xml_matches_security_profile(
             &windows,
             socket,
-            HighOsProfile::windows_rdp()
+            HighOsProfile::windows_rdp(),
+            "hf-high-isolated"
         ));
         assert!(!domain_xml_matches_security_profile(
             &windows.replace("127.0.0.1", "0.0.0.0"),
             socket,
-            HighOsProfile::windows_rdp()
+            HighOsProfile::windows_rdp(),
+            "hf-high-isolated"
         ));
+        let e2e = valid
+            .replace("hf-high-isolated", "hf-high-iso-e2e")
+            .replace(
+                "</devices>",
+                "<graphics type='spice' listen='127.0.0.1'/></devices>",
+            );
+        assert!(domain_xml_matches_security_profile(
+            &e2e,
+            socket,
+            HighOsProfile::ubuntu_iso_ssh(),
+            "hf-high-iso-e2e"
+        ));
+        assert_eq!(
+            high_network_name_from_scope(Some(std::ffi::OsStr::new("e2e"))).unwrap(),
+            "hf-high-iso-e2e"
+        );
     }
 
     #[test]

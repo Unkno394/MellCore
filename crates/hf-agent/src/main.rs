@@ -35,7 +35,7 @@ use kazik_protocol::{
 };
 use sandbox::{
     HighDomainState, HighVm, LibvirtSandboxManager, default_image_for, default_recipe_dir,
-    is_supported_profile, profile_manifest_kind, profile_recipe_name,
+    is_supported_profile, profile_manifest_kind, profile_recipe_name, validate_high_network_scope,
 };
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
@@ -472,31 +472,42 @@ impl ComposeProjectStore {
         mut deployment: HighVmDeployment,
         allow_existing_ubuntu_image: bool,
     ) -> anyhow::Result<()> {
+        let approved = if matches!(
+            deployment.profile,
+            profile if profile == HighOsProfile::ubuntu_iso_ssh()
+                || profile == HighOsProfile::debian_iso_ssh()
+                || profile == HighOsProfile::arch_linux_iso_ssh()
+        ) {
+            let catalog = high_image::approved_iso(deployment.profile)?;
+            if deployment
+                .image_source
+                .as_ref()
+                .is_none_or(|source| source == &catalog.source)
+            {
+                Some(catalog)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(approved) = &approved {
+            deployment.image_source = Some(approved.source.clone());
+        }
+        if deployment.image_source.is_none()
+            && deployment.profile == HighOsProfile::windows_rdp_legacy_iso()
+        {
+            deployment.image_source = match high_image::windows_admin_iso_source()? {
+                Some(source) => Some(source),
+                None => {
+                    return Err(high_image::approved_iso(deployment.profile)
+                        .unwrap_err()
+                        .into());
+                }
+            };
+        }
         Self::validate_high_deployment(&deployment, allow_existing_ubuntu_image)?;
-        let detect_iso_installer = deployment.profile == HighOsProfile::custom_linux_iso_ssh();
-        if let Some(source) = &deployment.image_source {
-            let state_dir = self.root.parent().unwrap_or(Path::new(DEFAULT_STATE_DIR));
-            deployment.base_image = high_image::materialize_image(
-                source,
-                deployment.profile,
-                &state_dir.join("images").join("custom"),
-            )?
-            .to_string_lossy()
-            .into_owned();
-        }
-        if detect_iso_installer {
-            deployment.profile =
-                high_image::automatic_install_profile(Path::new(&deployment.base_image))?;
-            Self::validate_high_deployment(&deployment, false)?;
-        }
-        let changed = self
-            .load_high_manifest(deployment.trap_id)?
-            .is_some_and(|current| {
-                current.deployment.base_image != deployment.base_image
-                    || current.deployment.external_service_port != deployment.external_service_port
-                    || current.deployment.profile != deployment.profile
-                    || current.deployment.image_source != deployment.image_source
-            });
+        let previous = self.load_high_manifest(deployment.trap_id)?;
         let mut manifest = HighRuntimeManifest {
             version: 1,
             kind: profile_manifest_kind(deployment.profile).into(),
@@ -506,6 +517,60 @@ impl ComposeProjectStore {
             lifecycle_state: HighLifecycleState::VmCreated,
             last_error: None,
         };
+        let detect_iso_installer = deployment.profile == HighOsProfile::custom_linux_iso_ssh();
+        if deployment.image_source.is_some() {
+            self.transition_high_lifecycle(&mut manifest, HighLifecycleState::Downloading, None)?;
+            let state_dir = self.root.parent().unwrap_or(Path::new(DEFAULT_STATE_DIR));
+            let source = deployment.image_source.as_ref().expect("checked above");
+            let materialized = if let Some(approved) = &approved {
+                high_image::materialize_approved_iso(
+                    approved,
+                    deployment.profile,
+                    &state_dir.join("images").join("iso"),
+                )
+            } else {
+                high_image::materialize_image(
+                    source,
+                    deployment.profile,
+                    &state_dir.join("images").join("custom"),
+                )
+            };
+            match materialized {
+                Ok(path) => deployment.base_image = path.to_string_lossy().into_owned(),
+                Err(error) => {
+                    self.transition_high_lifecycle(
+                        &mut manifest,
+                        HighLifecycleState::Failed,
+                        Some(error.to_string()),
+                    )?;
+                    return Err(error.into());
+                }
+            }
+        }
+        if detect_iso_installer {
+            deployment.profile =
+                match high_image::automatic_install_profile(Path::new(&deployment.base_image)) {
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        self.transition_high_lifecycle(
+                            &mut manifest,
+                            HighLifecycleState::Failed,
+                            Some(error.to_string()),
+                        )?;
+                        return Err(error.into());
+                    }
+                };
+            Self::validate_high_deployment(&deployment, false)?;
+        }
+        let changed = previous.is_some_and(|current| {
+            current.deployment.base_image != deployment.base_image
+                || current.deployment.external_service_port != deployment.external_service_port
+                || current.deployment.profile != deployment.profile
+                || current.deployment.image_source != deployment.image_source
+        });
+        manifest.kind = profile_manifest_kind(deployment.profile).into();
+        manifest.profile = deployment.profile;
+        manifest.deployment = deployment.clone();
         self.transition_high_lifecycle(&mut manifest, HighLifecycleState::VmCreated, None)?;
         let active_state = if matches!(
             deployment.profile.image_preparation,
@@ -720,6 +785,14 @@ impl ComposeProjectStore {
                         manifest.last_error = Some(error.to_string());
                         let _ = self.save_high_manifest(&manifest);
                     }
+                }
+                continue;
+            }
+            if manifest.desired_state == HighDesiredState::Running
+                && manifest.lifecycle_state == HighLifecycleState::Downloading
+            {
+                if let Err(error) = self.deploy_high(manifest.deployment.clone(), false) {
+                    tracing::error!(trap_id = %trap_id, %error, "High ISO download reconciliation failed");
                 }
                 continue;
             }
@@ -1609,6 +1682,7 @@ async fn main() -> anyhow::Result<()> {
         validate_standalone_high_args(&args)?;
     }
     let high_recipe_dir = default_recipe_dir()?;
+    validate_high_network_scope(args.standalone_high)?;
     LibvirtSandboxManager::with_high_root(&high_recipe_dir, args.state_dir.join("high"))
         .validate_recipes()?;
     fs::create_dir_all(&args.state_dir)?;

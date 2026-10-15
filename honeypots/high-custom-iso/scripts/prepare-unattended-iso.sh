@@ -32,6 +32,10 @@ if [ "$flavor" = ubuntu ]; then
 #cloud-config
 autoinstall:
   version: 1
+  refresh-installer:
+    update: no
+  apt:
+    fallback: offline-install
   identity:
     hostname: $hostname
     username: analyst
@@ -87,6 +91,7 @@ d-i partman/choose_partition select finish
 d-i partman/confirm boolean true
 d-i partman/confirm_nooverwrite boolean true
 tasksel tasksel/first multiselect standard, ssh-server
+d-i apt-setup/use_mirror boolean false
 d-i pkgsel/include string openssh-server qemu-guest-agent auditd python3
 popularity-contest popularity-contest/participate boolean false
 d-i grub-installer/only_debian boolean true

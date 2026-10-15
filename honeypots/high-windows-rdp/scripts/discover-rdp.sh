@@ -27,12 +27,12 @@ while [ "$attempt" -le "$dhcp_attempts" ]; do
   attempt=$((attempt + 1))
 done
 [ -n "$guest_ip" ] || { echo 'Windows VM did not obtain an isolated DHCP lease' >&2; exit 1; }
-python3 - "$guest_ip" <<'PY'
+python3 - "$guest_ip" "$HF_HIGH_DHCP_START" "$HF_HIGH_DHCP_END" <<'PY'
 import ipaddress
 import sys
 
 address = ipaddress.ip_address(sys.argv[1])
-if address.version != 4 or not ipaddress.ip_address("192.168.250.100") <= address <= ipaddress.ip_address("192.168.250.200"):
+if address.version != 4 or not ipaddress.ip_address(sys.argv[2]) <= address <= ipaddress.ip_address(sys.argv[3]):
     raise SystemExit("libvirt returned an address outside the High DHCP range")
 PY
 

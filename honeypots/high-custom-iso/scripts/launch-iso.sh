@@ -27,7 +27,7 @@ if ! virsh dominfo "$vm_name" >/dev/null 2>&1; then
   if [ -e "$instance_dir/installed-disk-verified" ]; then
     virt-install --name "$vm_name" --memory 2048 --vcpus 2 --os-variant generic --import \
       --disk "path=$instance_dir/disk.qcow2,format=qcow2,bus=virtio" --boot hd \
-      --network "network=hf-high-isolated,model=virtio" \
+      --network "network=$HF_HIGH_NETWORK_NAME,model=virtio" \
       --channel "unix,path=$instance_dir/telemetry.sock,mode=bind,target.type=virtio,target.name=org.honeyforge.telemetry.0" \
       --channel "unix,target.type=virtio,target.name=org.qemu.guest_agent.0" \
       --graphics spice,listen=127.0.0.1 --serial pty --console pty,target.type=serial --noautoconsole
@@ -35,7 +35,7 @@ if ! virsh dominfo "$vm_name" >/dev/null 2>&1; then
     virt-install --name "$vm_name" --memory 2048 --vcpus 2 --os-variant generic \
       --disk "path=$instance_dir/disk.qcow2,format=qcow2,bus=virtio" \
       --cdrom "$install_iso" --boot cdrom,hd \
-      --network "network=hf-high-isolated,model=virtio" \
+      --network "network=$HF_HIGH_NETWORK_NAME,model=virtio" \
       --channel "unix,path=$instance_dir/telemetry.sock,mode=bind,target.type=virtio,target.name=org.honeyforge.telemetry.0" \
       --channel "unix,target.type=virtio,target.name=org.qemu.guest_agent.0" \
       --graphics spice,listen=127.0.0.1 --serial pty --console pty,target.type=serial --noautoconsole

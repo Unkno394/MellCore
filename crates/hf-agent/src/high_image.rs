@@ -20,6 +20,92 @@ use uuid::Uuid;
 
 const MAX_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const MAX_VIRTUAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+const MIN_CUSTOM_QCOW2_DOWNLOAD_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+const MIN_CUSTOM_ISO_DOWNLOAD_FREE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+const DOWNLOAD_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct ApprovedIso {
+    pub source: HighImageSource,
+    pub expected_size_bytes: u64,
+}
+
+/// Versioned, reviewed installation media. Updating an entry requires reviewing the upstream
+/// checksum again; mutable `latest` URLs are intentionally not accepted here.
+pub fn approved_iso(profile: HighOsProfile) -> Result<ApprovedIso, HighImageError> {
+    let (url, sha256, expected_size_bytes) = if profile == HighOsProfile::ubuntu_iso_ssh() {
+        (
+            "https://releases.ubuntu.com/24.04.5/ubuntu-24.04.5-live-server-amd64.iso",
+            "97f3d7ffb032c3eb3b23d2c8be9cc76e60c2c1f2c0146ba5ba9fe01cafae0fd8",
+            4_080_486_400,
+        )
+    } else if profile == HighOsProfile::debian_iso_ssh() {
+        (
+            "https://chuangtzu.ftp.acc.umu.se/cdimage/archive/12.12.0/amd64/iso-dvd/debian-12.12.0-amd64-DVD-1.iso",
+            "84aae16b26c8d2802d1e327eb84ab8f053f0aa68b0b1679f5e6aaffd4fe549cc",
+            3_992_977_408,
+        )
+    } else if profile == HighOsProfile::arch_linux_iso_ssh() {
+        (
+            "https://archive.archlinux.org/iso/2025.08.01/archlinux-2025.08.01-x86_64.iso",
+            "4b1af44dbeed97acec0204a95f6393818bb8fd903b423a20b7ea141f80b27e59",
+            1_378_795_520,
+        )
+    } else if profile == HighOsProfile::windows_rdp_legacy_iso() {
+        return Err(error(
+            "WINDOWS_ISO_ADMIN_REQUIRED",
+            "licensing",
+            "Microsoft does not provide a stable license-neutral direct URL for Windows Server Evaluation media; an administrator must accept the Microsoft terms and provide image_source with the approved HTTPS URL and SHA-256",
+        ));
+    } else {
+        return Err(error(
+            "APPROVED_ISO_UNAVAILABLE",
+            "catalog",
+            "the selected profile has no agent-managed installation ISO",
+        ));
+    };
+    Ok(ApprovedIso {
+        source: HighImageSource {
+            url: url.into(),
+            sha256: sha256.into(),
+            format: HighImageFormat::Iso,
+            architecture: HighImageArchitecture::X86_64,
+        },
+        expected_size_bytes,
+    })
+}
+
+fn windows_admin_iso_from_values(
+    url: Option<std::ffi::OsString>,
+    sha256: Option<std::ffi::OsString>,
+) -> Result<Option<HighImageSource>, HighImageError> {
+    let (url, sha256) = match (url, sha256) {
+        (None, None) => return Ok(None),
+        (Some(url), Some(sha256)) => (url, sha256),
+        _ => {
+            return Err(error(
+                "WINDOWS_ISO_CONFIG_INCOMPLETE",
+                "licensing",
+                "HF_HIGH_WINDOWS_ISO_URL and HF_HIGH_WINDOWS_ISO_SHA256 must be provided together after an administrator accepts the Microsoft terms",
+            ));
+        }
+    };
+    let source = HighImageSource {
+        url: url.to_string_lossy().into_owned(),
+        sha256: sha256.to_string_lossy().into_owned(),
+        format: HighImageFormat::Iso,
+        architecture: HighImageArchitecture::X86_64,
+    };
+    validate_source_metadata(&source, HighOsProfile::windows_rdp_legacy_iso())?;
+    Ok(Some(source))
+}
+
+pub fn windows_admin_iso_source() -> Result<Option<HighImageSource>, HighImageError> {
+    windows_admin_iso_from_values(
+        std::env::var_os("HF_HIGH_WINDOWS_ISO_URL"),
+        std::env::var_os("HF_HIGH_WINDOWS_ISO_SHA256"),
+    )
+}
 
 #[derive(Debug, Error)]
 #[error("HF_HIGH_ERROR code={code} stage={stage}: {message}")]
@@ -41,6 +127,34 @@ pub fn materialize_image(
     source: &HighImageSource,
     profile: HighOsProfile,
     cache_dir: &Path,
+) -> Result<PathBuf, HighImageError> {
+    let required_free_bytes = match source.format {
+        HighImageFormat::Qcow2 => MIN_CUSTOM_QCOW2_DOWNLOAD_FREE_BYTES,
+        HighImageFormat::Iso => MIN_CUSTOM_ISO_DOWNLOAD_FREE_BYTES,
+    };
+    materialize_image_with_space(source, profile, cache_dir, required_free_bytes)
+}
+
+pub fn materialize_approved_iso(
+    approved: &ApprovedIso,
+    profile: HighOsProfile,
+    cache_dir: &Path,
+) -> Result<PathBuf, HighImageError> {
+    materialize_image_with_space(
+        &approved.source,
+        profile,
+        cache_dir,
+        approved
+            .expected_size_bytes
+            .saturating_add(DOWNLOAD_HEADROOM_BYTES),
+    )
+}
+
+fn materialize_image_with_space(
+    source: &HighImageSource,
+    profile: HighOsProfile,
+    cache_dir: &Path,
+    required_free_bytes: u64,
 ) -> Result<PathBuf, HighImageError> {
     validate_source_metadata(source, profile)?;
     fs::create_dir_all(cache_dir).map_err(|failure| {
@@ -67,6 +181,7 @@ pub fn materialize_image(
         verify_cached_image(source, profile, &destination)?;
         return Ok(destination);
     }
+    ensure_free_space(cache_dir, required_free_bytes)?;
 
     let temporary = cache_dir.join(format!(".{digest}.{}.part", Uuid::new_v4()));
     OpenOptions::new()
@@ -117,6 +232,54 @@ pub fn materialize_image(
     })();
     let _ = fs::remove_file(&temporary);
     result
+}
+
+fn ensure_free_space(path: &Path, required_bytes: u64) -> Result<(), HighImageError> {
+    let output = Command::new("df")
+        .args(["-Pk", "--"])
+        .arg(path)
+        .output()
+        .map_err(|failure| {
+            error(
+                "IMAGE_SPACE_CHECK_FAILED",
+                "download",
+                format!("could not inspect image cache free space: {failure}"),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(error(
+            "IMAGE_SPACE_CHECK_FAILED",
+            "download",
+            format!("df exited with {}", output.status),
+        ));
+    }
+    let available =
+        parse_df_available_bytes(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+            error(
+                "IMAGE_SPACE_CHECK_FAILED",
+                "download",
+                "df returned an unrecognized result",
+            )
+        })?;
+    if available < required_bytes {
+        return Err(error(
+            "IMAGE_DISK_SPACE_INSUFFICIENT",
+            "download",
+            format!(
+                "image cache has {available} bytes available but {required_bytes} bytes are required"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_df_available_bytes(output: &str) -> Option<u64> {
+    let line = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .last()?;
+    let kibibytes = line.split_whitespace().nth(3)?.parse::<u64>().ok()?;
+    kibibytes.checked_mul(1024)
 }
 
 pub fn verify_cached_image(
@@ -685,6 +848,57 @@ mod tests {
                 .code,
             "IMAGE_ARCHITECTURE_UNSUPPORTED"
         );
+    }
+
+    #[test]
+    fn approved_linux_iso_catalog_is_versioned_and_windows_requires_admin_media() {
+        for profile in [
+            HighOsProfile::ubuntu_iso_ssh(),
+            HighOsProfile::debian_iso_ssh(),
+            HighOsProfile::arch_linux_iso_ssh(),
+        ] {
+            let approved = approved_iso(profile).unwrap();
+            assert!(approved.source.url.starts_with("https://"));
+            assert!(!approved.source.url.contains("latest"));
+            assert_eq!(approved.source.sha256.len(), 64);
+            assert!(
+                approved
+                    .source
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            );
+            assert_eq!(approved.source.format, HighImageFormat::Iso);
+            assert_eq!(approved.source.architecture, HighImageArchitecture::X86_64);
+            assert!(approved.expected_size_bytes > 600 * 1024 * 1024);
+            validate_source_metadata(&approved.source, profile).unwrap();
+        }
+        let failure = approved_iso(HighOsProfile::windows_rdp_legacy_iso()).unwrap_err();
+        assert_eq!(failure.code, "WINDOWS_ISO_ADMIN_REQUIRED");
+        assert_eq!(failure.stage, "licensing");
+
+        assert!(windows_admin_iso_from_values(None, None).unwrap().is_none());
+        assert!(
+            windows_admin_iso_from_values(
+                Some("https://example.test/windows.iso".into()),
+                Some("a".repeat(64).into()),
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(
+            windows_admin_iso_from_values(Some("https://example.test/windows.iso".into()), None)
+                .unwrap_err()
+                .code,
+            "WINDOWS_ISO_CONFIG_INCOMPLETE"
+        );
+    }
+
+    #[test]
+    fn parses_df_space_and_rejects_malformed_results() {
+        let report = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 10000 2000 8000 20% /var/lib/honeyforge\n";
+        assert_eq!(parse_df_available_bytes(report), Some(8_192_000));
+        assert_eq!(parse_df_available_bytes("not df output\n"), None);
     }
 
     #[test]
