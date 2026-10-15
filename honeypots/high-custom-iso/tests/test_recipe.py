@@ -489,6 +489,71 @@ class CustomIsoRecipeTests(unittest.TestCase):
             verified = [call for call in run_mock.call_args_list if "--verify" in call.args[0]]
             self.assertEqual(len(verified), 2)
 
+    def test_arch_signature_preflight_uses_short_private_tmp_gnupg_home(self):
+        repository = load_arch_repository_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source_cache = root / ("long-cache-segment-" + "x" * 80) / ("y" * 80)
+            source_cache.mkdir(parents=True)
+            keyring = source_cache / repository.KEYRING_FILENAME
+            keyring.write_bytes(b"keyring fixture")
+            observed_homedirs = []
+
+            def extract(_package, member, destination):
+                if member.endswith("archlinux-revoked"):
+                    destination.write_text("", encoding="ascii")
+                elif member.endswith("archlinux-trusted"):
+                    destination.write_text(f"{'B' * 40}:4:\n", encoding="ascii")
+                else:
+                    destination.write_bytes(b"public keys")
+
+            def run(command, **_kwargs):
+                homedir = pathlib.Path(command[command.index("--homedir") + 1])
+                observed_homedirs.append(homedir)
+                self.assertLess(len(str(homedir / "S.gpg-agent")), 108)
+                self.assertEqual(stat.S_IMODE(homedir.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(homedir.parent.stat().st_mode), 0o700)
+                return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+            with mock.patch.object(
+                repository, "KEYRING_PACKAGE_SHA256", hashlib.sha256(b"keyring fixture").hexdigest()
+            ), mock.patch.object(repository, "extract_keyring_file", side_effect=extract), mock.patch.object(
+                repository.subprocess, "run", side_effect=run
+            ):
+                repository.preflight_package_signatures(source_cache, [])
+
+            self.assertEqual(len(observed_homedirs), 3)
+            self.assertTrue(all(str(path).startswith("/tmp/hf-arch-keyring-") for path in observed_homedirs))
+            self.assertTrue(all(not path.parent.exists() for path in observed_homedirs))
+
+    def test_arch_signature_preflight_reports_failed_gpg_operation_and_stderr(self):
+        repository = load_arch_repository_module()
+        with tempfile.TemporaryDirectory() as directory:
+            source_cache = pathlib.Path(directory)
+            keyring = source_cache / repository.KEYRING_FILENAME
+            keyring.write_bytes(b"keyring fixture")
+
+            def extract(_package, member, destination):
+                destination.write_bytes(b"fixture")
+
+            failure = subprocess.CompletedProcess(
+                ["gpg"],
+                2,
+                stdout=b"",
+                stderr=b"gpg: error running agent: File name too long\n",
+            )
+            with mock.patch.object(
+                repository, "KEYRING_PACKAGE_SHA256", hashlib.sha256(b"keyring fixture").hexdigest()
+            ), mock.patch.object(repository, "extract_keyring_file", side_effect=extract), mock.patch.object(
+                repository.subprocess, "run", return_value=failure
+            ):
+                with self.assertRaises(repository.RepositoryError) as caught:
+                    repository.preflight_package_signatures(source_cache, [])
+            self.assertEqual(caught.exception.code, "ARCH_REPO_KEYRING_INVALID")
+            self.assertIn("import public keys", str(caught.exception))
+            self.assertIn("exit 2", str(caught.exception))
+            self.assertIn("File name too long", str(caught.exception))
+
     def test_arch_repository_build_is_atomic_and_reuses_verified_iso(self):
         repository = load_arch_repository_module()
         with tempfile.TemporaryDirectory() as directory:

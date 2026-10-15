@@ -416,8 +416,11 @@ def preflight_package_signatures(source_cache: Path, packages: list[Package]) ->
     keyring_package = source_cache / KEYRING_FILENAME
     if sha256_file(keyring_package) != KEYRING_PACKAGE_SHA256:
         raise RepositoryError("ARCH_REPO_KEYRING_INVALID", "bootstrap keyring checksum mismatch")
-    with tempfile.TemporaryDirectory(prefix=".arch-keyring-", dir=source_cache) as directory:
+    # GnuPG creates S.gpg-agent below GNUPGHOME. Keep this root short: UNIX-domain
+    # socket paths are much shorter than normal filesystem paths on Linux.
+    with tempfile.TemporaryDirectory(prefix="hf-arch-keyring-", dir="/tmp") as directory:
         root = Path(directory)
+        os.chmod(root, 0o700)
         homedir = root / "gnupg"
         homedir.mkdir(mode=0o700)
         public_keys = root / "archlinux.gpg"
@@ -430,15 +433,27 @@ def preflight_package_signatures(source_cache: Path, packages: list[Package]) ->
         ):
             extract_keyring_file(keyring_package, member, destination)
         commands = (
-            ["gpg", "--batch", "--homedir", str(homedir), "--import", str(public_keys)],
-            ["gpg", "--batch", "--homedir", str(homedir), "--import-ownertrust", str(trusted)],
-            ["gpg", "--batch", "--homedir", str(homedir), "--check-trustdb"],
+            (
+                "import public keys",
+                ["gpg", "--batch", "--homedir", str(homedir), "--import", str(public_keys)],
+            ),
+            (
+                "import owner trust",
+                ["gpg", "--batch", "--homedir", str(homedir), "--import-ownertrust", str(trusted)],
+            ),
+            (
+                "check trust database",
+                ["gpg", "--batch", "--homedir", str(homedir), "--check-trustdb"],
+            ),
         )
-        for command in commands:
+        for operation, command in commands:
             result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             if result.returncode:
+                stderr = result.stderr.decode("utf-8", "replace")
+                detail = " ".join(stderr.strip().splitlines())[-600:] or "<empty stderr>"
                 raise RepositoryError(
-                    "ARCH_REPO_KEYRING_INVALID", "could not initialize isolated verification keyring"
+                    "ARCH_REPO_KEYRING_INVALID",
+                    f"GPG operation '{operation}' failed with exit {result.returncode}: {detail}",
                 )
         revoked_fingerprints = parse_revoked_fingerprints(revoked.read_text(encoding="ascii"))
         for package in packages:
