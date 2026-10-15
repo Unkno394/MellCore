@@ -343,7 +343,9 @@ pub fn pritvoryashka_service_endpoints_for_os(
     let endpoints = pritvoryashka_service_endpoints(profiles)?;
     if profiles
         .iter()
-        .any(|profile| profile.starts_with("win_") != windows)
+        .any(|profile| {
+            profile != "ssh_weak_credentials" && profile.starts_with("win_") != windows
+        })
     {
         return Err("Vulnerability profiles must match the Middle operating system");
     }

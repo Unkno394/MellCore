@@ -811,6 +811,7 @@ fn commands_for(action: TrapAction, trap: &Trap) -> Result<Vec<AgentCommand>, Ap
         match trap.profile_snapshot.honeypot_type.as_str() {
             "kozyavka" => crate::kozyavka::deployment_command(trap),
             "high_ubuntu_ssh" => crate::high_ubuntu::deployment_command(trap),
+            "high_vm" => crate::high_vm::deployment_command(trap),
             "pritvoryashka" => {
                 let settings = crate::pritvoryashka::validate_profile(
                     trap.profile_snapshot.level,

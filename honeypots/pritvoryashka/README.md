@@ -80,17 +80,22 @@ Windows-файлы-приманки используют пути `/C/Users/...`
 OpenSSH for Windows. В группе Dispatcher все участники используют общий
 SSH-баннер и host key; Windows Middle может делить порт с Linux Middle.
 
-## Linux-профили уязвимостей
+## Профили уязвимостей Middle
 
-Поле `vulnerability_profiles` принимает `ssh_weak_credentials`,
-`ssh_root_login_enabled`, `redis_unauthenticated_access`, `docker_api_exposed`,
+`ssh_weak_credentials` работает на Linux и Windows Middle: пары задаются отдельно
+через `ssh_auth_mode` и `ssh_credentials`, а попытки входа попадают в телеметрию.
+
+Linux-профиль принимает `ssh_root_login_enabled`, `redis_unauthenticated_access`, `docker_api_exposed`,
 `http_admin_panel_exposure`, `sql_database_weak_credentials`,
 `ftp_anonymous_login`, `web_path_traversal` и `web_command_injection`.
-SSH-профили помечают попытки входа и пишут события; принимаемые учётные данные
-задаются отдельно через `ssh_auth_mode` и `ssh_credentials`.
 Redis, Docker API и HTTP используют отдельные listeners; SQL поднимает MySQL и
 PostgreSQL; FTP использует control и EPSV data listeners. Несколько HTTP-профилей
 совместно используют один listener.
+
+Windows-профиль принимает `win_autologon_credentials`,
+`win_always_install_elevated`, `win_writable_service_binary` и `win_guest_share`.
+Они изменяют виртуальное состояние PowerShell/реестра и фиксируют обращения;
+Windows не запускает Linux listeners.
 
 Центр проверяет, что для каждого выбранного сетевого endpoint выделена прямая
 TCP-привязка. Только SSH можно направить через Dispatcher. Приложение

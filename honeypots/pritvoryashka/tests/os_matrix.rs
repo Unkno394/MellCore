@@ -616,20 +616,39 @@ fn windows_has_matching_virtual_users_files_and_scenarios() {
         run(&mut guest, "Get-Command msiexec.exe").contains("C:\\Windows\\System32\\msiexec.exe")
     );
     assert!(run(&mut guest, "Get-Acl C:\\ProgramData\\OpsBackup\\backup.exe").contains("Modify"));
-    assert!(
-        run(
-            &mut guest,
-            "Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon'"
-        )
-        .contains("DECOY-ONLY")
+    let autologon = guest.execute(
+        "Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon'",
+        now(),
     );
-    assert!(
-        run(
-            &mut guest,
-            "Get-ItemProperty 'HKCU:\\Software\\Policies\\Microsoft\\Windows\\Installer'"
-        )
-        .contains("AlwaysInstallElevated")
+    assert!(autologon.output.contains("DECOY-ONLY"));
+    assert!(autologon
+        .vulnerability_attempts
+        .iter()
+        .any(|attempt| attempt.profile_id == "win_autologon_credentials"));
+
+    let installer = guest.execute(
+        "Get-ItemProperty 'HKCU:\\Software\\Policies\\Microsoft\\Windows\\Installer'",
+        now(),
     );
+    assert!(installer.output.contains("AlwaysInstallElevated"));
+    assert!(installer
+        .vulnerability_attempts
+        .iter()
+        .any(|attempt| attempt.profile_id == "win_always_install_elevated"));
+
+    let writable_service = guest.execute("sc.exe qc OpsBackup", now());
+    assert!(writable_service.output.contains("backup.exe"));
+    assert!(writable_service
+        .vulnerability_attempts
+        .iter()
+        .any(|attempt| attempt.profile_id == "win_writable_service_binary"));
+
+    let guest_share = guest.execute("Get-SmbShare", now());
+    assert!(guest_share.output.contains("PublicShare"));
+    assert!(guest_share
+        .vulnerability_attempts
+        .iter()
+        .any(|attempt| attempt.profile_id == "win_guest_share"));
     run(
         &mut guest,
         "Set-Content C:\\ProgramData\\OpsBackup\\backup.exe -Value virtual",
@@ -647,10 +666,11 @@ fn windows_has_matching_virtual_users_files_and_scenarios() {
 fn windows_powershell_core_commands_and_expressions_work() {
     pritvoryashka::shell::windows::check_parser().unwrap();
     let mut guest = shell(Distribution::Windows, &[], &[]);
-    let assignment = run(
+    run(
         &mut guest,
         "$testDir = Join-Path $env:TEMP \"honeyforge-test\"",
     );
+    let assignment = run(&mut guest, "Write-Output $testDir");
     assert!(
         assignment.contains(r"C:\Users\admin\AppData\Local\Temp\honeyforge-test"),
         "Join-Path did not evaluate the assignment: {assignment}"

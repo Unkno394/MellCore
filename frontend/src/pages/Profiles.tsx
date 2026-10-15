@@ -11,7 +11,7 @@ const defaultLimits: Record<ProfileInput['level'], ContainerResourceLimits> = {
   medium: { cpu_cores: 1, memory_mb: 512, pids: 256 },
   high: { cpu_cores: 0.5, memory_mb: 128, pids: 64 },
 }
-const typeForLevel: Record<ProfileInput['level'], string> = { low: 'kozyavka', medium: 'pritvoryashka', high: 'high_ubuntu_ssh' }
+const typeForLevel: Record<ProfileInput['level'], string> = { low: 'kozyavka', medium: 'pritvoryashka', high: 'high_vm' }
 const emptyProfile: ProfileInput = { name: '', description: '', level: 'low', honeypot_type: typeForLevel.low, service_type: 'ssh', config: {}, resources: defaultLimits.low }
 
 export default function Profiles({ api, profiles, isAdmin, onChanged }: Props) {
@@ -26,7 +26,7 @@ export default function Profiles({ api, profiles, isAdmin, onChanged }: Props) {
   function createNew() { setSelectedId(null); setForm(emptyProfile); setConfigText('{}'); setError(''); setMessage('') }
   function select(profile: Profile) {
     setSelectedId(profile.id)
-    setForm({ name: profileNameLabel(profile.name, profile.level), description: profile.description, level: profile.level, honeypot_type: typeForLevel[profile.level], service_type: profile.service_type, config: profile.config, resources: profile.resources ?? defaultLimits[profile.level] })
+    setForm({ name: profileNameLabel(profile.name, profile.level), description: profile.description, level: profile.level, honeypot_type: profile.honeypot_type, service_type: profile.service_type, config: profile.config, resources: profile.resources ?? defaultLimits[profile.level] })
     setConfigText(JSON.stringify(profile.config, null, 2))
     setError(''); setMessage('')
   }
@@ -38,7 +38,8 @@ export default function Profiles({ api, profiles, isAdmin, onChanged }: Props) {
     try {
       const config = JSON.parse(configText) as unknown
       if (!config || Array.isArray(config) || typeof config !== 'object') throw new Error('Конфигурация должна быть объектом JSON.')
-      const input = { ...form, config: config as Record<string, unknown> }
+      const preservedName = selected && form.name === profileNameLabel(selected.name, selected.level) ? selected.name : form.name
+      const input = { ...form, name: preservedName, config: config as Record<string, unknown> }
       const saved = selected ? await api.profiles.update(selected, input) : await api.profiles.create(input)
       setSelectedId(saved.id)
       setMessage(selected ? 'Профиль обновлён.' : 'Профиль создан.')
@@ -63,7 +64,7 @@ export default function Profiles({ api, profiles, isAdmin, onChanged }: Props) {
       <section className="rounded-xl border border-white/10 bg-[#160e0c]/75 p-5 backdrop-blur-xl"><div className="border-b border-white/10 pb-5"><p className="text-[10px] uppercase tracking-[0.2em] text-orange-300/70">{selected ? `Редактирование версии ${selected.version}` : 'Новый профиль'}</p><h3 className="mt-2 text-lg font-semibold">{form.name || 'Профиль без названия'}</h3></div><div className="mt-5 space-y-5">
         <label className="block text-xs text-white/55">Название профиля<input disabled={!isAdmin} value={form.name} onChange={(e) => update('name', e.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-3 text-sm outline-none" /></label>
         <label className="block text-xs text-white/55">Описание<textarea disabled={!isAdmin} rows={3} value={form.description} onChange={(e) => update('description', e.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-3 text-sm outline-none" /></label>
-        <div className="grid gap-4 sm:grid-cols-2"><label className="text-xs text-white/55">Уровень взаимодействия<select disabled={!isAdmin} value={form.level} onChange={(e) => { const level = e.target.value as ProfileInput['level']; setForm((current) => ({ ...current, level, honeypot_type: typeForLevel[level], resources: defaultLimits[level] })); setMessage('') }} className="mt-2 w-full rounded-lg border border-white/10 bg-[#100a09] px-3 py-3 text-sm"><option value="low">Нижний</option><option value="medium">Средний</option><option value="high">Высокий</option></select></label><label className="text-xs text-white/55">Служба<input disabled={!isAdmin} value={form.service_type} onChange={(e) => update('service_type', e.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-3 text-sm" /></label></div>
+        <div className="grid gap-4 sm:grid-cols-2"><label className="text-xs text-white/55">Уровень взаимодействия<select disabled={!isAdmin} value={form.level} onChange={(e) => { const level = e.target.value as ProfileInput['level']; const config = level === 'high' ? { os_profile: 'ubuntu_ssh' } : {}; setForm((current) => ({ ...current, level, honeypot_type: typeForLevel[level], service_type: level === 'high' ? 'ssh' : current.service_type, config, resources: defaultLimits[level] })); setConfigText(JSON.stringify(config, null, 2)); setMessage('') }} className="mt-2 w-full rounded-lg border border-white/10 bg-[#100a09] px-3 py-3 text-sm"><option value="low">Нижний</option><option value="medium">Средний</option><option value="high">Высокий</option></select></label><label className="text-xs text-white/55">Служба<input disabled={!isAdmin} value={form.service_type} onChange={(e) => update('service_type', e.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-3 text-sm" /></label></div>
         {form.level !== 'high' && <section className="rounded-lg border border-white/10 bg-black/10 p-4"><h4 className="text-xs font-semibold uppercase tracking-wider text-white/45">Ресурсы по умолчанию</h4><p className="mt-1 text-[11px] text-white/35">Это исходный бюджет профиля. Для каждой ловушки его можно переопределить в допустимых пределах.</p><div className="mt-3 grid gap-3 sm:grid-cols-3"><ResourceInput label="CPU (ядра)" value={form.resources.cpu_cores} min={0.05} max={form.level === 'low' ? 0.5 : 1} step={0.05} disabled={!isAdmin} onChange={(value) => updateResource('cpu_cores', value)}/><ResourceInput label="RAM (МБ)" value={form.resources.memory_mb} min={32} max={form.level === 'low' ? 128 : 512} step={16} disabled={!isAdmin} onChange={(value) => updateResource('memory_mb', value)}/><ResourceInput label="Процессы" value={form.resources.pids} min={16} max={form.level === 'low' ? 64 : 256} step={1} disabled={!isAdmin} onChange={(value) => updateResource('pids', value)}/></div></section>}
         <label className="block text-xs text-white/55">Конфигурация JSON<textarea disabled={!isAdmin} rows={8} value={configText} onChange={(e) => { setConfigText(e.target.value); setMessage('') }} className="mt-2 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-3 font-mono text-xs outline-none" /></label>
         {error && <p role="alert" className="text-sm text-red-400">{error}</p>}{message && <p role="status" className="text-sm text-emerald-300">{message}</p>}

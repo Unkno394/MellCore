@@ -118,9 +118,11 @@ impl ProfileInput {
         }
         if self.honeypot_type == "high_ubuntu_ssh" {
             crate::high_ubuntu::validate_profile(self.level, &self.service_type, &self.config)?;
+        } else if self.honeypot_type == "high_vm" {
+            crate::high_vm::validate_profile(self.level, &self.service_type, &self.config)?;
         } else if self.level == TrapLevel::High {
             return Err(AppError::invalid(
-                "High interaction currently requires the high_ubuntu_ssh profile",
+                "High interaction requires a supported High VM profile",
             ));
         }
         Ok(())

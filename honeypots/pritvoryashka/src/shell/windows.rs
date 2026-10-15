@@ -3885,7 +3885,9 @@ impl WindowsShell {
                 ),
                 (
                     "win_always_install_elevated",
-                    (lower.contains("installer") && lower.contains("alwaysinstallelevated"))
+                    (lower.contains("installer")
+                        && (lower.contains("alwaysinstallelevated")
+                            || lower.contains("get-itemproperty")))
                         || lower.contains("msiexec"),
                 ),
                 (

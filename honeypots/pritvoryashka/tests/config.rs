@@ -15,11 +15,19 @@ fn example_configuration_is_valid() {
 fn vulnerability_profiles_must_match_middle_operating_system() {
     let mut value = valid();
     value["distribution"] = json!("windows");
-    value["vulnerability_profiles"] = json!(["win_autologon_credentials", "win_guest_share"]);
+    value["vulnerability_profiles"] = json!([
+        "ssh_weak_credentials",
+        "win_autologon_credentials",
+        "win_guest_share"
+    ]);
     let config: Config = serde_json::from_value(value.clone()).unwrap();
     config.validate().unwrap();
 
     value["vulnerability_profiles"] = json!(["docker_api_exposed"]);
+    let config: Config = serde_json::from_value(value.clone()).unwrap();
+    assert!(config.validate().is_err());
+
+    value["vulnerability_profiles"] = json!(["ssh_root_login_enabled"]);
     let config: Config = serde_json::from_value(value.clone()).unwrap();
     assert!(config.validate().is_err());
 

@@ -152,6 +152,8 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
         deploymentPort = temporaryPort
       }
       const isMiddle = profile.honeypot_type === 'pritvoryashka'
+      const isHigh = profile.level === 'high'
+      const serviceLabel = profile.service_type.toUpperCase()
       const config = isMiddle ? {
         hostname: middleHostname.trim(),
         username: middleUsername.trim(),
@@ -160,7 +162,7 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
         ssh_auth_mode: middleSshAuthMode,
         ssh_credentials: middleSshAuthMode === 'realistic' ? withFixedSshUsername(middleSshCredentials, middleUsername.trim()) : [],
       } : {}
-      const ports = [{ transport: 'tcp' as const, host_port: deploymentPort, target_port: 2222, route_mode: 'direct' as const }]
+      const ports = [{ transport: 'tcp' as const, host_port: deploymentPort, target_port: isHigh ? 22 : 2222, route_mode: 'direct' as const }]
       const input = { name, profile_id: profile.id, config, resources, desired_state: 'stopped' as const, ports }
       try {
         const created = await api.traps.create(serverId, input)
@@ -195,8 +197,8 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
         'success',
         effectiveSharedPort === null ? 'Ловушка установлена' : 'Общий порт настроен',
         effectiveSharedPort === null
-          ? `«${name}» доступна по SSH на ${selectedServer?.host ?? 'выбранном сервере'}:${hostPort}.${serviceSuffix}`
-          : `«${name}» доступна по SSH через общий порт ${effectiveSharedPort}.${serviceSuffix}`,
+          ? `«${name}» доступна по ${serviceLabel} на ${selectedServer?.host ?? 'выбранном сервере'}:${hostPort}.${serviceSuffix}`
+          : `«${name}» доступна по ${serviceLabel} через общий порт ${effectiveSharedPort}.${serviceSuffix}`,
       )
       setName('')
       setMiddleSshAuthMode('realistic')

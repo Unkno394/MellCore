@@ -73,6 +73,38 @@ fn reject_auth() -> Auth {
     }
 }
 
+fn sync_configured_baits(
+    filesystem: &mut PersistentVirtualFileSystem,
+    baits: &[hf_core::BaitFile],
+) -> io::Result<()> {
+    let mut virtual_filesystem = filesystem.filesystem().clone();
+    let mut changed = false;
+    for bait in baits {
+        let Some(path) = bait.path.as_deref() else {
+            continue;
+        };
+        if virtual_filesystem
+            .read(path)
+            .is_ok_and(|contents| contents == bait.content.as_bytes())
+        {
+            continue;
+        }
+        virtual_filesystem
+            .install_bait(bait, path, chrono::Utc::now())
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("could not apply configured bait {:?}: {error}", bait.name),
+                )
+            })?;
+        changed = true;
+    }
+    if changed {
+        filesystem.replace(virtual_filesystem)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     #[error("cannot load SSH host key: {0}")]
@@ -110,10 +142,12 @@ pub async fn run(config: Config, emitter: EventEmitter) -> Result<(), ServerErro
             .join("peer-passwords.json"),
         pepper_hasher.finalize().into(),
     )?;
-    let persistent_filesystem = Arc::new(std::sync::Mutex::new(PersistentVirtualFileSystem::open(
+    let mut persistent_filesystem = PersistentVirtualFileSystem::open(
         filesystem_path,
         initial_state.shell.filesystem().clone(),
-    )?));
+    )?;
+    sync_configured_baits(&mut persistent_filesystem, &config.baits)?;
+    let persistent_filesystem = Arc::new(std::sync::Mutex::new(persistent_filesystem));
     let ssh_config = Arc::new(server::Config {
         server_id: russh::SshId::Standard(
             if config.distribution == crate::config::Distribution::Windows

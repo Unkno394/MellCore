@@ -96,6 +96,13 @@ if ! nginx -t; then
     echo "Nginx-конфиг восстановлен из $backup/nginx/mellcore-https.conf" >&2
     exit 1
 fi
+
+# The backend verifies the exact migration set at startup. Apply migrations
+# embedded in the uploaded binary before activating it, using the production
+# environment file rather than a checkout-local .env.
+(cd / && env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    "$artifacts/honeyforge-backend" migrate)
+
 for name in hf-center hf-agent hf-dispatcher honeyforge-backend; do
     install -m 0755 "$artifacts/$name" "/usr/local/bin/.$name.new"
     mv -f "/usr/local/bin/.$name.new" "/usr/local/bin/$name"

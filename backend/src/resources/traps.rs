@@ -55,6 +55,41 @@ async fn snapshot(
             ));
         }
     }
+    if profile.honeypot_type == "high_vm" {
+        let configured_os = crate::high_vm::validate_profile(
+            profile.level,
+            &profile.service_type,
+            &profile.config,
+        )?;
+        let requested_os =
+            crate::high_vm::validate_profile(profile.level, &profile.service_type, &effective)?;
+        if configured_os != requested_os {
+            return Err(AppError::invalid(
+                "A trap cannot override the operating system selected by its High profile",
+            ));
+        }
+        if input.ports.len() != 1
+            || input.ports[0].transport != Transport::Tcp
+            || input.ports[0].route_mode != RouteMode::Direct
+        {
+            return Err(AppError::invalid(
+                "High SSH requires exactly one direct TCP port",
+            ));
+        }
+        let guest_port = match crate::high_vm::os_profile(&effective)?.connection {
+            hf_core::HighGuestConnection::Ssh { guest_port } => guest_port,
+            hf_core::HighGuestConnection::Rdp { .. } => {
+                return Err(AppError::invalid(
+                    "high_vm currently supports SSH profiles only",
+                ));
+            }
+        };
+        if input.ports[0].target_port != guest_port {
+            return Err(AppError::invalid(
+                "High SSH guest port does not match the selected OS profile",
+            ));
+        }
+    }
     Ok((profile, effective, resources))
 }
 async fn reserve(

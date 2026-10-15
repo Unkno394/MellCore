@@ -40,6 +40,7 @@ export const linuxScenarioOptions: ScenarioOption[] = [
 ]
 
 export const windowsScenarioOptions: ScenarioOption[] = [
+  { id: 'ssh_weak_credentials', name: 'SSH Weak Credentials', protocol: 'SSH', description: 'Принимает заданные слабые виртуальные учётные данные и фиксирует попытки входа в Windows Middle.' },
   { id: 'win_autologon_credentials', name: 'Секрет AutoAdminLogon', protocol: 'Реестр', description: 'Фиктивный пароль в Winlogon; чтение фиксируется.' },
   { id: 'win_always_install_elevated', name: 'AlwaysInstallElevated', protocol: 'PowerShell', description: 'Виртуальные ключи Installer и ответ msiexec. Код хоста не запускается.' },
   { id: 'win_writable_service_binary', name: 'Изменяемый файл службы', protocol: 'Служба', description: 'OpsBackup видна в службах и реестре; файл расположен в ProgramData.' },

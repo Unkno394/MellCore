@@ -35,7 +35,7 @@ export type BaitFileConfig = {
 export type BaitFile = {
   id: string
   name: string
-  path: string | null
+  path?: string | null
   content: string
   category?: Exclude<BaitKind, 'process'>
   /** Legacy configuration alias, read for traps created before category/implementation split. */

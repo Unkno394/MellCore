@@ -26,10 +26,11 @@ function trapBaits(trap: Trap | undefined): BaitFile[] {
   if (!Array.isArray(value)) return []
   return value.filter((item): item is BaitFile =>
     !!item && typeof item === 'object' && typeof item.id === 'string'
-    && typeof item.name === 'string' && (typeof item.path === 'string' || item.path === null)
+    && typeof item.name === 'string' && (typeof item.path === 'string' || item.path === null || item.path === undefined)
     && typeof item.content === 'string')
     .map((item) => ({
       ...item,
+      path: item.path ?? null,
       category: normalizedCategory(item.category ?? item.kind) as Exclude<BaitKind, 'process'>,
       implementation: item.implementation ?? (item.category === 'account' || item.kind === 'account' ? 'virtual_account' : 'virtual_file'),
       config: item.config ?? {},
