@@ -7,9 +7,7 @@ use std::{
     time::Duration,
 };
 
-use crate::sandbox::{
-    HighDomainState, LibvirtSandboxManager, default_recipe_dir, is_supported_profile,
-};
+use crate::sandbox::{HighDomainState, LibvirtSandboxManager, is_supported_profile};
 use hf_core::{HighGuestConnection, HighLifecycleState, HighOsProfile};
 use hf_services::high_telemetry::{
     DEFAULT_MAX_PENDING_HIGH_EVENTS, HighTelemetryStore, SharedHighTelemetryStore,
@@ -147,6 +145,7 @@ impl OperationalProbe for LibvirtSandboxManager {
 
 pub fn start(
     state_dir: &Path,
+    high_recipe_dir: PathBuf,
     agent_id: Uuid,
     max_pending_events: usize,
     operational_interval: Duration,
@@ -156,6 +155,9 @@ pub fn start(
     }
     let high_root = state_dir.join("high");
     let operational_state_dir = state_dir.to_path_buf();
+    let operational_manager =
+        LibvirtSandboxManager::with_high_root(high_recipe_dir, state_dir.join("high"));
+    operational_manager.validate_recipes()?;
     fs::create_dir_all(&high_root)?;
     let store = Arc::new(Mutex::new(HighTelemetryStore::open(
         state_dir.join("high-telemetry.sqlite"),
@@ -168,6 +170,7 @@ pub fn start(
             run_operational_monitor(
                 operational_state_dir,
                 operational_store,
+                operational_manager,
                 operational_interval
             )
         );
@@ -177,13 +180,15 @@ pub fn start(
 async fn run_operational_monitor(
     state_dir: PathBuf,
     store: SharedHighTelemetryStore,
+    manager: LibvirtSandboxManager,
     interval: Duration,
 ) {
     loop {
         let state_dir_for_poll = state_dir.clone();
         let store_for_poll = store.clone();
+        let manager_for_poll = manager.clone();
         if let Err(error) = tokio::task::spawn_blocking(move || {
-            collect_operational_snapshots(&state_dir_for_poll, &store_for_poll)
+            collect_operational_snapshots(&state_dir_for_poll, &store_for_poll, &manager_for_poll)
         })
         .await
         .map_err(|error| anyhow::anyhow!("High operational worker panicked: {error}"))
@@ -198,10 +203,9 @@ async fn run_operational_monitor(
 fn collect_operational_snapshots(
     state_dir: &Path,
     store: &SharedHighTelemetryStore,
+    manager: &LibvirtSandboxManager,
 ) -> anyhow::Result<()> {
-    let manager =
-        LibvirtSandboxManager::with_high_root(default_recipe_dir(), state_dir.join("high"));
-    collect_operational_snapshots_with_probe(state_dir, store, &manager, now_ms())
+    collect_operational_snapshots_with_probe(state_dir, store, manager, now_ms())
 }
 
 fn collect_operational_snapshots_with_probe(

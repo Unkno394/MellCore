@@ -101,6 +101,7 @@ impl HighVm {
     }
 }
 
+#[derive(Clone)]
 pub struct LibvirtSandboxManager {
     adapters: Vec<HighOsAdapter>,
     high_root: PathBuf,
@@ -409,6 +410,40 @@ impl LibvirtSandboxManager {
             ],
             high_root: high_root.into(),
         }
+    }
+
+    /// Validate the installed recipe tree before any lifecycle command can mutate libvirt or the
+    /// host firewall. Scripts are deliberately required to be regular files, not executable:
+    /// lifecycle commands invoke them through `sh`, which also supports read-only recipe trees.
+    pub fn validate_recipes(&self) -> anyhow::Result<()> {
+        for adapter in &self.adapters {
+            if !adapter.recipe_dir.is_dir() {
+                anyhow::bail!(
+                    "HF_HIGH_ERROR code=RECIPE_DIRECTORY_MISSING stage=configuration: High {} recipe directory does not exist: {}",
+                    profile_recipe_name(adapter.profile),
+                    adapter.recipe_dir.display()
+                );
+            }
+            let scripts_dir = adapter.recipe_dir.join("scripts");
+            if !scripts_dir.is_dir() {
+                anyhow::bail!(
+                    "HF_HIGH_ERROR code=RECIPE_SCRIPTS_MISSING stage=configuration: High {} scripts directory does not exist: {}",
+                    profile_recipe_name(adapter.profile),
+                    scripts_dir.display()
+                );
+            }
+            for script in adapter.scripts.required {
+                let path = scripts_dir.join(script);
+                if !path.is_file() {
+                    anyhow::bail!(
+                        "HF_HIGH_ERROR code=RECIPE_SCRIPT_MISSING stage=configuration: High {} recipe is missing required script {}",
+                        profile_recipe_name(adapter.profile),
+                        path.display()
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn create_and_start(&self, vm: &HighVm) -> anyhow::Result<()> {
@@ -1083,14 +1118,37 @@ fn high_running_health(
     state == HighDomainState::Running && matches_security_profile && has_dnat && ssh_ready
 }
 
-pub fn default_recipe_dir() -> &'static Path {
-    Path::new("/usr/local/lib/honeyforge/high-ubuntu-ssh")
+pub const DEFAULT_HIGH_RECIPES_ROOT: &str = "/usr/local/lib/honeyforge";
+pub const HIGH_RECIPES_ROOT_ENV: &str = "HF_HIGH_RECIPES_ROOT";
+
+fn recipe_dir_from_override(root: Option<std::ffi::OsString>) -> anyhow::Result<PathBuf> {
+    let root = match root {
+        Some(root) if root.is_empty() => {
+            anyhow::bail!(
+                "HF_HIGH_ERROR code=RECIPE_ROOT_INVALID stage=configuration: {HIGH_RECIPES_ROOT_ENV} must not be empty"
+            )
+        }
+        Some(root) => PathBuf::from(root),
+        None => PathBuf::from(DEFAULT_HIGH_RECIPES_ROOT),
+    };
+    if !root.is_absolute() {
+        anyhow::bail!(
+            "HF_HIGH_ERROR code=RECIPE_ROOT_INVALID stage=configuration: {HIGH_RECIPES_ROOT_ENV} must be an absolute path, got {}",
+            root.display()
+        );
+    }
+    Ok(root.join("high-ubuntu-ssh"))
+}
+
+pub fn default_recipe_dir() -> anyhow::Result<PathBuf> {
+    recipe_dir_from_override(std::env::var_os(HIGH_RECIPES_ROOT_ENV))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use hf_core::{HighImageKind, HighImagePreparation};
+    use std::{fs, os::unix::fs::PermissionsExt};
 
     #[test]
     fn high_vm_identity_is_a_real_instance_not_a_shell_simulation() {
@@ -1098,10 +1156,54 @@ mod tests {
         assert!(vm.instance_id.to_string().len() == 36);
         assert_eq!(vm.profile, HighOsProfile::ubuntu_ssh());
         assert_eq!(vm.external_service_port, 1488);
+    }
+
+    #[test]
+    fn recipe_root_override_selects_the_ubuntu_recipe_beneath_the_shared_root() {
         assert_eq!(
-            default_recipe_dir(),
+            recipe_dir_from_override(Some("/home/tima/MellCore-iso-e2e/honeypots".into())).unwrap(),
+            Path::new("/home/tima/MellCore-iso-e2e/honeypots/high-ubuntu-ssh")
+        );
+        assert_eq!(
+            recipe_dir_from_override(None).unwrap(),
             Path::new("/usr/local/lib/honeyforge/high-ubuntu-ssh")
         );
+        assert!(recipe_dir_from_override(Some("".into())).is_err());
+        assert!(recipe_dir_from_override(Some("relative/recipes".into())).is_err());
+    }
+
+    #[test]
+    fn validates_all_recipe_scripts_and_runs_non_executable_scripts_through_sh() {
+        let temporary = std::env::temp_dir().join(format!("hf-recipes-{}", Uuid::new_v4()));
+        let ubuntu = temporary.join("high-ubuntu-ssh");
+        let manager = LibvirtSandboxManager::with_high_root(&ubuntu, temporary.join("state"));
+        for adapter in &manager.adapters {
+            let scripts = adapter.recipe_dir.join("scripts");
+            fs::create_dir_all(&scripts).unwrap();
+            for script in adapter.scripts.required {
+                let path = scripts.join(script);
+                if !path.exists() {
+                    fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+            }
+        }
+        manager.validate_recipes().unwrap();
+
+        let probe = ubuntu.join("scripts/non-executable-probe.sh");
+        fs::write(&probe, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o600)).unwrap();
+        manager
+            .run(HighOsProfile::ubuntu_ssh(), "non-executable-probe.sh", &[])
+            .unwrap();
+
+        let missing = ubuntu.join("scripts/launch.sh");
+        fs::remove_file(&missing).unwrap();
+        let error = manager.validate_recipes().unwrap_err().to_string();
+        assert!(error.contains("RECIPE_SCRIPT_MISSING"));
+        assert!(error.contains(&missing.display().to_string()));
+
+        fs::remove_dir_all(&temporary).unwrap();
     }
 
     #[test]

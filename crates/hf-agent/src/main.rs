@@ -134,6 +134,7 @@ struct StandaloneHighIdentity {
 #[derive(Clone)]
 struct ComposeProjectStore {
     root: PathBuf,
+    high_recipe_dir: PathBuf,
     mutation_lock: Arc<std::sync::Mutex<()>>,
 }
 
@@ -304,9 +305,18 @@ fn normalize_dispatcher_weights(targets: &mut [DispatcherTarget]) -> anyhow::Res
 }
 
 impl ComposeProjectStore {
+    #[cfg(test)]
     fn new(state_dir: &Path) -> Self {
+        Self::with_high_recipe_dir(
+            state_dir,
+            Path::new(sandbox::DEFAULT_HIGH_RECIPES_ROOT).join("high-ubuntu-ssh"),
+        )
+    }
+
+    fn with_high_recipe_dir(state_dir: &Path, high_recipe_dir: impl Into<PathBuf>) -> Self {
         Self {
             root: state_dir.join("traps"),
+            high_recipe_dir: high_recipe_dir.into(),
             mutation_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
@@ -316,7 +326,7 @@ impl ComposeProjectStore {
             .root
             .parent()
             .unwrap_or(Path::new("/var/lib/honeyforge"));
-        LibvirtSandboxManager::with_high_root(default_recipe_dir(), state_dir.join("high"))
+        LibvirtSandboxManager::with_high_root(&self.high_recipe_dir, state_dir.join("high"))
     }
 
     fn high_manifest_path(&self, trap_id: uuid::Uuid) -> PathBuf {
@@ -1598,6 +1608,9 @@ async fn main() -> anyhow::Result<()> {
     if args.standalone_high {
         validate_standalone_high_args(&args)?;
     }
+    let high_recipe_dir = default_recipe_dir()?;
+    LibvirtSandboxManager::with_high_root(&high_recipe_dir, args.state_dir.join("high"))
+        .validate_recipes()?;
     fs::create_dir_all(&args.state_dir)?;
     if args.standalone_high {
         secure_standalone_high_state_dir(&args.state_dir)?;
@@ -1658,7 +1671,8 @@ async fn main() -> anyhow::Result<()> {
         }
         identity
     };
-    let compose_projects = ComposeProjectStore::new(&args.state_dir);
+    let compose_projects =
+        ComposeProjectStore::with_high_recipe_dir(&args.state_dir, &high_recipe_dir);
     fs::create_dir_all(&compose_projects.root)?;
     if emergency::pending(&args.state_dir)?.is_none() {
         let reconciliation_projects = compose_projects.clone();
@@ -1708,6 +1722,7 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     let _high_telemetry = high_telemetry::start(
         &args.state_dir,
+        high_recipe_dir,
         identity.agent_id,
         args.high_telemetry_max_pending,
         Duration::from_secs(args.high_operational_interval_seconds),
