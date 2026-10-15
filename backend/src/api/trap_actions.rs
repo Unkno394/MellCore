@@ -25,7 +25,6 @@ pub enum TrapAction {
     Restart,
     Remove,
 }
-
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TrapActionRequest {
@@ -469,7 +468,6 @@ pub async fn reconcile_shared_jobs(state: AppState) {
         }
     }
 }
-
 async fn shared_start_plan(
     state: &AppState,
     principal: &Principal,

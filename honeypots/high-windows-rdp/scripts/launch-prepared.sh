@@ -30,7 +30,7 @@ setfacl -m "u:$libvirt_user:rwx" "$instance_dir"
 virt-install --name "$vm_name" --memory 4096 --vcpus 2 --import --os-variant win2k22 \
   --disk "path=$instance_dir/disk.qcow2,format=qcow2,bus=virtio" \
   --disk "path=$instance_dir/config-drive.iso,device=cdrom,readonly=on" \
-  --network "network=hf-high-isolated,model=virtio" \
+  --network "network=$HF_HIGH_NETWORK_NAME,model=virtio" \
   --channel "unix,path=$instance_dir/telemetry.sock,mode=bind,target.type=virtio,target.name=org.honeyforge.telemetry.0" \
   --channel "unix,target.type=virtio,target.name=org.qemu.guest_agent.0" \
   --graphics spice,listen=127.0.0.1 --noautoconsole

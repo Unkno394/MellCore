@@ -23,6 +23,8 @@ Cloudbase-Init receives a unique instance UUID, hostname, `hfadmin` account and 
 `config-2` ISO. The adapter discovers the isolated DHCP lease and waits for RDP on 3389, but creates
 no DNAT or forwarding exception; RDP is reachable only from the KVM host.
 
-The original ISO/Unattend scripts remain for manifests carrying the legacy
-`InstallMediaAndDisk + UnattendedInstall` profile. Guest event telemetry still requires a reviewed
-Windows sensor; this recipe does not synthesize it.
+The ISO/Unattend path validates that index 2 is a supported Windows Server 2022 evaluation image,
+waits for installed-system RDP, ejects all installation media, cold-boots the disk and requires RDP
+again before writing `installed-disk-verified`. Guest event telemetry still requires a reviewed
+Windows sensor; this recipe does not synthesize it. Like the prepared-image path, legacy ISO RDP
+remains host-only and never creates DNAT automatically.

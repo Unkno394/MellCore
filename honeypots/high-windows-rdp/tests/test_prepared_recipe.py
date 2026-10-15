@@ -134,6 +134,53 @@ class PreparedWindowsRecipeTests(unittest.TestCase):
         self.assertNotIn("external-ssh-port\" >", launch + discover)
         self.assertIn("listen=127.0.0.1", launch)
 
+    def test_legacy_installer_uses_explicit_cdrom_install_method(self):
+        launch = (SCRIPTS / "launch.sh").read_text(encoding="utf-8")
+        self.assertIn('--cdrom "$base_iso"', launch)
+        self.assertIn("--boot cdrom,hd", launch)
+        self.assertIn('verify-windows-media.sh" "$base_iso"', launch)
+        self.assertIn('install-windows.sh" "$instance_id"', launch)
+        self.assertNotIn("publish-service.sh", launch)
+        installer = (SCRIPTS / "install-windows.sh").read_text(encoding="utf-8")
+        self.assertIn("installed-disk-verified", installer)
+        self.assertIn('change-media "$vm_name"', installer)
+        self.assertIn("HF_HIGH_INSTALL_TIMEOUT_SECONDS", installer)
+
+    def test_legacy_media_requires_server_2022_index_two(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            executable(
+                fake_bin / "xorriso",
+                "#!/bin/sh\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  [ \"$1\" = -extract ] && { shift; shift; : > \"$1\"; exit 0; }\n"
+                "  shift\n"
+                "done\n"
+                "exit 2\n",
+            )
+            executable(
+                fake_bin / "wimlib-imagex",
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"${FAKE_WIM_REPORT:-Name: Windows Server 2022 SERVERSTANDARD}\"\n"
+                "printf '%s\\n' \"${FAKE_WIM_DESCRIPTION:-Display Description: Windows Server 2022 Standard Evaluation (Desktop Experience)}\"\n",
+            )
+            iso = root / "server.iso"
+            iso.write_bytes(b"fixture")
+            environment = dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}")
+            command = [
+                "sh",
+                str(SCRIPTS / "verify-windows-media.sh"),
+                str(iso),
+                str(root / "instance"),
+            ]
+            subprocess.run(command, check=True, env=environment, capture_output=True, text=True)
+            environment["FAKE_WIM_REPORT"] = "Name: Windows Server 2019 SERVERSTANDARD"
+            failed = subprocess.run(command, env=environment, capture_output=True, text=True)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("index 2", failed.stderr)
+
     def test_missing_prepared_image_invokes_builder_with_approved_catalog(self):
         ensure = (SCRIPTS / "ensure-prepared-image.sh").read_text(encoding="utf-8")
         self.assertIn("/usr/local/lib/honeyforge/hf-image-builder/hf-image-builder", ensure)

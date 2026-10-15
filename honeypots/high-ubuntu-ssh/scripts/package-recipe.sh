@@ -7,7 +7,10 @@ set -eu
 recipe_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 output=${1:?usage: package-recipe.sh /path/to/hf-high-ubuntu-ssh.tar.gz}
 parent_dir=$(dirname "$recipe_dir")
+repo_dir=$(CDPATH= cd -- "$recipe_dir/../.." && pwd)
 
 # macOS otherwise injects AppleDouble `._*` entries that the Linux artifact validator rejects.
-COPYFILE_DISABLE=1 tar -C "$parent_dir" -czf "$output" high-ubuntu-ssh high-debian-ssh high-arch-ssh high-windows-rdp high-custom-iso
+COPYFILE_DISABLE=1 tar -czf "$output" \
+  -C "$parent_dir" high-ubuntu-ssh high-debian-ssh high-arch-ssh high-windows-rdp high-custom-iso \
+  -C "$repo_dir/tools" hf-image-builder
 printf '%s\n' "created $output"

@@ -1412,8 +1412,14 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": "Registration removed; no remote command is executed"
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteServerResult"
+                }
+              }
+            }
           },
           "401": {
             "content": {
@@ -1462,6 +1468,122 @@
             }
           },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/actions": {
+      "post": {
+        "tags": [
+          "servers"
+        ],
+        "operationId": "start",
+        "parameters": [
+          {
+            "name": "server_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServerActionInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerActionProgress"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/actions/{action_id}": {
+      "get": {
+        "tags": [
+          "servers"
+        ],
+        "operationId": "status",
+        "parameters": [
+          {
+            "name": "server_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "action_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerActionProgress"
+                }
+              }
+            }
+          },
+          "404": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1580,6 +1702,59 @@
             }
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/servers/{server_id}/presence": {
+      "get": {
+        "tags": [
+          "servers"
+        ],
+        "operationId": "presence",
+        "parameters": [
+          {
+            "name": "server_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerPresence"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
             "content": {
               "application/json": {
                 "schema": {
@@ -2280,6 +2455,71 @@
         ]
       }
     },
+    "/api/v1/traps/{trap_id}/bait-engagement": {
+      "get": {
+        "tags": [
+          "telemetry"
+        ],
+        "operationId": "list_bait_engagement",
+        "parameters": [
+          {
+            "name": "trap_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BaitEngagement"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/api/v1/traps/{trap_id}/events": {
       "get": {
         "tags": [
@@ -2313,6 +2553,14 @@
               "type": "integer",
               "format": "int32",
               "minimum": 0
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -2355,6 +2603,59 @@
             }
           },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/traps/{trap_id}/events/{event_id}": {
+      "get": {
+        "tags": [
+          "telemetry"
+        ],
+        "operationId": "get_event",
+        "parameters": [
+          {
+            "name": "trap_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttackEvent"
+                }
+              }
+            }
+          },
+          "404": {
             "content": {
               "application/json": {
                 "schema": {
@@ -2446,6 +2747,61 @@
             }
           },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/traps/{trap_id}/share-port": {
+      "post": {
+        "tags": [
+          "traps"
+        ],
+        "summary": "Replaces direct publications with loopback backends after the agent confirms that\nthe dispatcher is listening. The caller supplies the full desired member list.",
+        "operationId": "share_port",
+        "parameters": [
+          {
+            "name": "trap_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SharePortRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrapActionProgress"
+                }
+              }
+            }
+          },
+          "409": {
             "content": {
               "application/json": {
                 "schema": {
@@ -3011,19 +3367,81 @@
           }
         }
       },
+      "AttackGraphEdge": {
+        "type": "object",
+        "required": [
+          "from_node",
+          "to_node",
+          "status",
+          "matched_event_ids",
+          "expected_outcome"
+        ],
+        "properties": {
+          "expected_outcome": {
+            "type": "string"
+          },
+          "from_node": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "matched_event_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "observed_outcome": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "time_delta_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "to_node": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
       "AttackGraphMatch": {
         "type": "object",
         "required": [
+          "scenario_id",
+          "trap_id",
           "session_key",
           "evidence_domain",
           "technique_key",
           "technique_name",
           "status",
           "similarity",
+          "coverage",
           "evidence_event_ids",
+          "matched_event_ids",
+          "nodes",
+          "edges",
           "updated_at"
         ],
         "properties": {
+          "coverage": {
+            "type": "number",
+            "format": "float"
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttackGraphEdge"
+            }
+          },
           "evidence_domain": {
             "type": "string"
           },
@@ -3033,6 +3451,23 @@
               "type": "string",
               "format": "uuid"
             }
+          },
+          "matched_event_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "nodes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttackGraphNode"
+            }
+          },
+          "scenario_id": {
+            "type": "string",
+            "format": "uuid"
           },
           "session_key": {
             "type": "string"
@@ -3050,9 +3485,63 @@
           "technique_name": {
             "type": "string"
           },
+          "trap_id": {
+            "type": "string",
+            "format": "uuid"
+          },
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "AttackGraphNode": {
+        "type": "object",
+        "required": [
+          "node_id",
+          "node_key",
+          "action_kind",
+          "process_class",
+          "resource_class",
+          "status",
+          "matched_event_ids",
+          "expected_outcome"
+        ],
+        "properties": {
+          "action_kind": {
+            "type": "string"
+          },
+          "expected_outcome": {
+            "type": "string"
+          },
+          "matched_event_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "node_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "node_key": {
+            "type": "string"
+          },
+          "observed_outcome": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "process_class": {
+            "type": "string"
+          },
+          "resource_class": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
           }
         }
       },
@@ -3113,6 +3602,33 @@
           }
         }
       },
+      "BaitEngagement": {
+        "type": "object",
+        "required": [
+          "bait_id",
+          "opens",
+          "sessions",
+          "last_opened_at"
+        ],
+        "properties": {
+          "bait_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_opened_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "opens": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "sessions": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "BootstrapProgress": {
         "type": "object",
         "required": [
@@ -3168,6 +3684,13 @@
             "writeOnly": true
           },
           "ssh_private_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "writeOnly": true
+          },
+          "sudo_password": {
             "type": [
               "string",
               "null"
@@ -3250,19 +3773,19 @@
           "cpu_cores": {
             "type": "number",
             "format": "double",
-            "maximum": 1,
+            "maximum": 2,
             "minimum": 0.05
           },
           "memory_mb": {
             "type": "integer",
             "format": "int32",
-            "maximum": 512,
+            "maximum": 2048,
             "minimum": 32
           },
           "pids": {
             "type": "integer",
             "format": "int32",
-            "maximum": 256,
+            "maximum": 512,
             "minimum": 16
           }
         },
@@ -3325,6 +3848,18 @@
           "username",
           "password"
         ]
+      },
+      "DeleteServerResult": {
+        "type": "object",
+        "required": [
+          "remote_cleanup"
+        ],
+        "properties": {
+          "remote_cleanup": {
+            "type": "string",
+            "description": "scheduled: agent accepted the uninstall schedule; unreachable, unsupported, or\nunconfirmed: only Center access was revoked, and local cleanup may need attention."
+          }
+        }
       },
       "DesiredState": {
         "type": "string",
@@ -3619,6 +4154,14 @@
           },
           "transport": {
             "$ref": "#/components/schemas/Transport"
+          },
+          "weight": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
           }
         },
         "additionalProperties": false
@@ -3677,6 +4220,13 @@
               "null"
             ],
             "format": "uuid"
+          },
+          "weight": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
           }
         }
       },
@@ -3684,17 +4234,26 @@
         "type": "object",
         "required": [
           "bind",
+          "ssh_public_port",
           "health_bind",
           "trap_id",
           "server_id",
           "agent_id",
           "hostname",
+          "username",
+          "distribution",
           "host_key",
+          "ssh_auth_mode",
+          "ssh_credentials",
           "auth",
           "telemetry",
           "max_connections",
           "idle_timeout_seconds",
-          "max_input_bytes"
+          "max_input_bytes",
+          "baits",
+          "virtual_processes",
+          "vulnerability_profiles",
+          "network_listeners"
         ],
         "properties": {
           "agent_id": {
@@ -3704,7 +4263,16 @@
           "auth": {
             "$ref": "#/components/schemas/RuntimeAuth"
           },
+          "baits": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
           "bind": {
+            "type": "string"
+          },
+          "distribution": {
             "type": "string"
           },
           "health_bind": {
@@ -3729,9 +4297,29 @@
             "type": "integer",
             "minimum": 0
           },
+          "network_listeners": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RuntimeListener"
+            }
+          },
           "server_id": {
             "type": "string",
             "format": "uuid"
+          },
+          "ssh_auth_mode": {
+            "$ref": "#/components/schemas/SshAuthMode"
+          },
+          "ssh_credentials": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "ssh_public_port": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           },
           "telemetry": {
             "$ref": "#/components/schemas/RuntimeTelemetry"
@@ -3739,6 +4327,21 @@
           "trap_id": {
             "type": "string",
             "format": "uuid"
+          },
+          "username": {
+            "type": "string"
+          },
+          "virtual_processes": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "vulnerability_profiles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
@@ -3752,7 +4355,6 @@
           "honeypot_type",
           "service_type",
           "config",
-          "resources",
           "version",
           "created_at",
           "updated_at"
@@ -4011,6 +4613,29 @@
           }
         ]
       },
+      "RuntimeListener": {
+        "type": "object",
+        "required": [
+          "service_type",
+          "bind"
+        ],
+        "properties": {
+          "bind": {
+            "type": "string"
+          },
+          "public_port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "service_type": {
+            "type": "string"
+          }
+        }
+      },
       "RuntimeTelemetry": {
         "type": "object",
         "required": [
@@ -4094,6 +4719,16 @@
           "host": {
             "type": "string"
           },
+          "host_inventory": {
+            "description": "Latest typed inventory reported by the authenticated agent. The JSON schema version is\ncarried inside this object so the panel can evolve independently."
+          },
+          "inventory_updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
           "name": {
             "type": "string"
           },
@@ -4125,6 +4760,44 @@
           "version": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "ServerActionInput": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ServerActionProgress": {
+        "type": "object",
+        "required": [
+          "action_id",
+          "action",
+          "status"
+        ],
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "action_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
           }
         }
       },
@@ -4197,6 +4870,40 @@
           }
         }
       },
+      "ServerPresence": {
+        "type": "object",
+        "required": [
+          "registered",
+          "connected",
+          "can_reboot",
+          "can_uninstall"
+        ],
+        "properties": {
+          "can_reboot": {
+            "type": "boolean"
+          },
+          "can_share_tcp_ports": {
+            "type": "boolean"
+          },
+          "can_uninstall": {
+            "type": "boolean"
+          },
+          "connected": {
+            "type": "boolean"
+          },
+          "last_heartbeat_age_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "registered": {
+            "type": "boolean"
+          }
+        }
+      },
       "ServerSettings": {
         "type": "object",
         "properties": {
@@ -4228,6 +4935,53 @@
           "online",
           "offline",
           "error"
+        ]
+      },
+      "SharePortRequest": {
+        "type": "object",
+        "required": [
+          "listener_port",
+          "members"
+        ],
+        "properties": {
+          "listener_port": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SharedPortMember"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "SharedPortMember": {
+        "type": "object",
+        "required": [
+          "trap_id",
+          "weight"
+        ],
+        "properties": {
+          "trap_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "weight": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "SshAuthMode": {
+        "type": "string",
+        "enum": [
+          "realistic",
+          "adaptive"
         ]
       },
       "TelemetryBatch": {

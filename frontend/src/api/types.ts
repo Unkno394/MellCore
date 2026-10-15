@@ -129,6 +129,8 @@ export type Server = ServerInput & {
   server_id: string
   user_id: string
   status: ServerStatus
+  host_inventory: HostInventory | null
+  inventory_updated_at: string | null
   version: number
   created_at: string
   updated_at: string
@@ -136,6 +138,38 @@ export type Server = ServerInput & {
 
 export type ServerPresence = { registered: boolean; connected: boolean; can_reboot: boolean; can_uninstall: boolean; can_share_tcp_ports: boolean; last_heartbeat_age_ms: number | null }
 export type DeleteServerResult = { remote_cleanup: 'scheduled' | 'unreachable' | 'unsupported' | 'unconfirmed' | 'not_installed' }
+
+export type HostInventory = {
+  schema_version: number
+  collected_at_unix_ms: number
+  static_info: {
+    cpu: { vendor: string | null; model: string | null; architecture: string; physical_cores: number | null; logical_threads: number | null; frequency_mhz: number | null; flags: string[] }
+    memory: { ram_total_bytes: number | null; swap_total_bytes: number | null }
+    disks: Array<{ name: string; model: string | null; size_bytes: number | null; rotational: boolean | null; removable: boolean | null }>
+    gpus: Array<{ vendor: string | null; model: string | null; pci_address: string | null; driver: string | null }>
+    network: Array<{ name: string; state: string | null; mtu: number | null; speed_mbps: number | null; duplex: string | null; addresses: string[]; virtual_interface: boolean | null }>
+    operating_system: { name: string | null; version: string | null; distribution_id: string | null; kernel_release: string | null }
+    virtualization: { cpu_virtualization: 'intel_vtx' | 'amd_v' | null; kvm: HostComponentCapability; qemu: HostComponentCapability; libvirt: HostComponentCapability; nested_virtualization: boolean | null; guest_architectures: string[] }
+  }
+  dynamic: {
+    uptime_seconds: number | null
+    load_average_1m: number | null
+    load_average_5m: number | null
+    load_average_15m: number | null
+    cpu_utilization_percent: number | null
+    ram_used_bytes: number | null
+    ram_available_bytes: number | null
+    swap_used_bytes: number | null
+    filesystems: Array<{ mount_point: string; total_bytes: number | null; available_bytes: number | null }>
+    network: Array<{ name: string; received_bytes: number | null; transmitted_bytes: number | null }>
+  }
+}
+
+export type HostComponentCapability = {
+  installed: boolean | null
+  usable: boolean | null
+  version: string | null
+}
 
 export type BootstrapServerInput = {
   server: ServerInput

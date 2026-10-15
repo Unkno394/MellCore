@@ -621,34 +621,42 @@ fn windows_has_matching_virtual_users_files_and_scenarios() {
         now(),
     );
     assert!(autologon.output.contains("DECOY-ONLY"));
-    assert!(autologon
-        .vulnerability_attempts
-        .iter()
-        .any(|attempt| attempt.profile_id == "win_autologon_credentials"));
+    assert!(
+        autologon
+            .vulnerability_attempts
+            .iter()
+            .any(|attempt| attempt.profile_id == "win_autologon_credentials")
+    );
 
     let installer = guest.execute(
         "Get-ItemProperty 'HKCU:\\Software\\Policies\\Microsoft\\Windows\\Installer'",
         now(),
     );
     assert!(installer.output.contains("AlwaysInstallElevated"));
-    assert!(installer
-        .vulnerability_attempts
-        .iter()
-        .any(|attempt| attempt.profile_id == "win_always_install_elevated"));
+    assert!(
+        installer
+            .vulnerability_attempts
+            .iter()
+            .any(|attempt| attempt.profile_id == "win_always_install_elevated")
+    );
 
     let writable_service = guest.execute("sc.exe qc OpsBackup", now());
     assert!(writable_service.output.contains("backup.exe"));
-    assert!(writable_service
-        .vulnerability_attempts
-        .iter()
-        .any(|attempt| attempt.profile_id == "win_writable_service_binary"));
+    assert!(
+        writable_service
+            .vulnerability_attempts
+            .iter()
+            .any(|attempt| attempt.profile_id == "win_writable_service_binary")
+    );
 
     let guest_share = guest.execute("Get-SmbShare", now());
     assert!(guest_share.output.contains("PublicShare"));
-    assert!(guest_share
-        .vulnerability_attempts
-        .iter()
-        .any(|attempt| attempt.profile_id == "win_guest_share"));
+    assert!(
+        guest_share
+            .vulnerability_attempts
+            .iter()
+            .any(|attempt| attempt.profile_id == "win_guest_share")
+    );
     run(
         &mut guest,
         "Set-Content C:\\ProgramData\\OpsBackup\\backup.exe -Value virtual",

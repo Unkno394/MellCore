@@ -1536,7 +1536,20 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
                     AckDisposition::Accepted
                 }
             }
-            KazikBody::Heartbeat { .. } => AckDisposition::Accepted,
+            KazikBody::Heartbeat { status } => {
+                if let (Some(registry), Some(inventory)) =
+                    (&state.backend_registry, &status.host_inventory)
+                    && let Err(error) = registry
+                        .update_inventory(envelope.agent_id, inventory)
+                        .await
+                {
+                    // Inventory is refreshed on every heartbeat.  A backend outage must not
+                    // block command delivery or accumulate unbounded heartbeat retries.
+                    tracing::warn!(%error, agent_id=%envelope.agent_id,
+                        "host inventory was not persisted by backend");
+                }
+                AckDisposition::Accepted
+            }
             KazikBody::Register(_) | KazikBody::Command { .. } | KazikBody::Error { .. } => {
                 AckDisposition::Rejected
             }
@@ -1810,7 +1823,9 @@ fn run_ssh_install(
             CoreError::Transport(format!("cannot upload initial trap command: {error}"))
         })?;
         remote.send_eof().map_err(|error| {
-            CoreError::Transport(format!("cannot finish initial trap command upload: {error}"))
+            CoreError::Transport(format!(
+                "cannot finish initial trap command upload: {error}"
+            ))
         })?;
         remote.wait_eof().map_err(|error| {
             CoreError::Transport(format!("initial trap command did not reach EOF: {error}"))
@@ -1841,7 +1856,9 @@ fn run_ssh_install(
         }
         channel
             .write_all(script.contents.as_bytes())
-            .map_err(|error| CoreError::Transport(format!("cannot stream installer over SSH: {error}")))?;
+            .map_err(|error| {
+                CoreError::Transport(format!("cannot stream installer over SSH: {error}"))
+            })?;
         channel.send_eof().map_err(|error| {
             CoreError::Transport(format!("cannot finish installer input: {error}"))
         })?;
@@ -1860,7 +1877,8 @@ fn run_ssh_install(
         42 => return Err(CoreError::Transport(EXISTING_AGENT_ERROR.into())),
         43 => {
             return Err(CoreError::Transport(
-                "agent registration timed out; inspect /tmp/hf-agent-bootstrap.log on target".into(),
+                "agent registration timed out; inspect /tmp/hf-agent-bootstrap.log on target"
+                    .into(),
             ));
         }
         status => {

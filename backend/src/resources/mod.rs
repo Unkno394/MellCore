@@ -57,11 +57,11 @@ pub enum PortPurpose {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ToSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ContainerResourceLimits {
-    #[schema(minimum = 0.05, maximum = 1.0)]
+    #[schema(minimum = 0.05, maximum = 2.0)]
     pub cpu_cores: f64,
-    #[schema(minimum = 32, maximum = 512)]
+    #[schema(minimum = 32, maximum = 2048)]
     pub memory_mb: u32,
-    #[schema(minimum = 16, maximum = 256)]
+    #[schema(minimum = 16, maximum = 512)]
     pub pids: u32,
 }
 
@@ -165,6 +165,10 @@ pub struct Server {
     pub dispatcher_port: Option<i32>,
     #[sqlx(json)]
     pub settings: ServerSettings,
+    /// Latest typed inventory reported by the authenticated agent. The JSON schema version is
+    /// carried inside this object so the panel can evolve independently.
+    pub host_inventory: Option<Value>,
+    pub inventory_updated_at: Option<DateTime<Utc>>,
     pub status: ServerStatus,
     pub version: i64,
     pub created_at: DateTime<Utc>,

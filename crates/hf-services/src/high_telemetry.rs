@@ -424,7 +424,7 @@ impl HighTelemetryStore {
             service_type: service_type.into(),
             payload: guest.payload.clone(),
             metadata: json!({
-                "source": "high-ubuntu-ssh",
+                "source": "high-guest-sensor",
                 "agent_id": agent_id,
                 "guest_event_id": guest.guest_event_id,
                 "guest_sequence": guest.guest_sequence,
@@ -611,6 +611,16 @@ impl HighTelemetryStore {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn has_kazik_batch(&self, message_id: Uuid) -> Result<bool, HighTelemetryError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM high_telemetry_batches WHERE message_id = ?1)",
+                [message_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(HighTelemetryError::from)
     }
 }
 

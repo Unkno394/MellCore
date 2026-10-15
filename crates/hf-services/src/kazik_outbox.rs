@@ -156,7 +156,10 @@ impl SqliteKazikOutbox {
     }
 
     /// Command results take precedence over heartbeats, alerts and ordinary telemetry.
-    pub fn prioritize_acknowledgement(&mut self, message_id: Uuid) -> Result<(), SqliteOutboxError> {
+    pub fn prioritize_acknowledgement(
+        &mut self,
+        message_id: Uuid,
+    ) -> Result<(), SqliteOutboxError> {
         self.connection.execute(
             "UPDATE kazik_outbox SET priority=3 WHERE message_id=?1",
             [message_id.to_string()],
@@ -489,6 +492,7 @@ mod tests {
                     hostname: "test-vps".into(),
                     active_trap_count: 2,
                     capabilities: vec![],
+                    host_inventory: None,
                 },
             },
         )
@@ -513,7 +517,10 @@ mod tests {
             }),
         );
         outbox.enqueue(acknowledgement.clone()).unwrap();
-        assert_ne!(outbox.ready_to_send(64).unwrap()[0].envelope.message_id, acknowledgement.message_id);
+        assert_ne!(
+            outbox.ready_to_send(64).unwrap()[0].envelope.message_id,
+            acknowledgement.message_id
+        );
         drop(outbox);
         let mut restored = SqliteKazikOutbox::open(&path).unwrap();
         let ready = restored.ready_to_send(64).unwrap();

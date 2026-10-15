@@ -3656,7 +3656,11 @@ impl VirtualServer {
                 connection_string
                     .and_then(|url| url.split_once("@"))
                     .and_then(|(_, rest)| rest.split('/').next())
-                    .map(|authority| authority.rsplit_once(':').map_or(authority, |(host, _)| host))
+                    .map(|authority| {
+                        authority
+                            .rsplit_once(':')
+                            .map_or(authority, |(host, _)| host)
+                    })
             });
         if requested_host.is_some_and(|host| {
             host.parse::<std::net::IpAddr>()

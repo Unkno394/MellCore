@@ -86,10 +86,10 @@ Host-side libvirt даёт только aggregate RX/TX, а не flow records и
 доверенным после получения root внутри VM: такой атакующий всё ещё может скрыть или сфабриковать
 guest-наблюдения.
 
-Host events пока не отправляются в Kazik. Store уже создаёт bounded batch, стабильный
-`message_id`, durable mapping на event IDs и готовый `KazikBody::Telemetry`. Удаление разрешено
-только методом durable-ack. Текущий `Accepted` от центра не подтверждает запись в постоянное
-хранилище, поэтому transport pump намеренно не активирован.
+Host events отправляются в Kazik bounded batches со стабильным `message_id` и durable mapping на
+event IDs. Исходные строки удаляются из `high-telemetry.sqlite` только после Center `Accepted`,
+который выдаётся после append, flush и `sync_data`; потерянный ACK приводит к безопасному повтору,
+а Center дедуплицирует события по agent/event ID.
 
 ## Lifecycle и operational state
 

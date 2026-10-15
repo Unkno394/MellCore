@@ -16,10 +16,10 @@ while [ "$attempt" -le "$attempts" ]; do
   attempt=$((attempt + 1))
 done
 [ -n "$guest_ip" ] || { echo 'custom installer did not obtain an isolated DHCP lease' >&2; exit 1; }
-python3 - "$guest_ip" <<'PY'
+python3 - "$guest_ip" "$HF_HIGH_DHCP_START" "$HF_HIGH_DHCP_END" <<'PY'
 import ipaddress, sys
 address = ipaddress.ip_address(sys.argv[1])
-if address.version != 4 or not ipaddress.ip_address("192.168.250.100") <= address <= ipaddress.ip_address("192.168.250.200"):
+if address.version != 4 or not ipaddress.ip_address(sys.argv[2]) <= address <= ipaddress.ip_address(sys.argv[3]):
     raise SystemExit("guest address is outside the High DHCP range")
 PY
 tmp=$(mktemp "$instance_dir/.guest-ip.XXXXXX")

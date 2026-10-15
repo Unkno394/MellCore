@@ -1,27 +1,30 @@
 #!/bin/sh
 set -eu
 
-network_name=hf-high-isolated
 script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 . "$script_dir/firewall-common.sh"
+network_name=$HF_HIGH_NETWORK_NAME
 bridge=$HF_HIGH_BRIDGE
+network_address=$HF_HIGH_NETWORK_ADDRESS
+dhcp_start=$HF_HIGH_DHCP_START
+dhcp_end=$HF_HIGH_DHCP_END
 command -v python3 >/dev/null
 tmpfile=$(mktemp)
 trap 'rm -f "$tmpfile"' EXIT INT TERM
 if virsh net-info "$network_name" >/dev/null 2>&1; then
   virsh net-dumpxml "$network_name" > "$tmpfile"
-  python3 - "$tmpfile" "$network_name" "$bridge" <<'PY'
+  python3 - "$tmpfile" "$network_name" "$bridge" "$network_address" "$dhcp_start" "$dhcp_end" <<'PY'
 import sys
 import xml.etree.ElementTree as ET
 
-path, expected_name, expected_bridge = sys.argv[1:]
+path, expected_name, expected_bridge, expected_address, expected_start, expected_end = sys.argv[1:]
 root = ET.parse(path).getroot()
 forward = root.find("forward")
 bridge = root.find("bridge")
 addresses = root.findall("ip")
 valid_address = len(addresses) == 1 and (
     addresses[0].get("family", "ipv4") == "ipv4"
-    and addresses[0].get("address") == "192.168.250.1"
+    and addresses[0].get("address") == expected_address
     and addresses[0].get("netmask") == "255.255.255.0"
 )
 dhcp_range = addresses[0].find("./dhcp/range") if valid_address else None
@@ -33,8 +36,8 @@ valid = (
     and bridge.get("name") == expected_bridge
     and valid_address
     and dhcp_range is not None
-    and dhcp_range.get("start") == "192.168.250.100"
-    and dhcp_range.get("end") == "192.168.250.200"
+    and dhcp_range.get("start") == expected_start
+    and dhcp_range.get("end") == expected_end
     and not root.findall("route")
 )
 if not valid:
@@ -44,14 +47,14 @@ PY
     virsh net-start "$network_name"
   fi
 else
-  cat > "$tmpfile" <<'XML'
+  cat > "$tmpfile" <<XML
 <network>
-  <name>hf-high-isolated</name>
+  <name>$network_name</name>
   <forward mode='none'/>
-  <bridge name='virbr-hfhigh' stp='on' delay='0'/>
-  <ip address='192.168.250.1' netmask='255.255.255.0'>
+  <bridge name='$bridge' stp='on' delay='0'/>
+  <ip address='$network_address' netmask='255.255.255.0'>
     <dhcp>
-      <range start='192.168.250.100' end='192.168.250.200'/>
+      <range start='$dhcp_start' end='$dhcp_end'/>
     </dhcp>
   </ip>
 </network>

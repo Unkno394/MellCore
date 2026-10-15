@@ -3,12 +3,36 @@
 # Shared iptables helpers for the High bridge. Ubuntu's iptables command normally targets the
 # nftables backend, so these chains coexist with UFW, Docker and libvirt while running before
 # their broad INPUT/FORWARD accepts.
-HF_HIGH_BRIDGE=${HF_HIGH_BRIDGE:-virbr-hfhigh}
-HF_HIGH_INPUT_CHAIN=HF_HIGH_INPUT
-HF_HIGH_FORWARD_CHAIN=HF_HIGH_FORWARD
-HF_HIGH_DNAT_CHAIN=HF_HIGH_DNAT
-HF_HIGH_INPUT6_CHAIN=HF_HIGH_INPUT6
-HF_HIGH_FORWARD6_CHAIN=HF_HIGH_FORWARD6
+case ${HF_HIGH_NETWORK_SCOPE:-production} in
+  production)
+    HF_HIGH_NETWORK_NAME=hf-high-isolated
+    HF_HIGH_BRIDGE=${HF_HIGH_BRIDGE:-virbr-hfhigh}
+    HF_HIGH_NETWORK_ADDRESS=192.168.250.1
+    HF_HIGH_DHCP_START=192.168.250.100
+    HF_HIGH_DHCP_END=192.168.250.200
+    HF_HIGH_INPUT_CHAIN=HF_HIGH_INPUT
+    HF_HIGH_FORWARD_CHAIN=HF_HIGH_FORWARD
+    HF_HIGH_DNAT_CHAIN=HF_HIGH_DNAT
+    HF_HIGH_INPUT6_CHAIN=HF_HIGH_INPUT6
+    HF_HIGH_FORWARD6_CHAIN=HF_HIGH_FORWARD6
+    ;;
+  e2e)
+    HF_HIGH_NETWORK_NAME=hf-high-iso-e2e
+    HF_HIGH_BRIDGE=virbr-hfiso
+    HF_HIGH_NETWORK_ADDRESS=192.168.251.1
+    HF_HIGH_DHCP_START=192.168.251.100
+    HF_HIGH_DHCP_END=192.168.251.200
+    HF_HIGH_INPUT_CHAIN=HF_E2E_INPUT
+    HF_HIGH_FORWARD_CHAIN=HF_E2E_FORWARD
+    HF_HIGH_DNAT_CHAIN=HF_E2E_DNAT
+    HF_HIGH_INPUT6_CHAIN=HF_E2E_INPUT6
+    HF_HIGH_FORWARD6_CHAIN=HF_E2E_FORWARD6
+    ;;
+  *)
+    echo "invalid HF_HIGH_NETWORK_SCOPE: ${HF_HIGH_NETWORK_SCOPE}" >&2
+    return 1 2>/dev/null || exit 1
+    ;;
+esac
 
 validate_instance_id() {
   value=$1
