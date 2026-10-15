@@ -35,10 +35,14 @@ for pair in "honeyforge-low:$low_export/honeyforge-low" "pritvoryashka:$middle_e
     install -m 0755 "$source" "$artifact_dir/$name"
 done
 
+install -m 0755 "$repo/honeypots/pritvoryashka/docker-entrypoint.sh" "$artifact_dir/docker-entrypoint.sh"
+install -m 0644 "$repo/honeypots/pritvoryashka/config-schema-probe.json" "$artifact_dir/config-schema-probe.json"
+install -m 0755 "$repo/deploy/vps/update-honeypot-binaries-on-agent.sh" "$artifact_dir/update-honeypot-binaries-on-agent.sh"
 rm -rf "$low_export" "$middle_export"
-(cd "$artifact_dir" && sha256sum honeyforge-low pritvoryashka > SHA256SUMS)
+(cd "$artifact_dir" && sha256sum honeyforge-low pritvoryashka docker-entrypoint.sh config-schema-probe.json update-honeypot-binaries-on-agent.sh > SHA256SUMS)
 tar -czf "$artifact_dir/honeypot-binaries.tar.gz" \
-    -C "$artifact_dir" honeyforge-low pritvoryashka SHA256SUMS
+    -C "$artifact_dir" honeyforge-low pritvoryashka docker-entrypoint.sh \
+    config-schema-probe.json update-honeypot-binaries-on-agent.sh SHA256SUMS
 
 echo "Бинарники собраны из builder stages; runtime-образы не собирались."
 echo "Low:    $artifact_dir/honeyforge-low"

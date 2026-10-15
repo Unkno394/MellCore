@@ -108,7 +108,9 @@ pub fn plan_tcp_port_group(
             trap_kind: candidate.trap_kind,
         });
         unavailable.insert(backend_port);
-        if backend_port == next { next += 1; }
+        if backend_port == next {
+            next += 1;
+        }
     }
     Ok(AgentCommand::ReconcileTcpPortGroup(TcpPortGroup {
         command_id: Uuid::new_v4(),

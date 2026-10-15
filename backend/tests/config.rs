@@ -21,11 +21,29 @@ fn defaults_are_local_with_documentation_disabled() {
 #[test]
 fn host_observer_ingestion_uses_a_distinct_center_secret() {
     let shared = "test-telemetry-secret-of-at-least-32-bytes";
-    assert_eq!(config(&[("CENTER_INGEST_TOKEN", "short")]).unwrap_err().key, "CENTER_INGEST_TOKEN");
-    assert_eq!(config(&[("TELEMETRY_INGEST_TOKEN", shared), ("CENTER_INGEST_TOKEN", shared)])
-        .unwrap_err().key, "CENTER_INGEST_TOKEN");
-    assert!(config(&[("TELEMETRY_INGEST_TOKEN", shared),
-        ("CENTER_INGEST_TOKEN", "separate-center-secret-of-at-least-32-bytes")]).is_ok());
+    assert_eq!(
+        config(&[("CENTER_INGEST_TOKEN", "short")]).unwrap_err().key,
+        "CENTER_INGEST_TOKEN"
+    );
+    assert_eq!(
+        config(&[
+            ("TELEMETRY_INGEST_TOKEN", shared),
+            ("CENTER_INGEST_TOKEN", shared)
+        ])
+        .unwrap_err()
+        .key,
+        "CENTER_INGEST_TOKEN"
+    );
+    assert!(
+        config(&[
+            ("TELEMETRY_INGEST_TOKEN", shared),
+            (
+                "CENTER_INGEST_TOKEN",
+                "separate-center-secret-of-at-least-32-bytes"
+            )
+        ])
+        .is_ok()
+    );
 }
 
 #[test]

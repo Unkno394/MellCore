@@ -6,6 +6,7 @@ pub async fn lock(
     user: Uuid,
     id: Uuid,
 ) -> Result<Server, AppError> {
+    lock_operation(tx, id).await?;
     Ok(
         sqlx::query_as("SELECT * FROM servers WHERE server_id=$1 AND user_id=$2 FOR UPDATE")
             .bind(id)
@@ -13,6 +14,18 @@ pub async fn lock(
             .fetch_one(&mut **tx)
             .await?,
     )
+}
+
+/// Serialize panel-side server mutations without holding the server row lock
+/// across a request to Center. Center's trap registration callback needs that
+/// row, so holding it while waiting for Center creates a lock cycle.
+pub async fn lock_operation(tx: &mut Transaction<'_, Postgres>, id: Uuid) -> Result<(), AppError> {
+    let key = format!("honeyforge:server-operation:{id}");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(key)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 async fn reserve_management(
     tx: &mut Transaction<'_, Postgres>,
@@ -88,12 +101,11 @@ pub async fn update(
     input.server.validate()?;
     let mut tx = owned_tx(pool, principal).await?;
     let previous = lock(&mut tx, principal.user.id, id).await?;
-    let deletion_pending: bool = sqlx::query_scalar(
-        "SELECT deletion_pending FROM servers WHERE server_id=$1",
-    )
-    .bind(id)
-    .fetch_one(&mut *tx)
-    .await?;
+    let deletion_pending: bool =
+        sqlx::query_scalar("SELECT deletion_pending FROM servers WHERE server_id=$1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
     if deletion_pending {
         return Err(AppError::conflict("This server is being deleted."));
     }

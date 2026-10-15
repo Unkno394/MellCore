@@ -37,6 +37,7 @@ pub struct CenterEventInput {
 pub struct EventQuery {
     pub after: Option<Uuid>,
     pub limit: Option<u32>,
+    pub q: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -47,14 +48,68 @@ pub struct AttackEventPage {
 
 #[derive(Serialize, ToSchema)]
 pub struct AttackGraphMatch {
+    pub scenario_id: Uuid,
+    pub trap_id: Uuid,
     pub session_key: String,
     pub evidence_domain: String,
     pub technique_key: String,
     pub technique_name: String,
     pub status: String,
     pub similarity: f32,
+    pub coverage: f32,
     pub evidence_event_ids: Vec<Uuid>,
+    pub matched_event_ids: Vec<Uuid>,
+    pub nodes: Vec<AttackGraphNode>,
+    pub edges: Vec<AttackGraphEdge>,
     pub updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct AttackGraphNode {
+    pub node_id: Uuid,
+    pub node_key: String,
+    pub action_kind: String,
+    pub process_class: String,
+    pub resource_class: String,
+    pub status: String,
+    pub matched_event_ids: Vec<Uuid>,
+    pub observed_outcome: Option<String>,
+    pub expected_outcome: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct AttackGraphEdge {
+    pub from_node: Uuid,
+    pub to_node: Uuid,
+    pub status: String,
+    pub matched_event_ids: Vec<Uuid>,
+    pub observed_outcome: Option<String>,
+    pub expected_outcome: String,
+    pub time_delta_ms: Option<i64>,
+}
+
+#[derive(Clone, Deserialize)]
+struct NodeEvidence {
+    event_id: Uuid,
+    observed_outcome: String,
+    occurred_at: chrono::DateTime<Utc>,
+    from_node: Option<Uuid>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct BaitEngagement {
+    pub bait_id: Uuid,
+    pub opens: i64,
+    pub sessions: i64,
+    pub last_opened_at: chrono::DateTime<Utc>,
+}
+
+#[derive(FromRow)]
+struct BaitEngagementRow {
+    bait_id: String,
+    opens: i64,
+    sessions: i64,
+    last_opened_at: chrono::DateTime<Utc>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -118,13 +173,24 @@ pub async fn list(
         value @ 1..=100 => value as usize,
         _ => return Err(AppError::invalid("Limit must be between 1 and 100")),
     };
+    let search = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if search.is_some_and(|value| value.chars().count() > 200) {
+        return Err(AppError::invalid(
+            "Search query must be at most 200 characters",
+        ));
+    }
     let pool = state.pool()?;
     crate::resources::traps::get(pool, &principal, trap_id).await?;
     let stored: Vec<StoredAttackEvent> = sqlx::query_as(
-        "SELECT ae.agent_id,ae.server_id,ae.event_id,ae.trap_id,ae.session_id,ae.sequence_no,ae.event_type,ae.occurred_at,ae.received_at,ae.expires_at,ae.source_ip,ae.source_port,ae.destination_port,ae.protocol,ae.service_type,ae.payload,ae.metadata FROM attack_events ae WHERE ae.trap_id=$1 AND ($2::uuid IS NULL OR (ae.occurred_at,ae.event_id) < (SELECT cursor.occurred_at,cursor.event_id FROM attack_events cursor WHERE cursor.trap_id=$1 AND cursor.event_id=$2)) ORDER BY ae.occurred_at DESC,ae.event_id DESC LIMIT $3",
+        "SELECT ae.agent_id,ae.server_id,ae.event_id,ae.trap_id,ae.session_id,ae.sequence_no,ae.event_type,ae.occurred_at,ae.received_at,ae.expires_at,ae.source_ip,ae.source_port,ae.destination_port,ae.protocol,ae.service_type,ae.payload,ae.metadata FROM attack_events ae WHERE ae.trap_id=$1 AND ($2::uuid IS NULL OR (ae.occurred_at,ae.event_id) < (SELECT cursor.occurred_at,cursor.event_id FROM attack_events cursor WHERE cursor.trap_id=$1 AND cursor.event_id=$2)) AND ($3::text IS NULL OR strpos(lower(concat_ws(' ',ae.event_type,ae.service_type,ae.protocol,ae.source_ip,ae.payload::text,ae.metadata::text)),lower($3))>0) ORDER BY ae.occurred_at DESC,ae.event_id DESC LIMIT $4",
     )
     .bind(trap_id)
     .bind(query.after)
+    .bind(search)
     .bind(i64::try_from(limit + 1).map_err(|_| AppError::internal())?)
     .fetch_all(pool)
     .await?;
@@ -141,6 +207,52 @@ pub async fn list(
     Ok(Json(AttackEventPage { items, next_cursor }))
 }
 
+#[utoipa::path(get,path="/api/v1/traps/{trap_id}/events/{event_id}",tag="telemetry",security(("bearer"=[])),params(("trap_id"=Uuid,Path),("event_id"=Uuid,Path)),responses((status=200,body=AttackEvent),(status=404,body=crate::errors::ErrorResponse)))]
+pub async fn get_event(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((trap_id, event_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<AttackEvent>, AppError> {
+    let pool = state.pool()?;
+    crate::resources::traps::get(pool, &principal, trap_id).await?;
+    let stored: StoredAttackEvent = sqlx::query_as("SELECT agent_id,server_id,event_id,trap_id,session_id,sequence_no,event_type,occurred_at,received_at,expires_at,source_ip,source_port,destination_port,protocol,service_type,payload,metadata FROM attack_events WHERE trap_id=$1 AND event_id=$2")
+        .bind(trap_id).bind(event_id).fetch_optional(pool).await?.ok_or_else(AppError::not_found)?;
+    Ok(Json(AttackEvent::try_from(stored)?))
+}
+
+#[utoipa::path(get,path="/api/v1/traps/{trap_id}/bait-engagement",tag="telemetry",security(("bearer"=[])),params(("trap_id"=Uuid,Path)),responses((status=200,body=[BaitEngagement]),(status=401,body=crate::errors::ErrorResponse),(status=404,body=crate::errors::ErrorResponse),(status=503,body=crate::errors::ErrorResponse)))]
+pub async fn list_bait_engagement(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(trap_id): Path<Uuid>,
+) -> Result<Json<Vec<BaitEngagement>>, AppError> {
+    let pool = state.pool()?;
+    let trap = crate::resources::traps::get(pool, &principal, trap_id).await?;
+    if trap.profile_snapshot.honeypot_type != "pritvoryashka" {
+        return Err(AppError::not_found());
+    }
+    let rows: Vec<BaitEngagementRow> = sqlx::query_as(
+        "SELECT naa.environment->>'bait_id' AS bait_id, COUNT(*)::bigint AS opens, COUNT(DISTINCT naa.session_key)::bigint AS sessions, MAX(ae.occurred_at) AS last_opened_at FROM normalized_attack_actions naa JOIN attack_events ae ON ae.event_id=naa.event_id WHERE naa.trap_id=$1 AND naa.action_kind='deception.bait_open' AND naa.environment->>'bait_id' IS NOT NULL GROUP BY naa.environment->>'bait_id'",
+    )
+    .bind(trap_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .filter_map(|row| {
+                Uuid::parse_str(&row.bait_id)
+                    .ok()
+                    .map(|bait_id| BaitEngagement {
+                        bait_id,
+                        opens: row.opens,
+                        sessions: row.sessions,
+                        last_opened_at: row.last_opened_at,
+                    })
+            })
+            .collect(),
+    ))
+}
+
 #[utoipa::path(get,path="/api/v1/traps/{trap_id}/attack-matches",tag="telemetry",security(("bearer"=[])),params(("trap_id"=Uuid,Path)),responses((status=200,body=[AttackGraphMatch]),(status=401,body=crate::errors::ErrorResponse),(status=404,description="Trap missing or owned by another user",body=crate::errors::ErrorResponse),(status=503,body=crate::errors::ErrorResponse)))]
 pub async fn list_attack_matches(
     State(state): State<AppState>,
@@ -149,22 +261,180 @@ pub async fn list_attack_matches(
 ) -> Result<Json<Vec<AttackGraphMatch>>, AppError> {
     let pool = state.pool()?;
     crate::resources::traps::get(pool, &principal, trap_id).await?;
-    let rows = sqlx::query("SELECT gp.session_key,split_part(gp.session_key,':',1) AS evidence_domain,t.technique_key,t.name,gp.status,gp.similarity,gp.evidence_event_ids,gp.updated_at FROM attack_graph_progress gp JOIN attack_techniques t USING(technique_id) WHERE gp.trap_id=$1 ORDER BY gp.updated_at DESC LIMIT 100")
+    let rows = sqlx::query("SELECT gp.agent_id,gp.technique_id,gp.session_key,split_part(gp.session_key,':',1) AS evidence_domain,t.technique_key,t.name,gp.status,gp.similarity,gp.active_nodes,gp.evidence_event_ids,gp.node_evidence,gp.last_occurred_at,gp.updated_at FROM attack_graph_progress gp JOIN attack_techniques t USING(technique_id) WHERE gp.trap_id=$1 ORDER BY gp.updated_at DESC LIMIT 100")
         .bind(trap_id).fetch_all(pool).await?;
     use sqlx::Row;
-    let matches = rows
-        .into_iter()
-        .map(|row| AttackGraphMatch {
+    let technique_ids: Vec<Uuid> = rows.iter().map(|row| row.get("technique_id")).collect();
+    let graph_nodes = sqlx::query("SELECT node_id,technique_id,node_key,action_kind,process_class,resource_class,expected_outcome FROM attack_graph_nodes WHERE technique_id=ANY($1) ORDER BY technique_id,node_key")
+        .bind(&technique_ids).fetch_all(pool).await?;
+    let graph_edges = sqlx::query("SELECT technique_id,from_node,to_node FROM attack_graph_edges WHERE technique_id=ANY($1) ORDER BY technique_id,from_node,to_node")
+        .bind(&technique_ids).fetch_all(pool).await?;
+    let mut matches = Vec::with_capacity(rows.len());
+    for row in rows {
+        let scenario_id: Uuid = row.get("technique_id");
+        let active: Vec<Uuid> = row.get("active_nodes");
+        let raw_evidence: serde_json::Value = row.get("node_evidence");
+        let evidence: std::collections::HashMap<Uuid, NodeEvidence> = raw_evidence
+            .as_object()
+            .into_iter()
+            .flat_map(|object| object.iter())
+            .filter_map(|(id, value)| {
+                Some((
+                    Uuid::parse_str(id).ok()?,
+                    serde_json::from_value(value.clone()).ok()?,
+                ))
+            })
+            .collect();
+        let observations = if graph_nodes.iter().any(|n| {
+            n.get::<Uuid, _>("technique_id") == scenario_id
+                && !active.contains(&n.get::<Uuid, _>("node_id"))
+        }) {
+            sqlx::query("SELECT naa.event_id,naa.action_kind,naa.process_class,naa.resource_class,naa.outcome FROM normalized_attack_actions naa JOIN attack_events ae USING(event_id) WHERE naa.agent_id=$1 AND naa.trap_id=$2 AND naa.session_key=$3 AND ae.occurred_at BETWEEN $4::timestamptz - interval '30 minutes' AND $4::timestamptz ORDER BY ae.occurred_at DESC LIMIT 500")
+                .bind(row.get::<Uuid, _>("agent_id")).bind(trap_id).bind(row.get::<String, _>("session_key"))
+                .bind(row.get::<Option<chrono::DateTime<Utc>>, _>("last_occurred_at"))
+                .fetch_all(pool).await?
+        } else {
+            vec![]
+        };
+        let mut nodes: Vec<AttackGraphNode> = graph_nodes
+            .iter()
+            .filter(|n| n.get::<Uuid, _>("technique_id") == scenario_id)
+            .map(|n| {
+                let node_id: Uuid = n.get("node_id");
+                let proof = evidence.get(&node_id);
+                let expected_outcome: String = n.get("expected_outcome");
+                let action_kind: String = n.get("action_kind");
+                let process_class: String = n.get("process_class");
+                let resource_class: String = n.get("resource_class");
+                let observation = if proof.is_none() && !active.contains(&node_id) {
+                    observations.iter().find(|a| {
+                        a.get::<String, _>("action_kind") == action_kind
+                            && (process_class == "*"
+                                || a.get::<String, _>("process_class") == process_class)
+                            && (resource_class == "*"
+                                || a.get::<String, _>("resource_class") == resource_class)
+                    })
+                } else {
+                    None
+                };
+                let observed_outcome = proof
+                    .map(|p| p.observed_outcome.clone())
+                    .or_else(|| observation.map(|a| a.get::<String, _>("outcome")));
+                let status = if proof.is_some() {
+                    "matched"
+                } else if active.contains(&node_id) {
+                    "legacy_unattributed"
+                } else if observation.is_some()
+                    && expected_outcome != "*"
+                    && observed_outcome.as_deref() != Some(expected_outcome.as_str())
+                {
+                    "outcome_mismatch"
+                } else if observation.is_some() {
+                    "observed_unlinked"
+                } else {
+                    "missing"
+                };
+                AttackGraphNode {
+                    node_id,
+                    node_key: n.get("node_key"),
+                    action_kind,
+                    process_class,
+                    resource_class,
+                    status: status.into(),
+                    matched_event_ids: proof
+                        .map(|p| vec![p.event_id])
+                        .or_else(|| observation.map(|a| vec![a.get("event_id")]))
+                        .unwrap_or_default(),
+                    observed_outcome,
+                    expected_outcome,
+                }
+            })
+            .collect();
+        let edges: Vec<AttackGraphEdge> = graph_edges
+            .iter()
+            .filter(|e| e.get::<Uuid, _>("technique_id") == scenario_id)
+            .map(|e| {
+                let from_node: Uuid = e.get("from_node");
+                let to_node: Uuid = e.get("to_node");
+                let source = evidence.get(&from_node);
+                let target = evidence.get(&to_node);
+                let traversed = target.is_some_and(|p| p.from_node == Some(from_node));
+                AttackGraphEdge {
+                    from_node,
+                    to_node,
+                    status: if traversed {
+                        "matched"
+                    } else if active.contains(&from_node)
+                        && active.contains(&to_node)
+                        && (source.is_none() || target.is_none())
+                    {
+                        "legacy_unattributed"
+                    } else {
+                        "missing"
+                    }
+                    .into(),
+                    matched_event_ids: if traversed {
+                        target.map(|p| vec![p.event_id]).unwrap_or_default()
+                    } else {
+                        vec![]
+                    },
+                    observed_outcome: if traversed {
+                        target.map(|p| p.observed_outcome.clone())
+                    } else {
+                        None
+                    },
+                    expected_outcome: nodes
+                        .iter()
+                        .find(|n| n.node_id == to_node)
+                        .map(|n| n.expected_outcome.clone())
+                        .unwrap_or_default(),
+                    time_delta_ms: if traversed {
+                        source.zip(target).map(|(a, b)| {
+                            b.occurred_at
+                                .signed_duration_since(a.occurred_at)
+                                .num_milliseconds()
+                        })
+                    } else {
+                        None
+                    },
+                }
+            })
+            .collect();
+        let mut ordered = Vec::with_capacity(nodes.len());
+        while !nodes.is_empty() {
+            let next = nodes
+                .iter()
+                .position(|node| {
+                    !edges.iter().any(|edge| {
+                        edge.to_node == node.node_id
+                            && nodes
+                                .iter()
+                                .any(|remaining| remaining.node_id == edge.from_node)
+                    })
+                })
+                .unwrap_or(0);
+            ordered.push(nodes.remove(next));
+        }
+        let nodes = ordered;
+        let similarity: f32 = row.get("similarity");
+        let evidence_event_ids: Vec<Uuid> = row.get("evidence_event_ids");
+        matches.push(AttackGraphMatch {
+            scenario_id,
+            trap_id,
             session_key: row.get("session_key"),
             evidence_domain: row.get("evidence_domain"),
             technique_key: row.get("technique_key"),
             technique_name: row.get("name"),
             status: row.get("status"),
-            similarity: row.get("similarity"),
-            evidence_event_ids: row.get("evidence_event_ids"),
+            similarity,
+            coverage: similarity,
+            matched_event_ids: evidence_event_ids.clone(),
+            evidence_event_ids,
+            nodes,
+            edges,
             updated_at: row.get("updated_at"),
-        })
-        .collect();
+        });
+    }
     Ok(Json(matches))
 }
 

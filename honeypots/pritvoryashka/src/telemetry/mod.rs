@@ -31,11 +31,14 @@ pub struct EventEmitter {
     max_event_bytes: usize,
 }
 
+#[derive(Clone)]
 pub struct SessionTelemetry {
     emitter: EventEmitter,
     pub session_id: Uuid,
-    sequence: AtomicU64,
+    sequence: Arc<AtomicU64>,
     peer: SocketAddr,
+    destination_port: u16,
+    service_type: String,
 }
 
 #[derive(Debug, Error)]
@@ -102,11 +105,22 @@ impl EventEmitter {
     }
 
     pub fn session(&self, peer: SocketAddr) -> SessionTelemetry {
+        self.service_session(peer, self.destination_port, "ssh")
+    }
+
+    pub fn service_session(
+        &self,
+        peer: SocketAddr,
+        destination_port: u16,
+        service_type: &str,
+    ) -> SessionTelemetry {
         SessionTelemetry {
             emitter: self.clone(),
             session_id: Uuid::new_v4(),
-            sequence: AtomicU64::new(0),
+            sequence: Arc::new(AtomicU64::new(0)),
             peer,
+            destination_port,
+            service_type: service_type.to_owned(),
         }
     }
 
@@ -127,9 +141,9 @@ impl SessionTelemetry {
             occurred_at: chrono::Utc::now(),
             source_ip: Some(self.peer.ip()),
             source_port: Some(self.peer.port()),
-            destination_port: Some(self.emitter.destination_port),
+            destination_port: Some(self.destination_port),
             protocol: "tcp".into(),
-            service_type: "ssh".into(),
+            service_type: self.service_type.clone(),
             payload,
             metadata: json!({"source":"pritvoryashka","component_version":env!("CARGO_PKG_VERSION")}),
         };

@@ -12,6 +12,24 @@ fn example_configuration_is_valid() {
 }
 
 #[test]
+fn vulnerability_profiles_must_match_middle_operating_system() {
+    let mut value = valid();
+    value["distribution"] = json!("windows");
+    value["vulnerability_profiles"] = json!(["win_autologon_credentials", "win_guest_share"]);
+    let config: Config = serde_json::from_value(value.clone()).unwrap();
+    config.validate().unwrap();
+
+    value["vulnerability_profiles"] = json!(["docker_api_exposed"]);
+    let config: Config = serde_json::from_value(value.clone()).unwrap();
+    assert!(config.validate().is_err());
+
+    value["distribution"] = json!("debian");
+    value["vulnerability_profiles"] = json!(["win_autologon_credentials"]);
+    let config: Config = serde_json::from_value(value).unwrap();
+    assert!(config.validate().is_err());
+}
+
+#[test]
 fn configured_auth_requires_secret_environment_reference() {
     let mut value = valid();
     value["auth"]["policy"] = json!("configured");

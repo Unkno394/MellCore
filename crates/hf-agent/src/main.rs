@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     io::Write,
     net::SocketAddr,
@@ -21,8 +22,8 @@ use clap::Parser;
 use hf_core::{
     AgentCommand, AgentRegistration, CommandResult, CoreError, HighUbuntuDeployment,
     HysteriaConnection, KozyavkaDeployment, PacketTransport, PritvoryashkaDeployment,
-    RegisteredAgent, RegistrationTransport, SharedTcpTrapKind, TcpPortGroup, TrapSpec,
-    SHARED_SSH_IDENTIFICATION,
+    RegisteredAgent, RegistrationTransport, SHARED_SSH_IDENTIFICATION, SharedTcpTrapKind,
+    TcpPortGroup, TrapSpec,
 };
 use hf_services::{
     FailoverSender, HysteriaSocks5UdpTransport,
@@ -120,12 +121,24 @@ fn quarantine_result(marker: &QuarantineMarker, applied: bool) -> kazik_protocol
     let mut event = marker.trigger.clone();
     event.payload["trigger_event_type"] = serde_json::json!(event.event_type.clone());
     event.payload["trigger_event_id"] = serde_json::json!(event.event_id);
-    event.event_type = if applied { "security.trap_quarantined" } else { "security.trap_quarantine_failed" }.into();
-    event.payload["quarantine_result"] = serde_json::json!(if applied { "applied" } else { "failed" });
-    event.metadata["assessment"] = serde_json::json!(if applied { "isolated" } else { "suspicious_unconfirmed" });
+    event.event_type = if applied {
+        "security.trap_quarantined"
+    } else {
+        "security.trap_quarantine_failed"
+    }
+    .into();
+    event.payload["quarantine_result"] =
+        serde_json::json!(if applied { "applied" } else { "failed" });
+    event.metadata["assessment"] = serde_json::json!(if applied {
+        "isolated"
+    } else {
+        "suspicious_unconfirmed"
+    });
     event.event_id = marker.result_event_id;
     event.occurred_at_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|value| value.as_millis() as i64).unwrap_or_default();
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis() as i64)
+        .unwrap_or_default();
     event
 }
 
@@ -183,6 +196,10 @@ struct DispatcherTarget {
     trap_id: uuid::Uuid,
     address: SocketAddr,
     weight: u8,
+    #[serde(default)]
+    proxy_protocol: bool,
+    #[serde(default)]
+    proxy_secret: Option<String>,
 }
 
 impl DispatcherConfig {
@@ -210,10 +227,11 @@ impl DispatcherConfig {
                 "Dispatcher target weights do not total 100"
             );
             anyhow::ensure!(
-                listener
-                    .targets
-                    .iter()
-                    .all(|target| target.weight > 0 && target.address.ip().is_loopback()),
+                listener.targets.iter().all(|target| {
+                    target.weight > 0
+                        && target.address.ip().is_loopback()
+                        && target.proxy_protocol == target.proxy_secret.is_some()
+                }),
                 "invalid Dispatcher target"
             );
         }
@@ -270,6 +288,47 @@ fn systemd_management_supported() -> bool {
         })
 }
 
+fn dispatcher_binary_installed() -> bool {
+    let path = Path::new("/usr/local/bin/hf-dispatcher");
+    fs::metadata(path).is_ok_and(|metadata| {
+        metadata.is_file() && {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
+    })
+}
+
+fn ensure_dispatcher_service_unit() -> anyhow::Result<()> {
+    anyhow::ensure!(
+        systemd_management_supported(),
+        "shared TCP ports require a running systemd host"
+    );
+    anyhow::ensure!(
+        dispatcher_binary_installed(),
+        "hf-dispatcher is missing on this agent; update the agent runtime binaries before sharing SSH ports"
+    );
+
+    let unit_path = Path::new("/etc/systemd/system/hf-dispatcher.service");
+    let expected = b"[Unit]\nDescription=HoneyForge TCP dispatcher\nAfter=network-online.target docker.service\nWants=network-online.target\n[Service]\nType=simple\nExecStart=/usr/local/bin/hf-dispatcher --config /etc/honeyforge/dispatcher.json\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\n";
+    if fs::read(unit_path).ok().as_deref() != Some(expected.as_slice()) {
+        atomic_write(unit_path, expected)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(unit_path, fs::Permissions::from_mode(0o644))?;
+        }
+        run_program("systemctl", &["daemon-reload"])?;
+    }
+    Ok(())
+}
+
 impl ComposeProjectStore {
     fn new(state_dir: &Path) -> Self {
         Self {
@@ -300,9 +359,17 @@ impl ComposeProjectStore {
         let matching: Vec<_> = config
             .listeners
             .iter()
-            .filter(|listener| listener.targets.iter().any(|target| target.trap_id == trap_id))
+            .filter(|listener| {
+                listener
+                    .targets
+                    .iter()
+                    .any(|target| target.trap_id == trap_id)
+            })
             .collect();
-        anyhow::ensure!(matching.len() <= 1, "trap occurs in multiple Dispatcher listeners");
+        anyhow::ensure!(
+            matching.len() <= 1,
+            "trap occurs in multiple Dispatcher listeners"
+        );
         let Some(listener) = matching.first() else {
             return Ok(None);
         };
@@ -342,7 +409,10 @@ impl ComposeProjectStore {
 
         let key = match fs::symlink_metadata(&identity_path) {
             Ok(metadata) => {
-                anyhow::ensure!(metadata.file_type().is_file(), "shared SSH identity is not a regular file");
+                anyhow::ensure!(
+                    metadata.file_type().is_file(),
+                    "shared SSH identity is not a regular file"
+                );
                 let bytes = fs::read(&identity_path)?;
                 validate_openssh_private_key(&bytes)?;
                 bytes
@@ -352,11 +422,10 @@ impl ComposeProjectStore {
                 let mut fallback_key = None;
                 for member in &group.members {
                     let project = self.root.join(member.trap_id.to_string());
-                    let manifest: serde_json::Value = serde_json::from_slice(
-                        &fs::read(project.join("manifest.json"))?,
-                    )?;
-                    let was_listener = manifest["host_port"].as_u64()
-                        == Some(u64::from(group.listener_port));
+                    let manifest: serde_json::Value =
+                        serde_json::from_slice(&fs::read(project.join("manifest.json"))?)?;
+                    let was_listener =
+                        manifest["host_port"].as_u64() == Some(u64::from(group.listener_port));
                     let source = project.join("runtime/host_ed25519");
                     let metadata = match fs::symlink_metadata(&source) {
                         Ok(metadata) => metadata,
@@ -379,10 +448,8 @@ impl ComposeProjectStore {
                     Some(key) => key,
                     None => {
                         validate_container_image(pritvoryashka_image, "pritvoryashka")?;
-                        let mount = format!(
-                            "type=bind,src={},dst=/identity",
-                            identity_dir.display()
-                        );
+                        let mount =
+                            format!("type=bind,src={},dst=/identity", identity_dir.display());
                         run_program(
                             "docker",
                             &[
@@ -726,7 +793,9 @@ impl ComposeProjectStore {
         pritvoryashka_image: &str,
         agent_id: uuid::Uuid,
     ) -> anyhow::Result<CommandResult> {
-        let _mutation = self.mutation_lock.lock()
+        let _mutation = self
+            .mutation_lock
+            .lock()
             .map_err(|_| anyhow::anyhow!("trap mutation lock is poisoned"))?;
         let command_id = command.command_id();
         let trap_id = match &command {
@@ -759,13 +828,23 @@ impl ComposeProjectStore {
             tracing::warn!(command_id = %command_id, trap_id = %trap_id, "cached command state is absent or unhealthy; reconciling it again");
         }
         let deploying_quarantined = match &command {
-            AgentCommand::DeployKozyavka(_) | AgentCommand::DeployPritvoryashka(_) =>
-                self.root.join(trap_id.to_string()).join("security-quarantine.json").exists(),
-            AgentCommand::ReconcileTcpPortGroup(group) => group.members.iter().any(|member|
-                self.root.join(member.trap_id.to_string()).join("security-quarantine.json").exists()),
+            AgentCommand::DeployKozyavka(_) | AgentCommand::DeployPritvoryashka(_) => self
+                .root
+                .join(trap_id.to_string())
+                .join("security-quarantine.json")
+                .exists(),
+            AgentCommand::ReconcileTcpPortGroup(group) => group.members.iter().any(|member| {
+                self.root
+                    .join(member.trap_id.to_string())
+                    .join("security-quarantine.json")
+                    .exists()
+            }),
             _ => false,
         };
-        anyhow::ensure!(!deploying_quarantined, "trap is isolated after a security incident");
+        anyhow::ensure!(
+            !deploying_quarantined,
+            "trap is isolated after a security incident"
+        );
         let high_manifest = matches!(
             &command,
             AgentCommand::StopTrap { .. } | AgentCommand::RemoveTrap { .. }
@@ -811,24 +890,88 @@ impl ComposeProjectStore {
             AgentCommand::RebootSystem { command_id } => {
                 let unit = format!("hf-agent-reboot-{}", command_id.simple());
                 let status = Command::new("systemd-run")
-                    .args(["--quiet", "--unit", unit.as_str(), "--on-active=8s", "/usr/bin/systemctl", "reboot"])
+                    .args([
+                        "--quiet",
+                        "--unit",
+                        unit.as_str(),
+                        "--on-active=8s",
+                        "/usr/bin/systemctl",
+                        "reboot",
+                    ])
                     .status()?;
                 anyhow::ensure!(status.success(), "systemd refused the scheduled reboot");
                 Ok(())
             }
             AgentCommand::UninstallAgent { command_id } => {
+                // A failed Middle image preflight can leave a manifest and config before
+                // compose.yaml is written. Those files never represented a running trap.
+                for entry in fs::read_dir(&self.root)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if !path.is_dir()
+                        || Uuid::parse_str(&entry.file_name().to_string_lossy()).is_err()
+                        || path.join("compose.yaml").exists()
+                        || path.join("security-quarantine.json").exists()
+                    {
+                        continue;
+                    }
+                    let mut files = fs::read_dir(&path)?;
+                    let incomplete_middle = files.try_fold(true, |valid, item| {
+                        let item = item?;
+                        let name = item.file_name();
+                        let name = name.to_string_lossy();
+                        Ok::<_, std::io::Error>(
+                            valid
+                                && match name.as_ref() {
+                                    "manifest.json" | "pritvoryashka.json" => {
+                                        item.file_type()?.is_file()
+                                    }
+                                    "runtime" => {
+                                        item.file_type()?.is_dir()
+                                            && fs::read_dir(item.path())?.next().is_none()
+                                    }
+                                    _ => false,
+                                },
+                        )
+                    })?;
+                    if incomplete_middle && path.join("pritvoryashka.json").is_file() {
+                        fs::remove_dir_all(&path)?;
+                    }
+                }
                 let has_traps = fs::read_dir(&self.root)?.flatten().any(|entry| {
-                    entry.path().is_dir() && Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok()
+                    entry.path().is_dir()
+                        && Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok()
                 });
-                anyhow::ensure!(!has_traps, "local traps still exist; remove them before uninstalling the agent");
-                let script = std::path::PathBuf::from(format!("/run/hf-agent-uninstall-{}.sh", command_id.simple()));
+                anyhow::ensure!(
+                    !has_traps,
+                    "local traps still exist; remove them before uninstalling the agent"
+                );
+                let script = std::path::PathBuf::from(format!(
+                    "/run/hf-agent-uninstall-{}.sh",
+                    command_id.simple()
+                ));
                 atomic_write(&script, include_bytes!("uninstall.sh"))?;
                 let unit = format!("hf-agent-uninstall-{}", command_id.simple());
                 let status = Command::new("systemd-run")
-                    .args(["--quiet", "--unit", unit.as_str(), "--on-active=45s", "/bin/sh"])
+                    .args([
+                        "--quiet",
+                        "--unit",
+                        unit.as_str(),
+                        "--on-active=45s",
+                        "/bin/sh",
+                    ])
                     .arg(&script)
+                    .arg(
+                        self.root
+                            .parent()
+                            .unwrap_or(std::path::Path::new("/var/lib/honeyforge")),
+                    )
+                    .arg(agent_id.to_string())
                     .status()?;
-                anyhow::ensure!(status.success(), "systemd refused the scheduled agent uninstall");
+                anyhow::ensure!(
+                    status.success(),
+                    "systemd refused the scheduled agent uninstall"
+                );
                 Ok(())
             }
             AgentCommand::StopTrap { .. } => {
@@ -838,10 +981,17 @@ impl ComposeProjectStore {
                     self.high_manager().stop(trap_id)
                 } else {
                     let manifest = self.root.join(trap_id.to_string()).join("manifest.json");
-                    let shared = fs::read(manifest).ok()
+                    let shared = fs::read(manifest)
+                        .ok()
                         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                        .is_some_and(|manifest| manifest["publish_address"].as_str() == Some("127.0.0.1"));
-                    if shared { self.prepare_remove(trap_id) } else { self.compose_down(trap_id, false) }
+                        .is_some_and(|manifest| {
+                            manifest["publish_address"].as_str() == Some("127.0.0.1")
+                        });
+                    if shared {
+                        self.prepare_remove(trap_id)
+                    } else {
+                        self.compose_down(trap_id, false)
+                    }
                 }
             }
             AgentCommand::RemoveTrap { .. } => {
@@ -915,9 +1065,13 @@ impl ComposeProjectStore {
         let mut manifest = serde_json::to_value(&deployment)?;
         if let Some(identity) = shared_identity {
             manifest["shared_ssh_identity"] = serde_json::Value::Bool(true);
-            manifest["ssh_identity_path"] = serde_json::Value::String(identity.display().to_string());
+            manifest["ssh_identity_path"] =
+                serde_json::Value::String(identity.display().to_string());
         }
-        atomic_write(&project_dir.join("manifest.json"), &serde_json::to_vec_pretty(&manifest)?)?;
+        atomic_write(
+            &project_dir.join("manifest.json"),
+            &serde_json::to_vec_pretty(&manifest)?,
+        )?;
         let container_config = serde_json::json!({
             "bind_address": "0.0.0.0",
             "port": deployment.container_port,
@@ -942,7 +1096,11 @@ impl ComposeProjectStore {
             Some(identity) => format!(
                 "      - type: bind\n        source: {}\n        target: /var/lib/honeyforge-low\n        read_only: true\n",
                 serde_json::to_string(
-                    &identity.parent().expect("identity has a parent").display().to_string(),
+                    &identity
+                        .parent()
+                        .expect("identity has a parent")
+                        .display()
+                        .to_string(),
                 )?
             ),
             None => "      - ./runtime:/var/lib/honeyforge-low\n".into(),
@@ -969,18 +1127,55 @@ impl ComposeProjectStore {
 
     fn deploy_pritvoryashka(
         &self,
-        deployment: PritvoryashkaDeployment,
+        mut deployment: PritvoryashkaDeployment,
         image: &str,
         agent_id: uuid::Uuid,
         shared_identity: Option<&Path>,
     ) -> anyhow::Result<()> {
+        let project_dir = self.root.join(deployment.trap_id.to_string());
+        if deployment.dispatcher_proxy_secret.is_none() {
+            let manifest_path = project_dir.join("manifest.json");
+            if let Ok(bytes) = fs::read(&manifest_path) {
+                let previous: PritvoryashkaDeployment = serde_json::from_slice(&bytes)
+                    .with_context(|| {
+                        format!("invalid Middle manifest {}", manifest_path.display())
+                    })?;
+                deployment.dispatcher_proxy_secret = previous.dispatcher_proxy_secret;
+            }
+        }
+        deployment
+            .dispatcher_proxy_secret
+            .get_or_insert_with(|| Uuid::new_v4().simple().to_string());
         if deployment.trap_id.is_nil()
             || deployment.server_id.is_nil()
             || deployment.host_port == 0
             || !(1..=128).contains(&deployment.max_connections)
             || !deployment.resources.within(1.0, 512, 256)
+            || !matches!(
+                deployment.distribution.as_str(),
+                "ubuntu" | "debian" | "arch" | "windows"
+            )
+            || deployment.username.len() > 32
+            || deployment.username == "root"
+            || !deployment
+                .username
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.is_ascii_lowercase() || *b == b'_')
+            || !deployment
+                .username
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
             || deployment.hostname.is_empty()
             || deployment.hostname.len() > 64
+            || deployment.ssh_auth_mode != "realistic" && deployment.ssh_auth_mode != "adaptive"
+            || deployment.ssh_credentials.len() > 32
+            || deployment
+                .dispatcher_proxy_secret
+                .as_deref()
+                .is_none_or(|secret| {
+                    secret.len() != 32 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
             || !deployment
                 .hostname
                 .bytes()
@@ -988,11 +1183,91 @@ impl ComposeProjectStore {
         {
             anyhow::bail!("invalid pritvoryashka deployment command");
         }
+        if deployment.ssh_auth_mode == "realistic" {
+            anyhow::ensure!(
+                !deployment.ssh_credentials.is_empty(),
+                "realistic SSH authentication requires credentials"
+            );
+            let mut usernames = BTreeSet::new();
+            for credential in &deployment.ssh_credentials {
+                let valid_username = credential.username.len() <= 32
+                    && credential
+                        .username
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|byte| byte.is_ascii_lowercase() || *byte == b'_')
+                    && credential.username.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'_' | b'-')
+                    });
+                anyhow::ensure!(
+                    valid_username
+                        && !credential.password.trim().is_empty()
+                        && credential.password.len() <= 128
+                        && !credential.password.chars().any(char::is_control),
+                    "invalid realistic SSH credential"
+                );
+                anyhow::ensure!(
+                    usernames.insert(credential.username.to_ascii_lowercase()),
+                    "realistic SSH credential usernames must be unique"
+                );
+            }
+            anyhow::ensure!(
+                usernames.contains(&deployment.username),
+                "realistic SSH credentials must include the virtual username"
+            );
+        }
+        let expected_endpoints = hf_core::pritvoryashka_service_endpoints_for_os(
+            &deployment.vulnerability_profiles,
+            deployment.distribution == "windows",
+        )
+        .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            deployment.endpoints.len() == expected_endpoints.len()
+                && deployment.endpoints.iter().all(|binding| {
+                    binding.host_port != 0
+                        && binding.container_port != 0
+                        && expected_endpoints.iter().any(|expected| {
+                            binding.service_type == expected.service_type
+                                && binding.container_port == expected.container_port
+                        })
+                })
+                && deployment
+                    .endpoints
+                    .iter()
+                    .map(|binding| binding.host_port)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    == deployment.endpoints.len()
+                && deployment
+                    .endpoints
+                    .iter()
+                    .map(|binding| binding.container_port)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    == deployment.endpoints.len(),
+            "Middle network endpoint bindings do not match the selected vulnerability profiles"
+        );
+        let public_ssh_port = if deployment.public_ssh_port == 0 {
+            deployment.host_port
+        } else {
+            deployment.public_ssh_port
+        };
+        anyhow::ensure!(
+            deployment.endpoints.iter().all(|binding| {
+                binding.host_port != deployment.host_port && binding.host_port != public_ssh_port
+            }),
+            "Middle service ports must be distinct from its SSH publication"
+        );
         if deployment.publish_address != "0.0.0.0" && deployment.publish_address != "127.0.0.1" {
             anyhow::bail!("pritvoryashka publish address must be 0.0.0.0 or 127.0.0.1");
         }
         validate_container_image(image, "pritvoryashka")?;
-        let project_dir = self.root.join(deployment.trap_id.to_string());
+        hf_core::validate_bait_files(&deployment.baits).map_err(anyhow::Error::msg)?;
+        hf_core::validate_virtual_processes(&deployment.virtual_processes)
+            .map_err(anyhow::Error::msg)?;
+        let new_project = !project_dir.exists();
         fs::create_dir_all(project_dir.join("runtime"))?;
         let telemetry_endpoint = std::env::var("HF_TELEMETRY_PUBLIC_ENDPOINT").ok();
         let telemetry_enabled = telemetry_endpoint.is_some();
@@ -1002,16 +1277,43 @@ impl ComposeProjectStore {
         let mut manifest = serde_json::to_value(&deployment)?;
         if let Some(identity) = shared_identity {
             manifest["shared_ssh_identity"] = serde_json::Value::Bool(true);
-            manifest["ssh_identity_path"] = serde_json::Value::String(identity.display().to_string());
+            manifest["ssh_identity_path"] =
+                serde_json::Value::String(identity.display().to_string());
         }
-        atomic_write(&project_dir.join("manifest.json"), &serde_json::to_vec_pretty(&manifest)?)?;
-        let container_config = serde_json::json!({
+        atomic_write(
+            &project_dir.join("manifest.json"),
+            &serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        let network_listeners: Vec<_> = deployment
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                serde_json::json!({
+                    "service_type": endpoint.service_type,
+                    "bind": format!("0.0.0.0:{}", endpoint.container_port),
+                    "public_port": endpoint.host_port,
+                })
+            })
+            .collect();
+        let mut container_config = serde_json::json!({
             "bind": "0.0.0.0:2222",
+            "ssh_public_port": if deployment.public_ssh_port == 0 { deployment.host_port } else { deployment.public_ssh_port },
             "health_bind": "127.0.0.1:9091",
             "trap_id": deployment.trap_id,
             "server_id": deployment.server_id,
             "agent_id": agent_id,
             "hostname": deployment.hostname,
+            "username": deployment.username,
+            "distribution": deployment.distribution,
+            "ssh_auth_mode": deployment.ssh_auth_mode,
+            "ssh_credentials": deployment.ssh_credentials,
+            "dispatcher_proxy_secret": if deployment.publish_address == "127.0.0.1" {
+                deployment.dispatcher_proxy_secret.as_deref()
+            } else {
+                None
+            },
+            "vulnerability_profiles": deployment.vulnerability_profiles,
+            "network_listeners": network_listeners,
             "host_key": "/var/lib/pritvoryashka/host_ed25519",
             "auth": {"policy": "accept_all", "capture": "username", "max_attempts": 6},
             "telemetry": {
@@ -1025,12 +1327,21 @@ impl ComposeProjectStore {
             },
             "max_connections": deployment.max_connections,
             "idle_timeout_seconds": 600,
-            "max_input_bytes": 8192
+            "max_input_bytes": 8192,
+            "baits": deployment.baits,
+            "virtual_processes": deployment.virtual_processes
         });
-        atomic_write(
-            &project_dir.join("pritvoryashka.json"),
-            &serde_json::to_vec_pretty(&container_config)?,
-        )?;
+        if shared_identity.is_some() {
+            container_config["shared_ssh_identity"] = serde_json::Value::Bool(true);
+        }
+        let config_path = project_dir.join("pritvoryashka.json");
+        atomic_write(&config_path, &serde_json::to_vec_pretty(&container_config)?)?;
+        if let Err(error) = validate_pritvoryashka_image_config(image, &config_path) {
+            if new_project {
+                fs::remove_dir_all(&project_dir)?;
+            }
+            return Err(error);
+        }
         let shared_key_volume = match shared_identity {
             Some(identity) => format!(
                 "      - type: bind\n        source: {}\n        target: /var/lib/pritvoryashka/host_ed25519\n        read_only: true\n",
@@ -1038,12 +1349,23 @@ impl ComposeProjectStore {
             ),
             None => String::new(),
         };
+        let additional_ports = deployment
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                format!(
+                    "      - \"0.0.0.0:{}:{}/tcp\"\n",
+                    endpoint.host_port, endpoint.container_port
+                )
+            })
+            .collect::<String>();
         let mut compose = format!(
-            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    ports:\n      - \"{}:{}:2222/tcp\"\n    volumes:\n      - ./pritvoryashka.json:/etc/honeyforge/pritvoryashka.json:ro\n      - ./runtime:/var/lib/pritvoryashka\n{}    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: {}m\n    cpus: {:.3}\n    pids_limit: {}\n    ulimits:\n      nofile:\n        soft: 1024\n        hard: 1024\n    init: true\n",
+            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    ports:\n      - \"{}:{}:2222/tcp\"\n{}    volumes:\n      - ./pritvoryashka.json:/etc/honeyforge/pritvoryashka.json:ro\n      - ./runtime:/var/lib/pritvoryashka\n{}    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: {}m\n    cpus: {:.3}\n    pids_limit: {}\n    ulimits:\n      nofile:\n        soft: 1024\n        hard: 1024\n    init: true\n",
             deployment.trap_id.simple(),
             image,
             deployment.publish_address,
             deployment.host_port,
+            additional_ports,
             shared_key_volume,
             deployment.resources.memory_mb,
             deployment.resources.cpu_cores,
@@ -1107,7 +1429,7 @@ impl ComposeProjectStore {
                 .join("manifest.json");
             let manifest = fs::read(&manifest)
                 .with_context(|| format!("missing deployed trap {}", member.trap_id))?;
-            let deployment = match member.trap_kind {
+            let mut deployment = match member.trap_kind {
                 SharedTcpTrapKind::Kozyavka => {
                     SharedTcpDeployment::Kozyavka(serde_json::from_slice(&manifest)?)
                 }
@@ -1117,6 +1439,11 @@ impl ComposeProjectStore {
             };
             if deployment.trap_id() != member.trap_id {
                 anyhow::bail!("dispatcher member does not match its deployed trap manifest");
+            }
+            if let SharedTcpDeployment::Pritvoryashka(deployment) = &mut deployment {
+                deployment
+                    .dispatcher_proxy_secret
+                    .get_or_insert_with(|| Uuid::new_v4().simple().to_string());
             }
             originals.push(deployment);
         }
@@ -1136,29 +1463,53 @@ impl ComposeProjectStore {
             let targets: Vec<_> = group
                 .members
                 .iter()
-                .map(|member| {
+                .zip(&originals)
+                .map(|(member, deployment)| {
+                    let proxy = match deployment {
+                        SharedTcpDeployment::Kozyavka(_) => (false, None),
+                        SharedTcpDeployment::Pritvoryashka(deployment) => {
+                            (true, deployment.dispatcher_proxy_secret.as_deref())
+                        }
+                    };
                     serde_json::json!({
                         "trap_id": member.trap_id,
                         "address": format!("127.0.0.1:{}", member.backend_port),
                         "weight": member.weight,
+                        "proxy_protocol": proxy.0,
+                        "proxy_secret": proxy.1,
                     })
                 })
                 .collect();
             let config = serde_json::json!({"version": 1, "listeners": [{
                 "listen": format!("0.0.0.0:{}", group.listener_port), "targets": targets,
             }]});
+            ensure_dispatcher_service_unit()?;
             atomic_write(
                 Path::new("/etc/honeyforge/dispatcher.json"),
                 &serde_json::to_vec_pretty(&config)?,
             )?;
-            run_program("systemctl", &["enable", "hf-dispatcher.service"])?;
+            run_program_with_timeout(
+                "systemctl",
+                &["enable", "hf-dispatcher.service"],
+                Duration::from_secs(30),
+            )?;
             // The service may already be running with the previous routing table. Restart
             // before acknowledging the command so new targets are active immediately.
-            run_program("systemctl", &["restart", "hf-dispatcher.service"])?;
+            run_program_with_timeout(
+                "systemctl",
+                &["restart", "hf-dispatcher.service"],
+                Duration::from_secs(45),
+            )?;
             let address = SocketAddr::from(([127, 0, 0, 1], group.listener_port));
             for _ in 0..20 {
-                if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
-                    return run_program("systemctl", &["is-active", "--quiet", "hf-dispatcher.service"]);
+                if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100))
+                    .is_ok()
+                {
+                    return run_program_with_timeout(
+                        "systemctl",
+                        &["is-active", "--quiet", "hf-dispatcher.service"],
+                        Duration::from_secs(10),
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -1229,14 +1580,12 @@ impl ComposeProjectStore {
             SharedTcpDeployment::Kozyavka(deployment) => {
                 self.deploy_kozyavka(deployment, kozyavka_image, shared_identity.as_deref())
             }
-            SharedTcpDeployment::Pritvoryashka(deployment) => {
-                self.deploy_pritvoryashka(
-                    deployment,
-                    pritvoryashka_image,
-                    agent_id,
-                    shared_identity.as_deref(),
-                )
-            }
+            SharedTcpDeployment::Pritvoryashka(deployment) => self.deploy_pritvoryashka(
+                deployment,
+                pritvoryashka_image,
+                agent_id,
+                shared_identity.as_deref(),
+            ),
         }
     }
 
@@ -1287,9 +1636,16 @@ impl ComposeProjectStore {
         let project = self.root.join(trap_id.to_string());
         let route = fs::read(project.join("manifest.json"))
             .map_err(anyhow::Error::from)
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).map_err(Into::into))
-            .and_then(|manifest| self.detach_dispatcher_target(trap_id,
-                manifest["publish_address"].as_str() == Some("127.0.0.1")).map(|_| ()));
+            .and_then(|bytes| {
+                serde_json::from_slice::<serde_json::Value>(&bytes).map_err(Into::into)
+            })
+            .and_then(|manifest| {
+                self.detach_dispatcher_target(
+                    trap_id,
+                    manifest["publish_address"].as_str() == Some("127.0.0.1"),
+                )
+                .map(|_| ())
+            });
         let stopped = self.compose(&project, trap_id, ["stop"]);
         route?;
         stopped?;
@@ -1298,25 +1654,39 @@ impl ComposeProjectStore {
 
     /// Preserve the trap and its evidence, detach only its Dispatcher route and
     /// stop its container. Docker stop closes its established network sockets.
-    fn quarantine_trap(&self, trigger: &kazik_protocol::TrapEvent) -> anyhow::Result<kazik_protocol::TrapEvent> {
-        let _mutation = self.mutation_lock.lock()
+    fn quarantine_trap(
+        &self,
+        trigger: &kazik_protocol::TrapEvent,
+    ) -> anyhow::Result<kazik_protocol::TrapEvent> {
+        let _mutation = self
+            .mutation_lock
+            .lock()
             .map_err(|_| anyhow::anyhow!("trap mutation lock is poisoned"))?;
         let trap_id = trigger.trap_id;
         let project = self.root.join(trap_id.to_string());
-        anyhow::ensure!(project.join("compose.yaml").is_file()
-            && (project.join("config.json").is_file() || project.join("pritvoryashka.json").is_file()),
-            "only an existing Low/Middle trap may be quarantined");
+        anyhow::ensure!(
+            project.join("compose.yaml").is_file()
+                && (project.join("config.json").is_file()
+                    || project.join("pritvoryashka.json").is_file()),
+            "only an existing Low/Middle trap may be quarantined"
+        );
         let marker = project.join("security-quarantine.json");
         let record: QuarantineMarker = if marker.exists() {
             serde_json::from_slice(&fs::read(&marker)?)?
         } else {
-            let record = QuarantineMarker { trigger: trigger.clone(), result_event_id: uuid::Uuid::new_v4() };
+            let record = QuarantineMarker {
+                trigger: trigger.clone(),
+                result_event_id: uuid::Uuid::new_v4(),
+            };
             atomic_write(&marker, &serde_json::to_vec(&record)?)?;
             fs::File::open(&marker)?.sync_all()?;
             fs::File::open(&project)?.sync_all()?;
             record
         };
-        anyhow::ensure!(record.trigger.trap_id == trap_id, "quarantine marker trap ID mismatch");
+        anyhow::ensure!(
+            record.trigger.trap_id == trap_id,
+            "quarantine marker trap ID mismatch"
+        );
         self.isolate_project(trap_id)?;
         Ok(quarantine_result(&record, true))
     }
@@ -1325,25 +1695,36 @@ impl ComposeProjectStore {
         let mut results = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
-            let Ok(trap_id) = uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()) else { continue };
+            let Ok(trap_id) = uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()) else {
+                continue;
+            };
             let marker = entry.path().join("security-quarantine.json");
             if marker.is_file() {
                 let result = (|| -> anyhow::Result<kazik_protocol::TrapEvent> {
                     let record: QuarantineMarker = serde_json::from_slice(&fs::read(&marker)?)?;
-                    anyhow::ensure!(record.trigger.trap_id == trap_id, "quarantine marker trap ID mismatch");
+                    anyhow::ensure!(
+                        record.trigger.trap_id == trap_id,
+                        "quarantine marker trap ID mismatch"
+                    );
                     self.isolate_project(trap_id)?;
                     Ok(quarantine_result(&record, true))
                 })();
                 match result {
                     Ok(event) => results.push(event),
-                    Err(error) => tracing::error!(%trap_id, %error, "could not reapply trap quarantine after restart"),
+                    Err(error) => {
+                        tracing::error!(%trap_id, %error, "could not reapply trap quarantine after restart")
+                    }
                 }
             }
         }
         Ok(results)
     }
 
-    fn detach_dispatcher_target(&self, trap_id: uuid::Uuid, shared_backend: bool) -> anyhow::Result<Option<Vec<u8>>> {
+    fn detach_dispatcher_target(
+        &self,
+        trap_id: uuid::Uuid,
+        shared_backend: bool,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
         let path = Path::new("/etc/honeyforge/dispatcher.json");
         let previous = match fs::read(path) {
             Ok(bytes) => bytes,
@@ -1425,15 +1806,12 @@ impl ComposeProjectStore {
         args: [&str; N],
     ) -> anyhow::Result<()> {
         let project_name = format!("hf-{}", trap_id.simple());
-        let status = Command::new("docker")
+        let mut command = Command::new("docker");
+        command
             .args(["compose", "--project-name", &project_name, "--file"])
             .arg(project_dir.join("compose.yaml"))
-            .args(args)
-            .status()?;
-        if !status.success() {
-            anyhow::bail!("docker compose exited with {status}");
-        }
-        Ok(())
+            .args(args);
+        run_command_with_timeout(command, "docker compose", Duration::from_secs(90))
     }
 }
 
@@ -1652,7 +2030,9 @@ async fn run_kazik_hysteria_loop(
     let mut telemetry_poll = tokio::time::interval(telemetry::batch_wait());
     let mut emergency_tick = tokio::time::interval(Duration::from_secs(1));
     let existing_incident = emergency::pending(state_dir)?;
-    let mut incident_message_id = existing_incident.as_ref().map(|incident| incident.message_id);
+    let mut incident_message_id = existing_incident
+        .as_ref()
+        .map(|incident| incident.message_id);
     let mut missing_alert = None;
     if let Some(incident) = existing_incident.as_ref() {
         if emergency::alert_was_acknowledged(state_dir, incident.message_id)? {
@@ -1667,7 +2047,9 @@ async fn run_kazik_hysteria_loop(
                 identity.agent_id,
                 identity.transport_credential.clone(),
                 event.occurred_at_unix_ms,
-                KazikBody::Telemetry { events: vec![event] },
+                KazikBody::Telemetry {
+                    events: vec![event],
+                },
             );
             envelope.message_id = incident.message_id;
             telemetry::ensure_packet_size(&envelope)?;
@@ -1691,9 +2073,11 @@ async fn run_kazik_hysteria_loop(
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel::<CommandJob>(32);
     let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<CommandExecution>(32);
     match projects.recover_quarantines() {
-        Ok(events) => for event in events {
-            telemetry::enqueue_immediate_event(&identity, &mut outbox, event)?;
-        },
+        Ok(events) => {
+            for event in events {
+                telemetry::enqueue_immediate_event(&identity, &mut outbox, event)?;
+            }
+        }
         Err(error) => tracing::error!(%error, "could not scan persisted trap quarantines"),
     }
     let worker_projects = projects.clone();
@@ -1937,6 +2321,12 @@ async fn run_kazik_hysteria_loop(
                     Ok(result) => (AckDisposition::Rejected, Some(result.detail)),
                     Err(error) => (AckDisposition::Rejected, Some(error.to_string())),
                 };
+                if matches!(disposition, AckDisposition::Applied) {
+                    tracing::info!(message_id=%execution.message_id, "agent command applied");
+                } else {
+                    tracing::warn!(message_id=%execution.message_id,
+                        detail=detail.as_deref().unwrap_or("unknown"), "agent command rejected");
+                }
                 enqueue_ack(&mut outbox, &identity, execution.message_id, disposition, detail)?;
                 if let Some(sender) = sender.as_ref() {
                     if let Err(error) = send_pending_once(&mut outbox, sender, 64).await {
@@ -1983,10 +2373,16 @@ async fn run_kazik_hysteria_loop(
                     KazikBody::Heartbeat { status: AgentStatus {
                         hostname: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
                         active_trap_count,
-                        capabilities: if systemd_management_supported() {
-                            vec!["reboot_system".into(), "uninstall_agent".into()]
-                        } else {
-                            Vec::new()
+                        capabilities: {
+                            let mut capabilities = Vec::new();
+                            if systemd_management_supported() {
+                                capabilities.push("reboot_system".into());
+                                capabilities.push("uninstall_agent".into());
+                            }
+                            if systemd_management_supported() && dispatcher_binary_installed() {
+                                capabilities.push("shared_tcp_ports".into());
+                            }
+                            capabilities
                         },
                     }},
                 );
@@ -2087,7 +2483,7 @@ fn enqueue_ack(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default();
-    outbox.enqueue(KazikEnvelope::new(
+    let acknowledgement = KazikEnvelope::new(
         identity.agent_id,
         identity.transport_credential.clone(),
         now,
@@ -2096,7 +2492,12 @@ fn enqueue_ack(
             disposition,
             detail,
         }),
-    ))?;
+    );
+    let message_id = acknowledgement.message_id;
+    outbox.enqueue(acknowledgement)?;
+    // A command result must reach Center even when ordinary telemetry has filled
+    // the bounded delivery window. The outbox still retains it until Center ACKs it.
+    outbox.prioritize_acknowledgement(message_id)?;
     Ok(())
 }
 
@@ -2364,12 +2765,76 @@ fn validate_container_image(image: &str, trap_name: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+fn validate_pritvoryashka_image_config(image: &str, config_path: &Path) -> anyhow::Result<()> {
+    const PROBE_PATH: &str = "/tmp/hf-middle-deployment-probe.json";
+    let mount = format!("{}:{PROBE_PATH}:ro", config_path.display());
+    let output = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--pull=never",
+            "--network=none",
+            "--read-only",
+            "--volume",
+        ])
+        .arg(mount)
+        .args([
+            "--entrypoint",
+            "/usr/local/bin/pritvoryashka",
+            image,
+            "--check-config",
+            PROBE_PATH,
+        ])
+        .output()
+        .context("could not check the Middle image configuration")?;
+    if !output.status.success() {
+        let detail: String = String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(500)
+            .collect();
+        anyhow::bail!(
+            "Middle image {image} does not accept the current bait/process configuration; update the image on this agent before starting the trap: {}",
+            detail.trim()
+        );
+    }
+    Ok(())
+}
+
 fn run_program(program: &str, args: &[&str]) -> anyhow::Result<()> {
     let status = Command::new(program).args(args).status()?;
     if !status.success() {
         anyhow::bail!("{program} exited with {status}");
     }
     Ok(())
+}
+
+fn run_program_with_timeout(program: &str, args: &[&str], timeout: Duration) -> anyhow::Result<()> {
+    let mut command = Command::new(program);
+    command.args(args);
+    run_command_with_timeout(command, program, timeout)
+}
+
+fn run_command_with_timeout(
+    mut command: Command,
+    label: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                return Ok(());
+            }
+            anyhow::bail!("{label} exited with {status}");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("{label} timed out after {} seconds", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn compose_remove_id(projects: &ComposeProjectStore, command: &AgentCommand) -> Option<uuid::Uuid> {
@@ -2510,7 +2975,8 @@ fn validate_openssh_private_key(bytes: &[u8]) -> anyhow::Result<()> {
     anyhow::ensure!(
         (64..=16_384).contains(&bytes.len())
             && bytes.starts_with(b"-----BEGIN OPENSSH PRIVATE KEY-----\n")
-            && bytes.windows(b"-----END OPENSSH PRIVATE KEY-----".len())
+            && bytes
+                .windows(b"-----END OPENSSH PRIVATE KEY-----".len())
                 .any(|window| window == b"-----END OPENSSH PRIVATE KEY-----"),
         "shared SSH host key is not a valid OpenSSH private-key file"
     );
@@ -2538,32 +3004,93 @@ fn set_shared_identity_permissions(path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposeProjectStore, DispatcherConfig, DispatcherListener, DispatcherTarget,
-        HighDesiredState, HighRuntimeManifest, Platform, QuarantineMarker, compose_remove_id,
-        parse_platform, quarantine_result,
+        AgentIdentity, ComposeProjectStore, DispatcherConfig, DispatcherListener,
+        DispatcherTarget, HighDesiredState, HighRuntimeManifest, Platform, QuarantineMarker,
+        SqliteKazikOutbox, compose_remove_id, enqueue_ack, parse_platform, quarantine_result,
     };
     use hf_core::{AgentCommand, HighUbuntuDeployment};
+    use kazik_protocol::{AckDisposition, AgentStatus, DurableOutbox, KazikBody, KazikEnvelope};
     use std::fs;
 
     use uuid::Uuid;
 
     #[test]
+    fn command_ack_precedes_a_full_telemetry_delivery_window() {
+        let path = std::env::temp_dir().join(format!("hf-agent-ack-{}.sqlite", Uuid::new_v4()));
+        let mut outbox = SqliteKazikOutbox::open(&path).unwrap();
+        let identity = AgentIdentity {
+            agent_id: Uuid::new_v4(),
+            transport_credential: "test-credential".into(),
+            hysteria: None,
+        };
+        for sequence in 0..70 {
+            outbox
+                .enqueue(KazikEnvelope::new(
+                    identity.agent_id,
+                    identity.transport_credential.clone(),
+                    sequence,
+                    KazikBody::Heartbeat {
+                        status: AgentStatus {
+                            hostname: "test-vps".into(),
+                            active_trap_count: 0,
+                            capabilities: vec![],
+                        },
+                    },
+                ))
+                .unwrap();
+        }
+        let command_id = Uuid::new_v4();
+        enqueue_ack(
+            &mut outbox,
+            &identity,
+            command_id,
+            AckDisposition::Applied,
+            None,
+        )
+        .unwrap();
+        let ready = outbox.ready_to_send(64).unwrap();
+        assert_eq!(ready.len(), 64);
+        assert!(matches!(
+            &ready[0].envelope.body,
+            KazikBody::Ack(ack) if ack.acknowledged_message_id == command_id
+        ));
+        drop(outbox);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn quarantine_recovery_reuses_the_same_event_id() {
         let trigger = kazik_protocol::TrapEvent {
-            event_id: Uuid::new_v4(), trap_id: Uuid::new_v4(), session_id: None,
-            source_sequence_no: None, occurred_at_unix_ms: 1, event_type: "security.resource_access".into(),
-            source_ip: None, source_port: None, destination_port: None,
-            protocol: "local".into(), service_type: "host_monitor".into(),
+            event_id: Uuid::new_v4(),
+            trap_id: Uuid::new_v4(),
+            session_id: None,
+            source_sequence_no: None,
+            occurred_at_unix_ms: 1,
+            event_type: "security.resource_access".into(),
+            source_ip: None,
+            source_port: None,
+            destination_port: None,
+            protocol: "local".into(),
+            service_type: "host_monitor".into(),
             payload: serde_json::json!({"policy_decision":"isolate_trap"}),
             metadata: serde_json::json!({"source":"hf-agent-ebpf"}),
         };
-        let marker = QuarantineMarker { trigger, result_event_id: Uuid::new_v4() };
+        let marker = QuarantineMarker {
+            trigger,
+            result_event_id: Uuid::new_v4(),
+        };
         let first = quarantine_result(&marker, true);
         let replay = quarantine_result(&marker, true);
         assert_eq!(first.event_id, replay.event_id);
-        assert_eq!(first.payload["trigger_event_id"], marker.trigger.event_id.to_string());
+        assert_eq!(
+            first.payload["trigger_event_id"],
+            marker.trigger.event_id.to_string()
+        );
         assert_eq!(first.event_type, "security.trap_quarantined");
-        assert_eq!(quarantine_result(&marker, false).event_type, "security.trap_quarantine_failed");
+        assert_eq!(
+            quarantine_result(&marker, false).event_type,
+            "security.trap_quarantine_failed"
+        );
     }
 
     fn target(weight: u8) -> DispatcherTarget {
@@ -2571,6 +3098,8 @@ mod tests {
             trap_id: Uuid::new_v4(),
             address: "127.0.0.1:31001".parse().unwrap(),
             weight,
+            proxy_protocol: false,
+            proxy_secret: None,
         }
     }
 

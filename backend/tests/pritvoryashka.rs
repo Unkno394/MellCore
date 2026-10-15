@@ -57,7 +57,8 @@ fn profile_resource_defaults_follow_the_selected_tier_and_custom_limits_are_boun
     let low = serde_json::from_value::<ProfileInput>(json!({
         "name":"Low", "level":"low", "honeypot_type":"kozyavka",
         "service_type":"ssh", "config":{}
-    })).unwrap();
+    }))
+    .unwrap();
     assert_eq!(low.resolved_resources().cpu_cores, 0.5);
     assert_eq!(low.resolved_resources().memory_mb, 128);
     assert_eq!(low.resolved_resources().pids, 64);
@@ -65,18 +66,23 @@ fn profile_resource_defaults_follow_the_selected_tier_and_custom_limits_are_boun
     let medium = serde_json::from_value::<ProfileInput>(json!({
         "name":"Middle", "level":"medium", "honeypot_type":"pritvoryashka",
         "service_type":"ssh", "config":{}
-    })).unwrap();
+    }))
+    .unwrap();
     assert_eq!(medium.resolved_resources().cpu_cores, 1.0);
     assert_eq!(medium.resolved_resources().memory_mb, 512);
     assert_eq!(medium.resolved_resources().pids, 256);
 
     let mut bounded = medium;
     bounded.resources = Some(honeyforge_backend::resources::ContainerResourceLimits {
-        cpu_cores: 0.75, memory_mb: 384, pids: 128,
+        cpu_cores: 0.75,
+        memory_mb: 384,
+        pids: 128,
     });
     bounded.validate().unwrap();
     bounded.resources = Some(honeyforge_backend::resources::ContainerResourceLimits {
-        cpu_cores: 1.25, memory_mb: 384, pids: 128,
+        cpu_cores: 1.25,
+        memory_mb: 384,
+        pids: 128,
     });
     assert!(bounded.validate().is_err());
 }

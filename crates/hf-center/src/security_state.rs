@@ -31,7 +31,9 @@ pub(crate) struct IsolatedTrap {
     pub status: String,
 }
 
-fn default_isolated_status() -> String { "applied".into() }
+fn default_isolated_status() -> String {
+    "applied".into()
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AgentTarget {
@@ -46,10 +48,17 @@ pub(crate) struct PendingRemoval {
     pub trap_id: Uuid,
 }
 
-fn default_ssh_port() -> u16 { 22 }
+fn default_ssh_port() -> u16 {
+    22
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ResponseTier { Observe, Alert, IsolateTrap, QuarantineHost }
+pub(crate) enum ResponseTier {
+    Observe,
+    Alert,
+    IsolateTrap,
+    QuarantineHost,
+}
 
 #[derive(Default, Serialize, Deserialize)]
 struct PersistedState {
@@ -72,27 +81,45 @@ pub(crate) struct AgentSecurityStore {
 
 impl AgentSecurityStore {
     pub(crate) fn response_for_event(event: &TrapEvent) -> ResponseTier {
-        if Self::is_confirmed_escape(event) { ResponseTier::QuarantineHost }
-        else if Self::is_isolation_event(event) { ResponseTier::IsolateTrap }
-        else if event.event_type.starts_with("security.") { ResponseTier::Alert }
-        else { ResponseTier::Observe }
+        if Self::is_confirmed_escape(event) {
+            ResponseTier::QuarantineHost
+        } else if Self::is_isolation_event(event) {
+            ResponseTier::IsolateTrap
+        } else if event.event_type.starts_with("security.") {
+            ResponseTier::Alert
+        } else {
+            ResponseTier::Observe
+        }
     }
     pub(crate) fn is_confirmed_escape(event: &TrapEvent) -> bool {
-        !event.trap_id.is_nil() && hf_core::security::confirmed_escape(
-            &event.event_type, &event.service_type, &event.protocol, &event.payload, &event.metadata,
-        )
+        !event.trap_id.is_nil()
+            && hf_core::security::confirmed_escape(
+                &event.event_type,
+                &event.service_type,
+                &event.protocol,
+                &event.payload,
+                &event.metadata,
+            )
     }
 
     pub(crate) fn is_isolation_event(event: &TrapEvent) -> bool {
-        if event.service_type != "host_monitor" || event.protocol != "local"
+        if event.service_type != "host_monitor"
+            || event.protocol != "local"
             || event.metadata["source"] != "hf-agent-ebpf"
-            || !matches!(event.event_type.as_str(), "security.trap_quarantined" | "security.trap_quarantine_failed")
-            || event.payload["trigger_event_id"].as_str().and_then(|value| Uuid::parse_str(value).ok()).is_none()
+            || !matches!(
+                event.event_type.as_str(),
+                "security.trap_quarantined" | "security.trap_quarantine_failed"
+            )
+            || event.payload["trigger_event_id"]
+                .as_str()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .is_none()
             || event.payload["policy_decision"] != "isolate_trap"
             || event.payload["subject"] != "trap_process"
             || !matches!((event.payload["container_id"].as_str(), event.payload["cgroup"].as_str()),
                 (Some(id), Some(cgroup)) if hf_core::security::container_in_cgroup(cgroup, id))
-            || !matches!(event.payload["trap_tier"].as_str(), Some("low" | "middle")) {
+            || !matches!(event.payload["trap_tier"].as_str(), Some("low" | "middle"))
+        {
             return false;
         }
         let applied = event.event_type == "security.trap_quarantined"
@@ -100,22 +127,37 @@ impl AgentSecurityStore {
             && event.metadata["assessment"] == "isolated";
         let failed = event.event_type == "security.trap_quarantine_failed"
             && event.payload["quarantine_result"] == "failed";
-        if !applied && !failed { return false; }
+        if !applied && !failed {
+            return false;
+        }
         match event.payload["trigger_event_type"].as_str().unwrap_or("") {
-            "security.resource_access" => event.payload["operation"] == "open"
-                && event.payload["result"].as_i64().is_some_and(|v| v >= 0)
-                && event.payload["resource"].as_str()
-                    .is_some_and(hf_core::security::container_runtime_socket),
-            "security.policy_violation" => event.payload["policy_violations"].as_array()
-                .is_some_and(|reasons| reasons.iter().any(|reason|
-                    reason.as_str().is_some_and(|value| matches!(value,
-                        "privileged mode is enabled" | "host PID namespace is enabled"
-                        | "host network namespace is enabled" | "host IPC namespace is enabled"
-                        | "host user or cgroup namespace is explicitly shared"
-                        | "namespace sharing with another container is forbidden"
-                        | "additional capabilities or device access are forbidden"
-                        | "unconfined seccomp or LSM profile is forbidden"
-                        | "mount set differs from the tier allowlist")))),
+            "security.resource_access" => {
+                event.payload["operation"] == "open"
+                    && event.payload["result"].as_i64().is_some_and(|v| v >= 0)
+                    && event.payload["resource"]
+                        .as_str()
+                        .is_some_and(hf_core::security::container_runtime_socket)
+            }
+            "security.policy_violation" => event.payload["policy_violations"]
+                .as_array()
+                .is_some_and(|reasons| {
+                    reasons.iter().any(|reason| {
+                        reason.as_str().is_some_and(|value| {
+                            matches!(
+                                value,
+                                "privileged mode is enabled"
+                                    | "host PID namespace is enabled"
+                                    | "host network namespace is enabled"
+                                    | "host IPC namespace is enabled"
+                                    | "host user or cgroup namespace is explicitly shared"
+                                    | "namespace sharing with another container is forbidden"
+                                    | "additional capabilities or device access are forbidden"
+                                    | "unconfined seccomp or LSM profile is forbidden"
+                                    | "mount set differs from the tier allowlist"
+                            )
+                        })
+                    })
+                }),
             _ => false,
         }
     }
@@ -137,7 +179,10 @@ impl AgentSecurityStore {
     }
 
     pub(crate) fn target(&self, agent_id: &Uuid) -> Option<(&str, u16)> {
-        self.state.targets.get(agent_id).map(|target| (target.address.as_str(), target.ssh_port))
+        self.state
+            .targets
+            .get(agent_id)
+            .map(|target| (target.address.as_str(), target.ssh_port))
     }
 
     pub(crate) fn remove_agent(&mut self, agent_id: Uuid) -> anyhow::Result<()> {
@@ -145,8 +190,10 @@ impl AgentSecurityStore {
         next.targets.remove(&agent_id);
         next.compromised.remove(&agent_id);
         next.traps.retain(|_, owner| *owner != agent_id);
-        next.isolated_traps.retain(|_, trap| trap.agent_id != agent_id);
-        next.pending_removals.retain(|_, removal| removal.agent_id != agent_id);
+        next.isolated_traps
+            .retain(|_, trap| trap.agent_id != agent_id);
+        next.pending_removals
+            .retain(|_, removal| removal.agent_id != agent_id);
         self.persist(next)
     }
 
@@ -162,32 +209,69 @@ impl AgentSecurityStore {
         self.state.isolated_traps.values().cloned().collect()
     }
 
-    pub(crate) fn mark_trap_isolated(&mut self, agent_id: Uuid, event: &TrapEvent) -> anyhow::Result<bool> {
-        anyhow::ensure!(self.owns_trap(agent_id, event.trap_id), "isolation event belongs to an unregistered trap");
-        anyhow::ensure!(Self::is_isolation_event(event),
-            "event is not an agent-observed Low/Middle isolation decision");
-        let status = event.payload["quarantine_result"].as_str().unwrap_or("failed");
-        if self.state.isolated_traps.get(&event.trap_id).is_some_and(|old| old.status == status) {
+    pub(crate) fn mark_trap_isolated(
+        &mut self,
+        agent_id: Uuid,
+        event: &TrapEvent,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            self.owns_trap(agent_id, event.trap_id),
+            "isolation event belongs to an unregistered trap"
+        );
+        anyhow::ensure!(
+            Self::is_isolation_event(event),
+            "event is not an agent-observed Low/Middle isolation decision"
+        );
+        let status = event.payload["quarantine_result"]
+            .as_str()
+            .unwrap_or("failed");
+        if self
+            .state
+            .isolated_traps
+            .get(&event.trap_id)
+            .is_some_and(|old| old.status == status)
+        {
             return Ok(false);
         }
-        if self.state.isolated_traps.get(&event.trap_id).is_some_and(|old| old.status == "applied") {
+        if self
+            .state
+            .isolated_traps
+            .get(&event.trap_id)
+            .is_some_and(|old| old.status == "applied")
+        {
             return Ok(false);
         }
         let mut next = clone_state(&self.state)?;
-        next.isolated_traps.insert(event.trap_id, IsolatedTrap {
-            agent_id, trap_id: event.trap_id, event_id: event.event_id,
-            detected_at_unix_ms: event.occurred_at_unix_ms,
-            status: status.into(),
-        });
+        next.isolated_traps.insert(
+            event.trap_id,
+            IsolatedTrap {
+                agent_id,
+                trap_id: event.trap_id,
+                event_id: event.event_id,
+                detected_at_unix_ms: event.occurred_at_unix_ms,
+                status: status.into(),
+            },
+        );
         self.persist(next)?;
         Ok(true)
     }
 
     pub(crate) fn register_trap(&mut self, agent_id: Uuid, trap_id: Uuid) -> anyhow::Result<()> {
-        anyhow::ensure!(!agent_id.is_nil() && !trap_id.is_nil(), "invalid agent/trap ID");
-        anyhow::ensure!(!self.is_trap_isolated(trap_id), "trap is isolated after a security incident");
-        anyhow::ensure!(self.state.traps.get(&trap_id).map_or(true, |owner| *owner == agent_id),
-            "trap ID belongs to another agent");
+        anyhow::ensure!(
+            !agent_id.is_nil() && !trap_id.is_nil(),
+            "invalid agent/trap ID"
+        );
+        anyhow::ensure!(
+            !self.is_trap_isolated(trap_id),
+            "trap is isolated after a security incident"
+        );
+        anyhow::ensure!(
+            self.state
+                .traps
+                .get(&trap_id)
+                .map_or(true, |owner| *owner == agent_id),
+            "trap ID belongs to another agent"
+        );
         let mut next = clone_state(&self.state)?;
         next.traps.insert(trap_id, agent_id);
         self.persist(next)
@@ -197,17 +281,30 @@ impl AgentSecurityStore {
         self.state.pending_removals.get(&message_id).cloned()
     }
 
-    pub(crate) fn record_removal(&mut self, message_id: Uuid, agent_id: Uuid, trap_id: Uuid) -> anyhow::Result<()> {
-        anyhow::ensure!(self.owns_trap(agent_id, trap_id), "trap does not belong to agent");
+    pub(crate) fn record_removal(
+        &mut self,
+        message_id: Uuid,
+        agent_id: Uuid,
+        trap_id: Uuid,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.owns_trap(agent_id, trap_id),
+            "trap does not belong to agent"
+        );
         let mut next = clone_state(&self.state)?;
-        next.pending_removals.insert(message_id, PendingRemoval { agent_id, trap_id });
+        next.pending_removals
+            .insert(message_id, PendingRemoval { agent_id, trap_id });
         self.persist(next)
     }
 
     pub(crate) fn finish_removal(&mut self, message_id: Uuid, applied: bool) -> anyhow::Result<()> {
-        let Some(removal) = self.state.pending_removals.get(&message_id) else { return Ok(()) };
+        let Some(removal) = self.state.pending_removals.get(&message_id) else {
+            return Ok(());
+        };
         let mut next = clone_state(&self.state)?;
-        if applied { next.traps.remove(&removal.trap_id); }
+        if applied {
+            next.traps.remove(&removal.trap_id);
+        }
         next.pending_removals.remove(&message_id);
         self.persist(next)
     }
@@ -225,9 +322,15 @@ impl AgentSecurityStore {
         records
     }
 
-    pub(crate) fn set_target(&mut self, agent_id: Uuid, address: String, ssh_port: u16) -> anyhow::Result<()> {
+    pub(crate) fn set_target(
+        &mut self,
+        agent_id: Uuid,
+        address: String,
+        ssh_port: u16,
+    ) -> anyhow::Result<()> {
         let mut next = clone_state(&self.state)?;
-        next.targets.insert(agent_id, AgentTarget { address, ssh_port });
+        next.targets
+            .insert(agent_id, AgentTarget { address, ssh_port });
         self.persist(next)
     }
 
@@ -313,15 +416,23 @@ mod tests {
 
     fn incident() -> TrapEvent {
         TrapEvent {
-            event_id: Uuid::new_v4(), trap_id: Uuid::new_v4(), session_id: None,
-            source_sequence_no: None, occurred_at_unix_ms: 1_800_000_000_000,
-            event_type: "security.escape_confirmed".into(), source_ip: None, source_port: None,
-            destination_port: None, protocol: "local".into(), service_type: "host_monitor".into(),
+            event_id: Uuid::new_v4(),
+            trap_id: Uuid::new_v4(),
+            session_id: None,
+            source_sequence_no: None,
+            occurred_at_unix_ms: 1_800_000_000_000,
+            event_type: "security.escape_confirmed".into(),
+            source_ip: None,
+            source_port: None,
+            destination_port: None,
+            protocol: "local".into(),
+            service_type: "host_monitor".into(),
             payload: json!({"pid":123,"start_ticks":456,"boot_id":"10000000-0000-4000-8000-000000000001",
                 "container_id":"a".repeat(64),"cgroup":format!("0::/docker/{}", "a".repeat(64)),
                 "trap_tier":"low","observations":2,
                 "pid_namespace":"pid:[1]","host_pid_namespace":"pid:[1]","container_pid_namespace":"pid:[2]",
-                "mount_namespace":"mnt:[1]","host_mount_namespace":"mnt:[1]","container_mount_namespace":"mnt:[2]"}), metadata: json!({"source":"hf-agent-ebpf","assessment":"confirmed","validation":"two_samples_proc_docker_v2"}),
+                "mount_namespace":"mnt:[1]","host_mount_namespace":"mnt:[1]","container_mount_namespace":"mnt:[2]"}),
+            metadata: json!({"source":"hf-agent-ebpf","assessment":"confirmed","validation":"two_samples_proc_docker_v2"}),
         }
     }
 
@@ -338,7 +449,10 @@ mod tests {
         assert!(!store.mark_compromised(agent, &event).unwrap());
         let restored = AgentSecurityStore::open(&path).unwrap();
         assert!(restored.is_compromised(&agent));
-        assert_eq!(restored.compromised()[0].target.as_deref(), Some("192.0.2.10"));
+        assert_eq!(
+            restored.compromised()[0].target.as_deref(),
+            Some("192.0.2.10")
+        );
         assert!(!restored.compromised()[0].transport_disconnected);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -352,7 +466,10 @@ mod tests {
         let mut event = incident();
         event.event_type = "security.unexpected_executable".into();
         assert!(store.mark_compromised(agent, &event).is_err());
-        assert_eq!(AgentSecurityStore::response_for_event(&event), ResponseTier::Alert);
+        assert_eq!(
+            AgentSecurityStore::response_for_event(&event),
+            ResponseTier::Alert
+        );
         assert!(!store.is_compromised(&agent));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -379,7 +496,10 @@ mod tests {
         failed.payload["quarantine_result"] = json!("failed");
         failed.metadata["assessment"] = json!("suspicious_unconfirmed");
         assert!(AgentSecurityStore::is_isolation_event(&failed));
-        assert_eq!(AgentSecurityStore::response_for_event(&failed), ResponseTier::IsolateTrap);
+        assert_eq!(
+            AgentSecurityStore::response_for_event(&failed),
+            ResponseTier::IsolateTrap
+        );
         assert!(store.mark_trap_isolated(agent, &failed).unwrap());
         assert_eq!(store.isolated_traps()[0].status, "failed");
         assert!(store.mark_trap_isolated(agent, &event).unwrap());
@@ -414,7 +534,11 @@ mod tests {
         assert_eq!(reopened.pending_removal(removal).unwrap().trap_id, trap);
         let mut reopened = reopened;
         reopened.finish_removal(removal, true).unwrap();
-        assert!(!AgentSecurityStore::open(&path).unwrap().owns_trap(agent, trap));
+        assert!(
+            !AgentSecurityStore::open(&path)
+                .unwrap()
+                .owns_trap(agent, trap)
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }

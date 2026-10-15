@@ -5,7 +5,8 @@ import type { PageName } from './Sidebar'
 type Props = { currentPage: PageName; user: User; onLogout: () => void }
 
 const labels: Record<PageName, string> = {
-  Dashboard: 'Обзор', Infrastructure: 'Инфраструктура', Profiles: 'Профили',
+  Dashboard: 'Обзор', Infrastructure: 'Инфраструктура', Baits: 'Приманки',
+  Vulnerabilities: 'Уязвимости',
   LiveFeed: 'События', Settings: 'Настройки',
 }
 

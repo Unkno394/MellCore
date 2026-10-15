@@ -161,14 +161,52 @@ pub fn validate_config(config: &Value) -> Result<(), AppError> {
 // A guardrail, not a secret detector. Service-specific schemas follow when real
 // infrastructure is connected. Arbitrary profiles are never executed in stage 2.
 fn contains_secret(value: &Value) -> bool {
+    let decoy_ssh_credentials = value.as_object().is_some_and(|object| {
+        matches!(
+            object.get("ssh_auth_mode").and_then(Value::as_str),
+            Some("realistic" | "adaptive")
+        ) && object
+            .get("ssh_credentials")
+            .and_then(Value::as_array)
+            .is_some_and(|credentials| {
+                !credentials.is_empty()
+                    && credentials.iter().all(|credential| {
+                        credential.as_object().is_some_and(|fields| {
+                            fields.len() == 2
+                                && fields.get("username").is_some_and(Value::is_string)
+                                && fields.get("password").is_some_and(Value::is_string)
+                        })
+                    })
+            })
+    });
+    contains_secret_inner(value, decoy_ssh_credentials, false)
+}
+
+fn contains_secret_inner(
+    value: &Value,
+    allow_decoy_ssh_credentials: bool,
+    in_ssh_credential: bool,
+) -> bool {
     match value {
-        Value::Object(object) => object.iter().any(|(key, value)| {
-            matches!(
+        Value::Object(object) => object.iter().any(|(key, child)| {
+            let allowed_weak_password = allow_decoy_ssh_credentials
+                && in_ssh_credential
+                && key == "password"
+                && child.is_string();
+            let contains_secret_key = matches!(
                 key.to_ascii_lowercase().as_str(),
                 "password" | "private_key" | "ssh_key" | "token" | "secret"
-            ) || contains_secret(value)
+            );
+            (contains_secret_key && !allowed_weak_password)
+                || contains_secret_inner(
+                    child,
+                    allow_decoy_ssh_credentials,
+                    allow_decoy_ssh_credentials && key == "ssh_credentials",
+                )
         }),
-        Value::Array(values) => values.iter().any(contains_secret),
+        Value::Array(values) => values.iter().any(|child| {
+            contains_secret_inner(child, allow_decoy_ssh_credentials, in_ssh_credential)
+        }),
         _ => false,
     }
 }

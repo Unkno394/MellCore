@@ -91,9 +91,17 @@ pub(crate) fn install(state_dir: &Path) -> Result<()> {
 
 /// Durable local evidence, written before asking systemd to isolate the host.
 pub(crate) fn record(state_dir: &Path, event: &TrapEvent, message_id: Uuid) -> Result<()> {
-    anyhow::ensure!(!event.trap_id.is_nil() && hf_core::security::confirmed_escape(
-        &event.event_type, &event.service_type, &event.protocol, &event.payload, &event.metadata),
-        "only a confirmed escape may create an emergency incident");
+    anyhow::ensure!(
+        !event.trap_id.is_nil()
+            && hf_core::security::confirmed_escape(
+                &event.event_type,
+                &event.service_type,
+                &event.protocol,
+                &event.payload,
+                &event.metadata
+            ),
+        "only a confirmed escape may create an emergency incident"
+    );
     let path = marker(state_dir);
     if path.exists() {
         anyhow::bail!("a confirmed escape incident already exists");
@@ -109,7 +117,15 @@ pub(crate) fn record(state_dir: &Path, event: &TrapEvent, message_id: Uuid) -> R
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
     let mut file = options.open(&temporary)?;
-    file.write_all(format!("{}\n{}\narmed={}\n", event.trap_id, message_id, u8::from(armed())).as_bytes())?;
+    file.write_all(
+        format!(
+            "{}\n{}\narmed={}\n",
+            event.trap_id,
+            message_id,
+            u8::from(armed())
+        )
+        .as_bytes(),
+    )?;
     file.sync_all()?;
     // hard_link is an atomic no-replace publication; readers never see a partial marker.
     let published = fs::hard_link(&temporary, &path);
@@ -126,8 +142,12 @@ pub(crate) fn pending(state_dir: &Path) -> Result<Option<PendingIncident>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    anyhow::ensure!(metadata.file_type().is_file() && metadata.uid() == 0
-        && metadata.permissions().mode() & 0o777 == 0o600, "incident marker is not a private root-owned file");
+    anyhow::ensure!(
+        metadata.file_type().is_file()
+            && metadata.uid() == 0
+            && metadata.permissions().mode() & 0o777 == 0o600,
+        "incident marker is not a private root-owned file"
+    );
     let content = match fs::read_to_string(&path) {
         Ok(content) => content,
         Err(error) => return Err(error.into()),
@@ -142,18 +162,32 @@ pub(crate) fn alert_was_acknowledged(state_dir: &Path, message_id: Uuid) -> Resu
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    anyhow::ensure!(metadata.file_type().is_file() && metadata.uid() == 0
-        && metadata.permissions().mode() & 0o777 == 0o600, "incident ACK marker is not private and root-owned");
+    anyhow::ensure!(
+        metadata.file_type().is_file()
+            && metadata.uid() == 0
+            && metadata.permissions().mode() & 0o777 == 0o600,
+        "incident ACK marker is not private and root-owned"
+    );
     let acknowledged: Uuid = fs::read_to_string(&path)?.trim().parse()?;
-    anyhow::ensure!(acknowledged == message_id, "incident ACK marker refers to another message");
+    anyhow::ensure!(
+        acknowledged == message_id,
+        "incident ACK marker refers to another message"
+    );
     Ok(true)
 }
 
 pub(crate) fn record_alert_ack(state_dir: &Path, message_id: Uuid) -> Result<()> {
-    let Some(incident) = pending(state_dir)? else { anyhow::bail!("no incident to acknowledge") };
-    anyhow::ensure!(incident.message_id == message_id, "ACK does not match incident alert");
+    let Some(incident) = pending(state_dir)? else {
+        anyhow::bail!("no incident to acknowledge")
+    };
+    anyhow::ensure!(
+        incident.message_id == message_id,
+        "ACK does not match incident alert"
+    );
     let path = state_dir.join("security/confirmed-escape.acked");
-    if alert_was_acknowledged(state_dir, message_id)? { return Ok(()); }
+    if alert_was_acknowledged(state_dir, message_id)? {
+        return Ok(());
+    }
     crate::atomic_write(&path, format!("{message_id}\n").as_bytes())?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     fs::File::open(&path)?.sync_all()?;
@@ -164,12 +198,24 @@ pub(crate) fn record_alert_ack(state_dir: &Path, message_id: Uuid) -> Result<()>
 pub(crate) fn alert_event(state_dir: &Path, incident: &PendingIncident) -> Result<TrapEvent> {
     let path = state_dir.join("security/confirmed-escape.json");
     let metadata = fs::symlink_metadata(&path)?;
-    anyhow::ensure!(metadata.file_type().is_file() && metadata.uid() == 0
-        && metadata.permissions().mode() & 0o777 == 0o600, "incident evidence is not private and root-owned");
+    anyhow::ensure!(
+        metadata.file_type().is_file()
+            && metadata.uid() == 0
+            && metadata.permissions().mode() & 0o777 == 0o600,
+        "incident evidence is not private and root-owned"
+    );
     let event: TrapEvent = serde_json::from_slice(&fs::read(&path)?)?;
-    anyhow::ensure!(event.trap_id == incident.trap_id && hf_core::security::confirmed_escape(
-        &event.event_type, &event.service_type, &event.protocol, &event.payload, &event.metadata),
-        "incident evidence does not match confirmed marker");
+    anyhow::ensure!(
+        event.trap_id == incident.trap_id
+            && hf_core::security::confirmed_escape(
+                &event.event_type,
+                &event.service_type,
+                &event.protocol,
+                &event.payload,
+                &event.metadata
+            ),
+        "incident evidence does not match confirmed marker"
+    );
     Ok(event)
 }
 
@@ -183,7 +229,11 @@ fn parse_marker(content: &str) -> Result<PendingIncident> {
         _ => anyhow::bail!("invalid incident response state"),
     };
     anyhow::ensure!(lines.next().is_none(), "unexpected incident marker content");
-    Ok(PendingIncident { trap_id, message_id, response_armed })
+    Ok(PendingIncident {
+        trap_id,
+        message_id,
+        response_armed,
+    })
 }
 
 pub(crate) fn start(state_dir: &Path) -> Result<()> {
@@ -219,15 +269,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hf-emergency-{}", Uuid::new_v4()));
         fs::create_dir(&dir).unwrap();
         let event = TrapEvent {
-            event_id: Uuid::new_v4(), trap_id: Uuid::new_v4(), session_id: None,
-            source_sequence_no: None, occurred_at_unix_ms: 1, event_type: "security.escape_confirmed".into(),
-            source_ip: None, source_port: None, destination_port: None,
-            protocol: "local".into(), service_type: "host_monitor".into(),
+            event_id: Uuid::new_v4(),
+            trap_id: Uuid::new_v4(),
+            session_id: None,
+            source_sequence_no: None,
+            occurred_at_unix_ms: 1,
+            event_type: "security.escape_confirmed".into(),
+            source_ip: None,
+            source_port: None,
+            destination_port: None,
+            protocol: "local".into(),
+            service_type: "host_monitor".into(),
             payload: json!({"pid":123,"start_ticks":456,"boot_id":"10000000-0000-4000-8000-000000000001",
                 "container_id":"a".repeat(64),"cgroup":format!("0::/docker/{}", "a".repeat(64)),
                 "trap_tier":"low","observations":2,
                 "pid_namespace":"pid:[1]","host_pid_namespace":"pid:[1]","container_pid_namespace":"pid:[2]",
-                "mount_namespace":"mnt:[1]","host_mount_namespace":"mnt:[1]","container_mount_namespace":"mnt:[2]"}), metadata: json!({"source":"hf-agent-ebpf","assessment":"confirmed","validation":"two_samples_proc_docker_v2"}),
+                "mount_namespace":"mnt:[1]","host_mount_namespace":"mnt:[1]","container_mount_namespace":"mnt:[2]"}),
+            metadata: json!({"source":"hf-agent-ebpf","assessment":"confirmed","validation":"two_samples_proc_docker_v2"}),
         };
         let message_id = Uuid::new_v4();
         let mut ordinary = event.clone();

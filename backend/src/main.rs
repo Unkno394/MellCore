@@ -42,13 +42,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if command == "migrate" {
         let pool = database.ok_or("DATABASE_URL is required")?;
-        storage::MIGRATOR
-            .run(&pool)
-            .await
-            .map_err(|error| {
-                tracing::error!(%error, "PostgreSQL migration failed");
-                "migration failed; inspect schema and permissions"
-            })?;
+        storage::MIGRATOR.run(&pool).await.map_err(|error| {
+            tracing::error!(%error, "PostgreSQL migration failed");
+            "migration failed; inspect schema and permissions"
+        })?;
         tracing::info!("PostgreSQL migrations applied");
         pool.close().await;
         return Ok(());

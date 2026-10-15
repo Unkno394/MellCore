@@ -127,21 +127,26 @@ export default function Infrastructure(props: Props) {
       setSelectedServer(server.server_id)
       return
     }
-    const canUninstall = presence[server.server_id]?.can_uninstall === true
-    const warning = canUninstall
+    const serverPresence = presence[server.server_id]
+    const canUninstall = serverPresence?.can_uninstall === true
+    const heartbeatAge = serverPresence?.last_heartbeat_age_ms
+    const uninstallLikely = canUninstall && heartbeatAge != null && heartbeatAge < 20_000
+    const warning = uninstallLikely
       ? 'Агент на связи получит команду самоудаления.'
-      : 'Доступ агента будет отозван, но локальные файлы на сервере могут остаться.'
+      : 'Доступ агента будет отозван; локальные файлы на сервере могут остаться.'
     if (!window.confirm(`Удалить «${server.name}» из MellCore? ${warning}`)) return
     setBusy(true)
-    props.notify('info', 'Удаление сервера', 'Отзываю доступ агента и удаляю запись из Центра…')
+    props.notify('info', 'Удаление сервера', 'Отправляю команду самоудаления агенту и отзываю его доступ…')
     try {
       const result = await props.api.servers.delete(server.server_id)
       if (result.remote_cleanup === 'scheduled') {
-        props.notify('success', 'Сервер удалён', 'Агент подтвердил самоудаление. Доступ отозван, локальная очистка выполняется.')
+        props.notify('success', 'Сервер удалён', 'Агент принял команду самоудаления. Доступ отозван, локальная очистка запланирована примерно через 45 секунд.')
       } else if (result.remote_cleanup === 'unreachable') {
         props.notify('info', 'Запись удалена, агент недоступен', 'Доступ отозван. Агент не был на связи: его файлы на сервере нужно удалить вручную.')
       } else if (result.remote_cleanup === 'unsupported') {
         props.notify('info', 'Запись удалена', 'Доступ отозван. На сервере старая версия агента: его файлы нужно удалить вручную.')
+      } else if (result.remote_cleanup === 'unconfirmed') {
+        props.notify('info', 'Запись удалена, очистка не подтверждена', 'Доступ агента отозван и запись удалена. Агент не подтвердил самоудаление; при необходимости удалите локальные файлы агента вручную.')
       } else {
         props.notify('success', 'Сервер удалён', 'Запись удалена. Зарегистрированного агента у этого сервера не было.')
       }
@@ -158,12 +163,12 @@ export default function Infrastructure(props: Props) {
     setBusy(true)
     props.notify('info', 'Удаление записей', `Удаляю неудачные подключения: ${failedServers.length}.`)
     let removed = 0
-    let unreachable = 0
+    let cleanupWarnings = 0
     let failure: string | null = null
     for (const server of failedServers) {
       try {
         const result = await props.api.servers.delete(server.server_id)
-        if (result.remote_cleanup === 'unreachable') unreachable += 1
+        if (['unreachable', 'unsupported', 'unconfirmed'].includes(result.remote_cleanup)) cleanupWarnings += 1
         removed += 1
       } catch (error) {
         failure = `Удалено ${removed} из ${failedServers.length}. «${server.name}»: ${apiErrorMessage(error)}`
@@ -172,8 +177,8 @@ export default function Infrastructure(props: Props) {
     }
     if (failure) {
       props.notify('error', 'Не все записи удалены', failure)
-    } else if (unreachable > 0) {
-      props.notify('info', 'Записи удалены, агенты недоступны', `Удалено записей: ${removed}. У ${unreachable} недоступных агентов локальные файлы нужно удалить вручную.`)
+    } else if (cleanupWarnings > 0) {
+      props.notify('info', 'Записи удалены, очистка не подтверждена', `Удалено записей: ${removed}. Для ${cleanupWarnings} агентов проверьте локальные файлы и при необходимости удалите их вручную.`)
     } else {
       props.notify('success', 'Записи удалены', `Удалено записей: ${removed} из ${failedServers.length}.`)
     }

@@ -14,10 +14,18 @@ pub(crate) enum TrapTier {
 /// Decision about an observed host syscall. These are audit decisions, not
 /// proof that a container crossed into the host namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ActionDecision { Allowed, Alert, IsolateTrap }
+pub(crate) enum ActionDecision {
+    Allowed,
+    Alert,
+    IsolateTrap,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Operation { Execute, Open, Connect }
+pub(crate) enum Operation {
+    Execute,
+    Open,
+    Connect,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct ObservedAction<'a> {
@@ -29,16 +37,35 @@ pub(crate) struct ObservedAction<'a> {
 }
 
 pub(crate) fn evaluate(action: ObservedAction<'_>) -> ActionDecision {
-    if !action.inside_trap { return ActionDecision::Alert; }
+    if !action.inside_trap {
+        return ActionDecision::Alert;
+    }
     match action.operation {
-        Operation::Execute if action.tier.allowed_executable(action.resource) => ActionDecision::Allowed,
+        Operation::Execute if action.tier.allowed_executable(action.resource) => {
+            ActionDecision::Allowed
+        }
         Operation::Execute => ActionDecision::Alert,
         Operation::Open if hf_core::security::container_runtime_socket(action.resource) => {
-            if action.succeeded { ActionDecision::IsolateTrap } else { ActionDecision::Alert }
+            if action.succeeded {
+                ActionDecision::IsolateTrap
+            } else {
+                ActionDecision::Alert
+            }
         }
-        Operation::Open if action.resource.starts_with("/host/")
-            || matches!(action.resource, "/etc/shadow" | "/etc/passwd" | "/proc/1/root"
-                | "/proc/1/ns/pid" | "/proc/1/ns/mnt" | "/var/lib/docker") => ActionDecision::Alert,
+        Operation::Open
+            if action.resource.starts_with("/host/")
+                || matches!(
+                    action.resource,
+                    "/etc/shadow"
+                        | "/etc/passwd"
+                        | "/proc/1/root"
+                        | "/proc/1/ns/pid"
+                        | "/proc/1/ns/mnt"
+                        | "/var/lib/docker"
+                ) =>
+        {
+            ActionDecision::Alert
+        }
         // The honeypots are inbound listeners. Outbound attempts need review,
         // but a connection alone is not proof of host compromise.
         Operation::Connect if action.succeeded => ActionDecision::Alert,
@@ -47,14 +74,18 @@ pub(crate) fn evaluate(action: ObservedAction<'_>) -> ActionDecision {
 }
 
 pub(crate) fn dangerous_configuration(reason: &str) -> bool {
-    matches!(reason,
-        "privileged mode is enabled" | "host PID namespace is enabled"
-        | "host network namespace is enabled" | "host IPC namespace is enabled"
-        | "host user or cgroup namespace is explicitly shared"
-        | "namespace sharing with another container is forbidden"
-        | "additional capabilities or device access are forbidden"
-        | "unconfined seccomp or LSM profile is forbidden"
-        | "mount set differs from the tier allowlist")
+    matches!(
+        reason,
+        "privileged mode is enabled"
+            | "host PID namespace is enabled"
+            | "host network namespace is enabled"
+            | "host IPC namespace is enabled"
+            | "host user or cgroup namespace is explicitly shared"
+            | "namespace sharing with another container is forbidden"
+            | "additional capabilities or device access are forbidden"
+            | "unconfined seccomp or LSM profile is forbidden"
+            | "mount set differs from the tier allowlist"
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -133,7 +164,11 @@ pub(crate) fn violations(
     let shared_identity_path = std::fs::read(project_dir.join("manifest.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|manifest| manifest["ssh_identity_path"].as_str().map(std::path::PathBuf::from));
+        .and_then(|manifest| {
+            manifest["ssh_identity_path"]
+                .as_str()
+                .map(std::path::PathBuf::from)
+        });
     let identity_root = project_dir
         .parent()
         .and_then(std::path::Path::parent)
@@ -144,8 +179,7 @@ pub(crate) fn violations(
             && path
                 .file_name()
                 .is_some_and(|name| name.to_str() == Some("host_ed25519"))
-            && std::fs::symlink_metadata(path)
-                .is_ok_and(|metadata| metadata.file_type().is_file())
+            && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
     });
     let low_uses_persistent_host_key = tier == TrapTier::Low
         && std::fs::read(project_dir.join("config.json"))
@@ -204,16 +238,28 @@ pub(crate) fn violations(
         }
     }
 
-    if host["Privileged"].as_bool() != Some(false) { result.push("privileged mode is enabled"); }
-    if host["PidMode"].as_str() == Some("host") { result.push("host PID namespace is enabled"); }
-    if host["NetworkMode"].as_str() == Some("host") { result.push("host network namespace is enabled"); }
-    if host["IpcMode"].as_str() == Some("host") { result.push("host IPC namespace is enabled"); }
+    if host["Privileged"].as_bool() != Some(false) {
+        result.push("privileged mode is enabled");
+    }
+    if host["PidMode"].as_str() == Some("host") {
+        result.push("host PID namespace is enabled");
+    }
+    if host["NetworkMode"].as_str() == Some("host") {
+        result.push("host network namespace is enabled");
+    }
+    if host["IpcMode"].as_str() == Some("host") {
+        result.push("host IPC namespace is enabled");
+    }
     for field in ["PidMode", "IpcMode", "NetworkMode"] {
-        if host[field].as_str().is_some_and(|v| v.starts_with("container:")) {
+        if host[field]
+            .as_str()
+            .is_some_and(|v| v.starts_with("container:"))
+        {
             result.push("namespace sharing with another container is forbidden");
         }
     }
-    if host["UsernsMode"].as_str() == Some("host") || host["CgroupnsMode"].as_str() == Some("host") {
+    if host["UsernsMode"].as_str() == Some("host") || host["CgroupnsMode"].as_str() == Some("host")
+    {
         result.push("host user or cgroup namespace is explicitly shared");
     }
     for field in ["CapAdd", "Devices", "DeviceRequests", "DeviceCgroupRules"] {
@@ -221,8 +267,10 @@ pub(crate) fn violations(
             result.push("additional capabilities or device access are forbidden");
         }
     }
-    if host["SecurityOpt"].as_array().is_some_and(|opts| opts.iter().any(|v|
-        v.as_str().is_some_and(|v| v.contains("unconfined")))) {
+    if host["SecurityOpt"].as_array().is_some_and(|opts| {
+        opts.iter()
+            .any(|v| v.as_str().is_some_and(|v| v.contains("unconfined")))
+    }) {
         result.push("unconfined seccomp or LSM profile is forbidden");
     }
     if tier == TrapTier::Low
@@ -294,11 +342,17 @@ pub(crate) fn violations(
             for (destination, writable, expected_source) in &expected_mounts {
                 let valid = mounts.iter().any(|mount| {
                     let source = mount["Source"].as_str().unwrap_or("");
-                    let destination_ok = mount["Destination"].as_str() == Some(destination.as_str());
+                    let destination_ok =
+                        mount["Destination"].as_str() == Some(destination.as_str());
                     let write_ok = mount["RW"].as_bool() == Some(*writable);
                     let source_ok = source == expected_source.as_str();
-                    let propagation_ok = matches!(mount["Propagation"].as_str(), Some("rprivate" | "private"));
-                    destination_ok && write_ok && source_ok && propagation_ok && mount["Type"] == "bind"
+                    let propagation_ok =
+                        matches!(mount["Propagation"].as_str(), Some("rprivate" | "private"));
+                    destination_ok
+                        && write_ok
+                        && source_ok
+                        && propagation_ok
+                        && mount["Type"] == "bind"
                 });
                 if !valid {
                     result.push("mount set differs from the tier allowlist");
@@ -374,8 +428,13 @@ mod tests {
 
     #[test]
     fn resource_action_outcome_and_environment_change_the_decision() {
-        let mut action = ObservedAction { tier: TrapTier::Middle, operation: Operation::Open,
-            resource: "/run/docker.sock", succeeded: false, inside_trap: true };
+        let mut action = ObservedAction {
+            tier: TrapTier::Middle,
+            operation: Operation::Open,
+            resource: "/run/docker.sock",
+            succeeded: false,
+            inside_trap: true,
+        };
         assert_eq!(evaluate(action), ActionDecision::Alert);
         action.succeeded = true;
         assert_eq!(evaluate(action), ActionDecision::IsolateTrap);
@@ -392,10 +451,19 @@ mod tests {
 
     #[test]
     fn all_known_runtime_sockets_are_alerted_or_isolated_by_result() {
-        for path in ["/run/docker.sock", "/var/run/containerd/containerd.sock",
-            "/run/podman/podman.sock", "/var/run/crio/crio.sock"] {
-            let mut action = ObservedAction { tier: TrapTier::Low, operation: Operation::Open,
-                resource: path, succeeded: false, inside_trap: true };
+        for path in [
+            "/run/docker.sock",
+            "/var/run/containerd/containerd.sock",
+            "/run/podman/podman.sock",
+            "/var/run/crio/crio.sock",
+        ] {
+            let mut action = ObservedAction {
+                tier: TrapTier::Low,
+                operation: Operation::Open,
+                resource: path,
+                succeeded: false,
+                inside_trap: true,
+            };
             assert_eq!(evaluate(action), ActionDecision::Alert, "{path}");
             action.succeeded = true;
             assert_eq!(evaluate(action), ActionDecision::IsolateTrap, "{path}");
@@ -456,7 +524,8 @@ mod tests {
         assert!(violations(TrapTier::Low, &inspect, &root).is_empty());
         let mut hostile = inspect.clone();
         hostile["HostConfig"]["CapAdd"] = json!(["SYS_ADMIN"]);
-        hostile["HostConfig"]["SecurityOpt"] = json!(["no-new-privileges:true", "seccomp=unconfined"]);
+        hostile["HostConfig"]["SecurityOpt"] =
+            json!(["no-new-privileges:true", "seccomp=unconfined"]);
         hostile["Mounts"][0]["Source"] = json!(root.to_string_lossy());
         assert!(violations(TrapTier::Low, &hostile, &root).len() >= 3);
         std::fs::remove_dir_all(root).unwrap();

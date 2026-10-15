@@ -20,7 +20,9 @@ Middle компилируется внутри Rust Bookworm stage, а скри�
 
 Чтобы применить эти готовые бинарники на агенте без повторной компиляции Rust,
 передайте туда `hf-agent`, `honeyforge-low`, `pritvoryashka`,
-`honeypots/pritvoryashka/docker-entrypoint.sh` и `update-honeypot-binaries-on-agent.sh`.
+`honeypots/pritvoryashka/docker-entrypoint.sh`,
+`honeypots/pritvoryashka/config-schema-probe.json` и
+`update-honeypot-binaries-on-agent.sh`.
 На агенте выполните от root:
 
 ```sh
@@ -28,10 +30,28 @@ bash /tmp/hf-honeypot-update/update-honeypot-binaries-on-agent.sh /tmp/hf-honeyp
 ```
 
 Скрипт проверит запуск нового `hf-agent`, упакует honeypot-бинарники в runtime-образы с тегами `honeyforge-low:local` и
-`honeyforge-pritvoryashka:local`, проверит Middle на GLIBC Bookworm и пользователя Low
+`honeyforge-pritvoryashka:local`, проверит Middle на GLIBC Trixie и пользователя Low
 `65532:65532`, сохранит прежние образы под rollback-тегами и пересоздаст найденные
 Low/Middle контейнеры через Compose. Затем заменит `hf-agent` атомарно и перезапустит его.
 После пересоздания он выведет `docker ps`, свежие логи ловушек и состояние с журналом агента.
+
+## Только Middle: обновление схемы приманок
+
+Если агент уже записывает `baits` и `virtual_processes` в
+`pritvoryashka.json`, Middle image тоже должен содержать актуальный бинарник.
+Соберите отдельный Cargo-артефакт:
+
+```sh
+bash /root/MellCore/deploy/vps/build-middle-binary-update.sh
+```
+
+Перенесите созданный архив на проблемный сервер агента, распакуйте и запустите
+`update-middle-from-binary-on-agent.sh` из каталога пакета от root. Скрипт соберёт
+runtime image на агенте, прогонит конфиг-пробу с непустыми `baits` и
+`virtual_processes`, сохранит старый image под rollback-тегом и пересоздаст только
+Middle-контейнеры. Если проба или запуск контейнера не пройдут, старый image будет
+возвращён. `check-middle-image.sh` и `update-honeypot-binaries-on-agent.sh` также
+проверяют эту схему, чтобы несовместимая версия не прошла установку.
 
 Если нужно пересобрать все компоненты, кроме Middle, передайте текущий архив Middle:
 

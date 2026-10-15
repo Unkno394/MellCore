@@ -4,11 +4,15 @@
 //! matching `message_id`; a failed transport leaves the original bytes available
 //! for retry. Inbound commands deliberately do not use this database.
 
-use std::{fs, path::Path, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    fs,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use kazik_protocol::{
-    DurableOutbox, KazikBody, KazikEnvelope, MAX_TELEMETRY_BATCH_EVENTS,
-    MAX_TELEMETRY_BATCH_WAIT, MAX_TELEMETRY_PACKET_BYTES,
+    DurableOutbox, KazikBody, KazikEnvelope, MAX_TELEMETRY_BATCH_EVENTS, MAX_TELEMETRY_BATCH_WAIT,
+    MAX_TELEMETRY_PACKET_BYTES,
 };
 use rusqlite::{Connection, params};
 use thiserror::Error;
@@ -79,34 +83,84 @@ impl SqliteKazikOutbox {
         )?;
         let has_priority = {
             let mut statement = connection.prepare("PRAGMA table_info(kazik_outbox)")?;
-            let columns = statement.query_map([], |row| row.get::<_, String>(1))?
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
                 .collect::<Result<Vec<_>, _>>()?;
             columns.iter().any(|name| name == "priority")
         };
         if !has_priority {
-            connection.execute("ALTER TABLE kazik_outbox ADD COLUMN priority INTEGER NOT NULL DEFAULT 0", [])?;
+            connection.execute(
+                "ALTER TABLE kazik_outbox ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         let columns = {
             let mut statement = connection.prepare("PRAGMA table_info(kazik_outbox)")?;
-            statement.query_map([], |row| row.get::<_, String>(1))?
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
                 .collect::<Result<Vec<_>, _>>()?
         };
         if !columns.iter().any(|name| name == "batchable") {
-            connection.execute("ALTER TABLE kazik_outbox ADD COLUMN batchable INTEGER NOT NULL DEFAULT 0", [])?;
+            connection.execute(
+                "ALTER TABLE kazik_outbox ADD COLUMN batchable INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         if !columns.iter().any(|name| name == "batched_by") {
             connection.execute("ALTER TABLE kazik_outbox ADD COLUMN batched_by TEXT", [])?;
         }
         connection.execute(
             "CREATE INDEX IF NOT EXISTS kazik_outbox_batchable_idx
-             ON kazik_outbox(batchable, batched_by, created_at_unix_ms)", [],
+             ON kazik_outbox(batchable, batched_by, created_at_unix_ms)",
+            [],
         )?;
-        Ok(Self { connection })
+        let mut outbox = Self { connection };
+        outbox.promote_pending_acknowledgements()?;
+        Ok(outbox)
+    }
+
+    /// Old agent versions stored command ACKs with ordinary telemetry priority.
+    /// Recover them on startup without changing their bytes or assigned HFSP sequence.
+    fn promote_pending_acknowledgements(&mut self) -> Result<(), SqliteOutboxError> {
+        let transaction = self.connection.transaction()?;
+        let acknowledgements = {
+            let mut statement = transaction.prepare(
+                "SELECT message_id, envelope_json FROM kazik_outbox
+                 WHERE priority < 3 AND batched_by IS NULL AND batchable = 0",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (message_id, bytes) in acknowledgements {
+            if matches!(Self::decode(&bytes)?.body, KazikBody::Ack(_)) {
+                transaction.execute(
+                    "UPDATE kazik_outbox SET priority=3 WHERE message_id=?1",
+                    [message_id],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Scheduling priority never changes immutable bytes or an assigned sequence.
     pub fn prioritize(&mut self, message_id: Uuid) -> Result<(), SqliteOutboxError> {
-        self.connection.execute("UPDATE kazik_outbox SET priority=1 WHERE message_id=?1", [message_id.to_string()])?;
+        self.connection.execute(
+            "UPDATE kazik_outbox SET priority=1 WHERE message_id=?1",
+            [message_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Command results take precedence over heartbeats, alerts and ordinary telemetry.
+    pub fn prioritize_acknowledgement(&mut self, message_id: Uuid) -> Result<(), SqliteOutboxError> {
+        self.connection.execute(
+            "UPDATE kazik_outbox SET priority=3 WHERE message_id=?1",
+            [message_id.to_string()],
+        )?;
         Ok(())
     }
 
@@ -119,7 +173,11 @@ impl SqliteKazikOutbox {
         transaction.execute(
             "INSERT INTO kazik_outbox (message_id, envelope_json, created_at_unix_ms, priority)
              VALUES (?1, ?2, ?3, 2)",
-            params![envelope.message_id.to_string(), bytes, envelope.sent_at_unix_ms],
+            params![
+                envelope.message_id.to_string(),
+                bytes,
+                envelope.sent_at_unix_ms
+            ],
         )?;
         transaction.commit()?;
         Ok(())
@@ -152,15 +210,26 @@ impl SqliteKazikOutbox {
             "INSERT OR IGNORE INTO kazik_outbox
              (message_id, envelope_json, created_at_unix_ms, batchable)
              VALUES (?1, ?2, ?3, ?4)",
-            params![envelope.message_id.to_string(), &bytes, envelope.sent_at_unix_ms, batchable],
+            params![
+                envelope.message_id.to_string(),
+                &bytes,
+                envelope.sent_at_unix_ms,
+                batchable
+            ],
         )?;
-        if inserted == 1 { return Ok(()); }
+        if inserted == 1 {
+            return Ok(());
+        }
         let existing: Vec<u8> = self.connection.query_row(
             "SELECT envelope_json FROM kazik_outbox WHERE message_id=?1",
-            [envelope.message_id.to_string()], |row| row.get(0),
+            [envelope.message_id.to_string()],
+            |row| row.get(0),
         )?;
-        if existing == bytes { Ok(()) }
-        else { Err(SqliteOutboxError::ConflictingMessage(envelope.message_id)) }
+        if existing == bytes {
+            Ok(())
+        } else {
+            Err(SqliteOutboxError::ConflictingMessage(envelope.message_id))
+        }
     }
 
     /// Joins queued ordinary telemetry into a stable outbox envelope once it reaches the
@@ -168,7 +237,8 @@ impl SqliteKazikOutbox {
     /// mapping are committed together, so a restart retries identical bytes and ACK removes
     /// every source row atomically.
     fn prepare_telemetry_batch(&mut self) -> Result<(), SqliteOutboxError> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map_err(|error| SqliteOutboxError::Serialization(error.to_string()))?
             .as_millis() as i64;
         let transaction = self.connection.transaction()?;
@@ -178,23 +248,37 @@ impl SqliteKazikOutbox {
                  WHERE batchable=1 AND batched_by IS NULL AND priority=0
                  ORDER BY created_at_unix_ms,rowid LIMIT 128",
             )?;
-            statement.query_map([], |row| Ok((
-                row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?,
-            )))?.collect::<Result<Vec<_>, _>>()?
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
         };
-        if rows.is_empty() { transaction.commit()?; return Ok(()); }
-        let timed_out = now.saturating_sub(rows[0].2) >= MAX_TELEMETRY_BATCH_WAIT.as_millis() as i64;
+        if rows.is_empty() {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let timed_out =
+            now.saturating_sub(rows[0].2) >= MAX_TELEMETRY_BATCH_WAIT.as_millis() as i64;
         let mut selected_ids = Vec::new();
         let mut selected_events = Vec::new();
         let mut identity: Option<(uuid::Uuid, String)> = None;
         let mut due_to_size = false;
         for (message_id, bytes, _) in &rows {
             let source = Self::decode(bytes)?;
-            let KazikBody::Telemetry { events } = source.body else { continue; };
-            if events.is_empty() { continue; }
-            if identity.as_ref().is_some_and(|(agent, credential)|
-                *agent != source.agent_id || credential != &source.transport_credential)
-            {
+            let KazikBody::Telemetry { events } = source.body else {
+                continue;
+            };
+            if events.is_empty() {
+                continue;
+            }
+            if identity.as_ref().is_some_and(|(agent, credential)| {
+                *agent != source.agent_id || credential != &source.transport_credential
+            }) {
                 break;
             }
             let mut candidate_events = selected_events.clone();
@@ -204,11 +288,17 @@ impl SqliteKazikOutbox {
                 break;
             }
             let candidate = KazikEnvelope::new(
-                source.agent_id, source.transport_credential.clone(), now,
-                KazikBody::Telemetry { events: candidate_events.clone() },
+                source.agent_id,
+                source.transport_credential.clone(),
+                now,
+                KazikBody::Telemetry {
+                    events: candidate_events.clone(),
+                },
             );
-            let packet_size = candidate.encode_hfsp(0, 0)
-                .map_err(|error| SqliteOutboxError::Serialization(error.to_string()))?.len();
+            let packet_size = candidate
+                .encode_hfsp(0, 0)
+                .map_err(|error| SqliteOutboxError::Serialization(error.to_string()))?
+                .len();
             if packet_size > MAX_TELEMETRY_PACKET_BYTES {
                 due_to_size = true;
                 break;
@@ -216,7 +306,9 @@ impl SqliteKazikOutbox {
             identity.get_or_insert_with(|| (source.agent_id, source.transport_credential.clone()));
             selected_ids.push(message_id.clone());
             selected_events = candidate_events;
-            if selected_events.len() == MAX_TELEMETRY_BATCH_EVENTS { break; }
+            if selected_events.len() == MAX_TELEMETRY_BATCH_EVENTS {
+                break;
+            }
         }
         let due = timed_out || due_to_size || selected_events.len() >= MAX_TELEMETRY_BATCH_EVENTS;
         if !due || selected_ids.is_empty() {
@@ -225,12 +317,20 @@ impl SqliteKazikOutbox {
         }
         let (agent_id, credential) = identity.expect("selected telemetry has an identity");
         let batch = KazikEnvelope::new(
-            agent_id, credential, now, KazikBody::Telemetry { events: selected_events },
+            agent_id,
+            credential,
+            now,
+            KazikBody::Telemetry {
+                events: selected_events,
+            },
         );
-        let packet = batch.encode_hfsp(0, 0)
+        let packet = batch
+            .encode_hfsp(0, 0)
             .map_err(|error| SqliteOutboxError::Serialization(error.to_string()))?;
         if packet.len() > MAX_TELEMETRY_PACKET_BYTES {
-            return Err(SqliteOutboxError::Serialization("telemetry batch exceeds packet limit".into()));
+            return Err(SqliteOutboxError::Serialization(
+                "telemetry batch exceeds packet limit".into(),
+            ));
         }
         let batch_id = batch.message_id;
         let encoded = Self::encode(&batch)?;
@@ -339,8 +439,14 @@ impl DurableOutbox for SqliteKazikOutbox {
 
     fn acknowledge(&mut self, message_id: Uuid) -> Result<(), Self::Error> {
         let transaction = self.connection.transaction()?;
-        transaction.execute("DELETE FROM kazik_outbox WHERE batched_by=?1", [message_id.to_string()])?;
-        transaction.execute("DELETE FROM kazik_outbox WHERE message_id=?1", [message_id.to_string()])?;
+        transaction.execute(
+            "DELETE FROM kazik_outbox WHERE batched_by=?1",
+            [message_id.to_string()],
+        )?;
+        transaction.execute(
+            "DELETE FROM kazik_outbox WHERE message_id=?1",
+            [message_id.to_string()],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -371,7 +477,7 @@ pub async fn send_pending_once(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kazik_protocol::{AgentStatus, KazikBody, TrapEvent};
+    use kazik_protocol::{AckDisposition, Acknowledgement, AgentStatus, KazikBody, TrapEvent};
 
     fn heartbeat() -> KazikEnvelope {
         KazikEnvelope::new(
@@ -389,13 +495,46 @@ mod tests {
     }
 
     #[test]
+    fn reopening_old_outbox_promotes_persisted_command_ack() {
+        let path = std::env::temp_dir().join(format!("hf-old-ack-{}.sqlite", Uuid::new_v4()));
+        let mut outbox = SqliteKazikOutbox::open(&path).unwrap();
+        for _ in 0..70 {
+            outbox.enqueue(heartbeat()).unwrap();
+        }
+        let command_id = Uuid::new_v4();
+        let acknowledgement = KazikEnvelope::new(
+            Uuid::new_v4(),
+            "test-credential",
+            200,
+            KazikBody::Ack(Acknowledgement {
+                acknowledged_message_id: command_id,
+                disposition: AckDisposition::Applied,
+                detail: None,
+            }),
+        );
+        outbox.enqueue(acknowledgement.clone()).unwrap();
+        assert_ne!(outbox.ready_to_send(64).unwrap()[0].envelope.message_id, acknowledgement.message_id);
+        drop(outbox);
+        let mut restored = SqliteKazikOutbox::open(&path).unwrap();
+        let ready = restored.ready_to_send(64).unwrap();
+        assert_eq!(ready[0].envelope.message_id, acknowledgement.message_id);
+        restored.acknowledge(acknowledgement.message_id).unwrap();
+        drop(restored);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn priority_survives_restart_without_changing_sequence() {
         let path = std::env::temp_dir().join(format!("hf-priority-{}.sqlite", Uuid::new_v4()));
         let mut outbox = SqliteKazikOutbox::open(&path).unwrap();
-        let old = heartbeat(); let mut alert = heartbeat(); alert.sent_at_unix_ms = 200;
-        outbox.enqueue(old.clone()).unwrap(); outbox.enqueue(alert.clone()).unwrap();
+        let old = heartbeat();
+        let mut alert = heartbeat();
+        alert.sent_at_unix_ms = 200;
+        outbox.enqueue(old.clone()).unwrap();
+        outbox.enqueue(alert.clone()).unwrap();
         let sequence = outbox.ready_to_send(10).unwrap()[1].sequence;
-        outbox.prioritize(alert.message_id).unwrap(); drop(outbox);
+        outbox.prioritize(alert.message_id).unwrap();
+        drop(outbox);
         let mut restored = SqliteKazikOutbox::open(&path).unwrap();
         assert_eq!(restored.pending(1).unwrap()[0].message_id, alert.message_id);
         let ready = restored.ready_to_send(1).unwrap();
@@ -403,7 +542,8 @@ mod tests {
         assert_eq!(ready[0].sequence, sequence);
         restored.acknowledge(alert.message_id).unwrap();
         assert_eq!(restored.pending(1).unwrap()[0].message_id, old.message_id);
-        drop(restored); fs::remove_file(path).unwrap();
+        drop(restored);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -428,26 +568,30 @@ mod tests {
     #[test]
     fn telemetry_batch_survives_restart_and_only_matching_ack_deletes_it() {
         let path = std::env::temp_dir().join(format!("hf-kazik-batch-{}.sqlite", Uuid::new_v4()));
-        let events: Vec<_> = (0..3).map(|sequence| TrapEvent {
-            event_id: Uuid::new_v4(),
-            trap_id: Uuid::new_v4(),
-            session_id: Some(format!("session-{sequence}")),
-            source_sequence_no: Some(sequence),
-            occurred_at_unix_ms: 100 + sequence as i64,
-            event_type: "command.executed".into(),
-            source_ip: None,
-            source_port: None,
-            destination_port: Some(2224),
-            protocol: "tcp".into(),
-            service_type: "ssh".into(),
-            payload: serde_json::json!({"sequence":sequence}),
-            metadata: serde_json::json!({}),
-        }).collect();
+        let events: Vec<_> = (0..3)
+            .map(|sequence| TrapEvent {
+                event_id: Uuid::new_v4(),
+                trap_id: Uuid::new_v4(),
+                session_id: Some(format!("session-{sequence}")),
+                source_sequence_no: Some(sequence),
+                occurred_at_unix_ms: 100 + sequence as i64,
+                event_type: "command.executed".into(),
+                source_ip: None,
+                source_port: None,
+                destination_port: Some(2224),
+                protocol: "tcp".into(),
+                service_type: "ssh".into(),
+                payload: serde_json::json!({"sequence":sequence}),
+                metadata: serde_json::json!({}),
+            })
+            .collect();
         let envelope = KazikEnvelope::new(
             Uuid::new_v4(),
             "test-credential",
             100,
-            KazikBody::Telemetry { events: events.clone() },
+            KazikBody::Telemetry {
+                events: events.clone(),
+            },
         );
         let mut outbox = SqliteKazikOutbox::open(&path).unwrap();
         outbox.enqueue(envelope.clone()).unwrap();
@@ -458,10 +602,17 @@ mod tests {
         let mut restarted = SqliteKazikOutbox::open(&path).unwrap();
         let retried = restarted.ready_to_send(1).unwrap();
         assert_eq!(retried[0].envelope.message_id, envelope.message_id);
-        assert_eq!(retried[0].envelope.encode_hfsp(retried[0].sequence, 0).unwrap(), first_packet);
+        assert_eq!(
+            retried[0]
+                .envelope
+                .encode_hfsp(retried[0].sequence, 0)
+                .unwrap(),
+            first_packet
+        );
         restarted.acknowledge(Uuid::new_v4()).unwrap();
         assert_eq!(restarted.pending(1).unwrap().len(), 1);
-        let KazikBody::Telemetry { events: restored } = &restarted.pending(1).unwrap()[0].body else {
+        let KazikBody::Telemetry { events: restored } = &restarted.pending(1).unwrap()[0].body
+        else {
             panic!("expected telemetry")
         };
         assert_eq!(restored, &events);

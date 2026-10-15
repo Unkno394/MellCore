@@ -57,10 +57,16 @@ async fn documentation_is_disabled_by_default() {
 #[tokio::test]
 async fn server_bootstrap_requires_user_authentication() {
     let response = router(&config(false))
-        .oneshot(Request::builder().method("POST").uri("/api/v1/servers/bootstrap")
-            .header("content-type", "application/json")
-            .body(Body::from("{}")).unwrap())
-        .await.unwrap();
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/servers/bootstrap")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 

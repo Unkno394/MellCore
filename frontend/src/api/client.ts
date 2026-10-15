@@ -27,6 +27,7 @@ export type ApiClientOptions = {
 
 export type ApiRequestOptions = Omit<RequestInit, 'body'> & {
   body?: unknown
+  timeoutMs?: number
 }
 
 const defaultBaseUrl =
@@ -55,8 +56,9 @@ export class ApiClient {
   }
 
   async request<T>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+    const { timeoutMs = this.timeoutMs, ...fetchOptions } = options
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort('timeout'), this.timeoutMs)
+    const timeout = setTimeout(() => controller.abort('timeout'), timeoutMs)
     const abortFromCaller = () => controller.abort(options.signal?.reason)
     options.signal?.addEventListener('abort', abortFromCaller, { once: true })
 
@@ -68,7 +70,7 @@ export class ApiClient {
 
     try {
       const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
-        ...options,
+        ...fetchOptions,
         credentials: options.credentials ?? 'same-origin',
         headers,
         body: options.body === undefined ? undefined : JSON.stringify(options.body),
@@ -138,7 +140,9 @@ export function apiErrorMessage(error: unknown): string {
     case 'mail_unavailable':
       return `Не удалось отправить письмо. Проверьте настройки SMTP. ${logHint}${requestId}`
     case 'database_unavailable':
-      return `MellCore не получил ответ от базы данных или Центра. Повторите попытку. ${logHint}${requestId}`
+      return `База данных MellCore временно не отвечает. Повторите попытку. ${logHint}${requestId}`
+    case 'center_unavailable':
+      return `Центр не подтвердил команду. Проверьте состояние ловушки или сервера и журналы Центра: journalctl -u hf-center -u honeyforge-backend -n 100 --no-pager.${requestId}`
     case 'rate_limited':
       return 'Слишком много запросов. Подождите немного и повторите попытку.'
     case 'internal_error':

@@ -1,7 +1,13 @@
 //! Mirrors the durable Center spool into PostgreSQL's normalized-action and
 //! knowledge-graph pipeline. The cursor advances after a validated commit ACK
 //! or a durable rejection record; rejection never implies ClickHouse delivery.
-use std::{fs::{self, File, OpenOptions}, io::{BufRead, BufReader, Seek, SeekFrom, Write}, os::unix::fs::{OpenOptionsExt, PermissionsExt}, path::{Path, PathBuf}, time::Duration};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, bail};
 use reqwest::Client;
@@ -50,11 +56,15 @@ impl PostgresGraphSink {
         loop {
             let mut line = Vec::new();
             let bytes = reader.read_until(b'\n', &mut line)?;
-            if bytes == 0 || line.last() != Some(&b'\n') { break; }
-            let record: StoredTelemetryEvent = serde_json::from_slice(&line).context("parse Center spool event")?;
+            if bytes == 0 || line.last() != Some(&b'\n') {
+                break;
+            }
+            let record: StoredTelemetryEvent =
+                serde_json::from_slice(&line).context("parse Center spool event")?;
             let event = &record.event;
-            let occurred_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(event.occurred_at_unix_ms)
-                .context("event timestamp is outside chrono range")?;
+            let occurred_at =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(event.occurred_at_unix_ms)
+                    .context("event timestamp is outside chrono range")?;
             let payload = json!({
                 "event": {
                     "event_id": event.event_id,
@@ -73,20 +83,35 @@ impl PostgresGraphSink {
                 },
                 "agent_id": record.agent_id,
             });
-            let response = self.client.post(&self.endpoint).bearer_auth(&self.token).json(&payload).send().await?;
+            let response = self
+                .client
+                .post(&self.endpoint)
+                .bearer_auth(&self.token)
+                .json(&payload)
+                .send()
+                .await?;
             let status = response.status().as_u16();
             if status == 202 {
-                let ack: serde_json::Value = response.json().await.context("parse graph commit ACK")?;
-                anyhow::ensure!(valid_ack(&ack, event.event_id), "invalid PostgreSQL graph commit ACK");
+                let ack: serde_json::Value =
+                    response.json().await.context("parse graph commit ACK")?;
+                anyhow::ensure!(
+                    valid_ack(&ack, event.event_id),
+                    "invalid PostgreSQL graph commit ACK"
+                );
             } else if matches!(status, 404 | 409 | 422) {
                 // A missing backend route also returns 404. It is a deployment
                 // failure, not a rejected event, so keep the cursor retryable.
-                let error: serde_json::Value = response.json().await.context("parse backend rejection")?;
+                let error: serde_json::Value =
+                    response.json().await.context("parse backend rejection")?;
                 let expected = match status {
-                    404 => "not_found", 409 => "conflict", _ => "validation_error",
+                    404 => "not_found",
+                    409 => "conflict",
+                    _ => "validation_error",
                 };
-                anyhow::ensure!(error["error"]["code"].as_str() == Some(expected),
-                    "unexpected backend rejection shape; cursor remains retryable");
+                anyhow::ensure!(
+                    error["error"]["code"].as_str() == Some(expected),
+                    "unexpected backend rejection shape; cursor remains retryable"
+                );
                 // Unknown traps/conflicting/invalid events must be reviewable and replayable.
                 // The original spool and this rejection record retain the complete event.
                 retain_rejection(spool_path, next_offset, status, &record)?;
@@ -118,26 +143,54 @@ fn read_offset(path: &Path) -> anyhow::Result<u64> {
 }
 fn write_offset(path: &Path, offset: u64) -> anyhow::Result<()> {
     let temporary = PathBuf::from(format!("{}.tmp", path.display()));
-    let mut options = OpenOptions::new(); options.create(true).truncate(true).write(true).mode(0o600);
-    let mut file = options.open(&temporary)?; writeln!(file, "{offset}")?; file.sync_all()?;
-    fs::rename(temporary, path)?; fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    if let Some(parent) = path.parent() { File::open(parent)?.sync_all()?; }
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true).mode(0o600);
+    let mut file = options.open(&temporary)?;
+    writeln!(file, "{offset}")?;
+    file.sync_all()?;
+    fs::rename(temporary, path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
-
 fn valid_ack(ack: &serde_json::Value, event_id: uuid::Uuid) -> bool {
-    ack["batch_id"].as_str().and_then(|s| s.parse::<uuid::Uuid>().ok()) == Some(event_id)
-        && matches!((ack["accepted_events"].as_u64(), ack["duplicate_events"].as_u64()),
-            (Some(1), Some(0)) | (Some(0), Some(1)))
+    ack["batch_id"]
+        .as_str()
+        .and_then(|s| s.parse::<uuid::Uuid>().ok())
+        == Some(event_id)
+        && matches!(
+            (
+                ack["accepted_events"].as_u64(),
+                ack["duplicate_events"].as_u64()
+            ),
+            (Some(1), Some(0)) | (Some(0), Some(1))
+        )
 }
 
-fn retain_rejection(spool: &Path, offset: u64, status: u16, record: &StoredTelemetryEvent) -> anyhow::Result<()> {
+fn retain_rejection(
+    spool: &Path,
+    offset: u64,
+    status: u16,
+    record: &StoredTelemetryEvent,
+) -> anyhow::Result<()> {
     let path = spool.with_extension("postgres-graph-rejected.jsonl");
-    let mut file = OpenOptions::new().create(true).append(true).mode(0o600).open(&path)?;
-    serde_json::to_writer(&mut file, &json!({"spool_offset":offset,"http_status":status,"record":record}))?;
-    file.write_all(b"\n")?; file.sync_all()?;
-    if let Some(parent) = path.parent() { File::open(parent)?.sync_all()?; }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path)?;
+    serde_json::to_writer(
+        &mut file,
+        &json!({"spool_offset":offset,"http_status":status,"record":record}),
+    )?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -147,9 +200,21 @@ mod tests {
     #[test]
     fn only_matching_single_event_commit_is_an_ack() {
         let id = uuid::Uuid::new_v4();
-        assert!(valid_ack(&json!({"batch_id":id,"accepted_events":1,"duplicate_events":0}),id));
-        assert!(valid_ack(&json!({"batch_id":id,"accepted_events":0,"duplicate_events":1}),id));
-        assert!(!valid_ack(&json!({"batch_id":id,"accepted_events":0,"duplicate_events":0}),id));
-        assert!(!valid_ack(&json!({"batch_id":uuid::Uuid::new_v4(),"accepted_events":1,"duplicate_events":0}),id));
+        assert!(valid_ack(
+            &json!({"batch_id":id,"accepted_events":1,"duplicate_events":0}),
+            id
+        ));
+        assert!(valid_ack(
+            &json!({"batch_id":id,"accepted_events":0,"duplicate_events":1}),
+            id
+        ));
+        assert!(!valid_ack(
+            &json!({"batch_id":id,"accepted_events":0,"duplicate_events":0}),
+            id
+        ));
+        assert!(!valid_ack(
+            &json!({"batch_id":uuid::Uuid::new_v4(),"accepted_events":1,"duplicate_events":0}),
+            id
+        ));
     }
 }

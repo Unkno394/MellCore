@@ -1,0 +1,50 @@
+{
+  "bind": "127.0.0.1:2222",
+  "health_bind": "127.0.0.1:9091",
+  "trap_id": "550e8400-e29b-41d4-a716-446655440000",
+  "server_id": "1d7056ee-e381-41cf-833c-7c1c9e4b8a6b",
+  "agent_id": "2f506e90-273e-485c-8a22-1b38f8c54b16",
+  "hostname": "middle-schema-probe",
+  "host_key": "/__hf_missing_host_key__",
+  "auth": {
+    "policy": "accept_all",
+    "capture": "username",
+    "max_attempts": 6
+  },
+  "telemetry": {
+    "endpoint": null,
+    "token_env": null,
+    "jsonl_path": "/tmp/hf-middle-schema-probe-events.jsonl",
+    "queue_capacity": 1024,
+    "batch_size": 50,
+    "flush_interval_ms": 500,
+    "max_event_bytes": 49152
+  },
+  "max_connections": 128,
+  "idle_timeout_seconds": 600,
+  "max_input_bytes": 8192,
+  "baits": [
+    {
+      "id": "a1a35bdf-32bf-4e21-84d3-5713c5b7e126",
+      "name": "Schema probe",
+      "path": "/home/admin/schema-probe.txt",
+      "content": "probe",
+      "category": "file",
+      "implementation": "virtual_file"
+    }
+  ],
+  "virtual_processes": [
+    {
+      "id": "67032d77-444c-4826-9eef-938e1734cf44",
+      "title": "Schema probe",
+      "category": "process",
+      "implementation": "virtual_process",
+      "name": "schema-probe",
+      "user": "admin",
+      "command": "/usr/bin/schema-probe",
+      "running": true,
+      "listen_port": null,
+      "config": { "protocol": "tcp" }
+    }
+  ]
+}

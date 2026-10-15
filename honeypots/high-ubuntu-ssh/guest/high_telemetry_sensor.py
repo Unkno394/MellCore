@@ -1,8 +1,8 @@
 #!/usr/bin/python3
-"""Minimal one-way High VM telemetry sensor.
+"""Forward guest journal and audit records to the host over a private virtio-serial port.
 
-The process reads OpenSSH journal records and writes bounded, durable JSONL events to the
-virtio-serial port. It accepts only persistence acknowledgements; it has no command handler.
+Records stay in the durable outbox until the host acknowledges persistence. The host has no
+command channel into the guest sensor.
 """
 
 import json
@@ -31,6 +31,8 @@ DIAGNOSTICS = STATE_DIR / "diagnostic-counters.json"
 AUDIT_CURSOR = STATE_DIR / "audit.cursor"
 AUDIT_LOG = Path("/var/log/audit/audit.log")
 MAX_FRAME_BYTES = 16 * 1024
+MAX_LOG_MESSAGE_BYTES = 12 * 1024
+MAX_LOG_PAYLOAD_BYTES = MAX_FRAME_BYTES - 2048
 MAX_OUTBOX_BYTES = 16 * 1024 * 1024
 MAX_OUTBOX_EVENTS = 10_000
 MAX_KNOWN_EVENTS = 20_000
@@ -303,6 +305,40 @@ def stable_journal_event_id(boot_id, cursor, event_type):
     return uuid.uuid5(NAMESPACE, f"{boot_id}:{cursor}:{event_type}")
 
 
+def _bounded_message(value):
+    message = value if isinstance(value, str) else str(value)
+    encoded = message.encode("utf-8", errors="replace")
+    if len(encoded) <= MAX_LOG_MESSAGE_BYTES:
+        return message, False
+    return encoded[:MAX_LOG_MESSAGE_BYTES].decode("utf-8", errors="ignore"), True
+
+
+def _fit_log_payload(payload, message_key, truncated_key):
+    while len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > MAX_LOG_PAYLOAD_BYTES:
+        payload[message_key] = payload[message_key][:len(payload[message_key]) // 2]
+        payload[truncated_key] = True
+    return payload
+
+
+def raw_journal_event(record):
+    message, truncated = _bounded_message(record.get("MESSAGE", ""))
+    fields = (
+        "_SYSTEMD_UNIT", "SYSLOG_IDENTIFIER", "PRIORITY", "_PID", "_UID", "_GID",
+        "_TRANSPORT", "_BOOT_ID", "__CURSOR",
+    )
+    payload = {key: str(record[key])[:128] for key in fields if key in record}
+    payload.update({"message": message, "message_truncated": truncated})
+    _fit_log_payload(payload, "message", "message_truncated")
+    return {
+        "event_type": "guest.journal",
+        "occurred_at_ms": _occurred_at_ms(record),
+        "transport": "local",
+        "event_origin": "systemd_journal",
+        "event_confidence": "observed",
+        "payload": payload,
+    }
+
+
 def _audit_session_for_record(record):
     pid = record.get("_PID") or record.get("SYSLOG_PID")
     if not pid or not str(pid).isdigit():
@@ -330,7 +366,6 @@ def _diagnostic(outbox, boot_id, code, detail):
 
 
 def audit_collector(outbox, boot_id, stop):
-    assembler = AuditAssembler()
     reported_dropped_groups = 0
     unavailable_reported = False
     while not stop.is_set():
@@ -342,6 +377,9 @@ def audit_collector(outbox, boot_id, stop):
             continue
         unavailable_reported = False
         try:
+            # The persisted cursor points to a completed audit group. Replaying from it must
+            # start with a fresh assembler so a prior partial group is not appended twice.
+            assembler = AuditAssembler()
             stat = AUDIT_LOG.stat()
             offset = 0
             if AUDIT_CURSOR.exists():
@@ -351,6 +389,7 @@ def audit_collector(outbox, boot_id, stop):
             with open(AUDIT_LOG, encoding="utf-8", errors="replace") as handle:
                 handle.seek(offset)
                 while not stop.is_set():
+                    line_offset = handle.tell()
                     line = handle.readline()
                     if not line:
                         try:
@@ -361,6 +400,24 @@ def audit_collector(outbox, boot_id, stop):
                             break
                         stop.wait(0.5)
                         continue
+                    message, truncated = _bounded_message(line.rstrip("\n"))
+                    raw_id = uuid.uuid5(
+                        NAMESPACE, f"{boot_id}:audit:{stat.st_dev}:{stat.st_ino}:{line_offset}"
+                    )
+                    if not outbox.enqueue(
+                        raw_id,
+                        "guest.audit",
+                        int(time.time() * 1000),
+                        transport="local",
+                        event_origin="kernel_audit",
+                        event_confidence="observed",
+                        payload=_fit_log_payload(
+                            {"line": message, "line_truncated": truncated},
+                            "line", "line_truncated",
+                        ),
+                    ):
+                        stop.wait(2)
+                        break
                     events = assembler.feed(line)
                     if assembler.dropped_groups > reported_dropped_groups:
                         outbox.record_diagnostic(
@@ -558,11 +615,11 @@ def run():
     heartbeat_worker.start()
 
     cursor = CURSOR.read_text(encoding="utf-8").strip() if CURSOR.exists() else None
-    command = ["journalctl", "--follow", "--output=json", "--unit=ssh.service", "--unit=sshd.service"]
+    command = ["journalctl", "--follow", "--output=json", "--all"]
     if cursor:
         command.append(f"--after-cursor={cursor}")
     else:
-        command.append("--since=-5min")
+        command.append("--boot")
     process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, bufsize=1)
     try:
         for line in process.stdout:
@@ -571,8 +628,19 @@ def run():
             try:
                 record = json.loads(line)
                 record_cursor = record.get("__CURSOR")
+                if record.get("_SYSTEMD_UNIT") == "honeyforge-high-telemetry.service":
+                    if record_cursor:
+                        _atomic_text(CURSOR, record_cursor + "\n")
+                    continue
+                if record_cursor:
+                    raw_id = stable_journal_event_id(boot_id, record_cursor, "guest.journal")
+                    if not outbox.enqueue(raw_id, **raw_journal_event(record)):
+                        break
                 parsed = parse_journal_record(record, boot_id)
-                if parsed and record_cursor:
+                if (
+                    parsed and record_cursor
+                    and record.get("_SYSTEMD_UNIT") in ("ssh.service", "sshd.service")
+                ):
                     audit_session = _audit_session_for_record(record)
                     if audit_session:
                         parsed["session_id"] = audit_session

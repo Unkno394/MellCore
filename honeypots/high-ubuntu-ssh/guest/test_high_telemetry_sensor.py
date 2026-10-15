@@ -40,6 +40,22 @@ class GuestTelemetrySensorTests(unittest.TestCase):
         second = sensor.stable_journal_event_id("boot", "cursor", "ssh.auth.failed")
         self.assertEqual(first, second)
 
+    def test_raw_journal_entry_from_any_unit_fits_channel_frame(self):
+        record = {
+            "MESSAGE": "\\n" * 20_000,
+            "_SYSTEMD_UNIT": "cron.service",
+            "__CURSOR": "cursor",
+            "_SOURCE_REALTIME_TIMESTAMP": "1760000000000000",
+        }
+        raw = sensor.raw_journal_event(record)
+        self.assertEqual(raw["event_type"], "guest.journal")
+        self.assertEqual(raw["payload"]["_SYSTEMD_UNIT"], "cron.service")
+        self.assertTrue(raw["payload"]["message_truncated"])
+        with tempfile.TemporaryDirectory() as directory:
+            outbox = sensor.DurableGuestOutbox(directory)
+            self.assertTrue(outbox.enqueue(uuid.uuid4(), **raw))
+            self.assertLessEqual(len(sensor._encode(outbox.peek())), sensor.MAX_FRAME_BYTES)
+
     def test_outbox_recovers_and_reuses_immutable_event_after_ack(self):
         with tempfile.TemporaryDirectory() as directory:
             event_id = uuid.uuid4()

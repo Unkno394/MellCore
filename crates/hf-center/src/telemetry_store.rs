@@ -66,7 +66,12 @@ impl TelemetryStore {
                 }
             }
         }
-        Ok(Self { path, file, seen, rejected_seen })
+        Ok(Self {
+            path,
+            file,
+            seen,
+            rejected_seen,
+        })
     }
 
     /// Durable quarantine for events whose trap is absent from Center's registry.
@@ -83,10 +88,18 @@ impl TelemetryStore {
         let mut pending = HashSet::new();
         for event in events {
             if self.rejected_seen.contains(&(agent_id, event.event_id))
-                || !pending.insert((agent_id, event.event_id)) { continue; }
-            serde_json::to_writer(&mut file, &StoredTelemetryEvent {
-                agent_id, received_at_unix_ms, event: event.clone(),
-            })?;
+                || !pending.insert((agent_id, event.event_id))
+            {
+                continue;
+            }
+            serde_json::to_writer(
+                &mut file,
+                &StoredTelemetryEvent {
+                    agent_id,
+                    received_at_unix_ms,
+                    event: event.clone(),
+                },
+            )?;
             file.write_all(b"\n")?;
             count += 1;
         }
@@ -173,9 +186,14 @@ mod tests {
 
     #[test]
     fn lost_batch_ack_replay_is_deduplicated_after_restart() {
-        let path = std::env::temp_dir().join(format!("hf-telemetry-batch-{}.jsonl", Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("hf-telemetry-batch-{}.jsonl", Uuid::new_v4()));
         let agent_id = Uuid::new_v4();
-        let batch = vec![event(Uuid::new_v4()), event(Uuid::new_v4()), event(Uuid::new_v4())];
+        let batch = vec![
+            event(Uuid::new_v4()),
+            event(Uuid::new_v4()),
+            event(Uuid::new_v4()),
+        ];
         {
             let mut store = TelemetryStore::open(&path).unwrap();
             assert_eq!(store.persist(agent_id, &batch).unwrap(), batch.len());
@@ -184,7 +202,10 @@ mod tests {
         }
         let mut restarted = TelemetryStore::open(&path).unwrap();
         assert_eq!(restarted.persist(agent_id, &batch).unwrap(), 0);
-        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), batch.len());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().lines().count(),
+            batch.len()
+        );
         fs::remove_file(path).unwrap();
     }
 
@@ -200,7 +221,13 @@ mod tests {
         let mut restored = TelemetryStore::open(&path).unwrap();
         assert_eq!(restored.reject(agent, &[event]).unwrap(), 0);
         assert_eq!(fs::read_to_string(&path).unwrap(), "");
-        assert_eq!(fs::read_to_string(path.with_extension("rejected.jsonl")).unwrap().lines().count(), 1);
+        assert_eq!(
+            fs::read_to_string(path.with_extension("rejected.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
         fs::remove_file(&path).unwrap();
         fs::remove_file(path.with_extension("rejected.jsonl")).unwrap();
     }

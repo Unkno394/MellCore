@@ -4,7 +4,14 @@ use crate::{
     errors::{AppError, RequestId},
     management::{self, User},
 };
-use axum::{Extension, Json, extract::State, http::{HeaderMap, HeaderValue, StatusCode, header::{COOKIE, ORIGIN, SET_COOKIE}}};
+use axum::{
+    Extension, Json,
+    extract::State,
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{COOKIE, ORIGIN, SET_COOKIE},
+    },
+};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -21,14 +28,24 @@ fn refresh_cookie(token: &str) -> HeaderValue {
 }
 
 fn clear_refresh_cookie() -> HeaderValue {
-    HeaderValue::from_static("__Host-mellcore-refresh=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict")
+    HeaderValue::from_static(
+        "__Host-mellcore-refresh=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
+    )
 }
 
 fn cookie_token(headers: &HeaderMap) -> Option<&str> {
-    headers.get_all(COOKIE).iter().filter_map(|value| value.to_str().ok())
+    headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(';'))
         .filter_map(|part| part.trim().split_once('='))
-        .find_map(|(name, value)| (name == REFRESH_COOKIE && value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())).then_some(value))
+        .find_map(|(name, value)| {
+            (name == REFRESH_COOKIE
+                && value.len() == 64
+                && value.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then_some(value)
+        })
 }
 
 fn require_same_origin(headers: &HeaderMap, origin: &str) -> Result<(), AppError> {
@@ -102,22 +119,42 @@ pub async fn change_password(
         return Err(AppError::unauthorized());
     }
     management::password(&input.new_password)?;
-    let old_hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id=$1 AND is_active")
-        .bind(principal.user.id).fetch_optional(state.pool()?).await?.ok_or_else(AppError::unauthorized)?;
-    if !runtime.verify(input.current_password, old_hash.clone()).await? {
+    let old_hash: String =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id=$1 AND is_active")
+            .bind(principal.user.id)
+            .fetch_optional(state.pool()?)
+            .await?
+            .ok_or_else(AppError::unauthorized)?;
+    if !runtime
+        .verify(input.current_password, old_hash.clone())
+        .await?
+    {
         return Err(AppError::unauthorized());
     }
     let new_hash = runtime.hash(input.new_password).await?;
     let mut tx = state.pool()?.begin().await?;
-    let current_hash: Option<String> = sqlx::query_scalar("SELECT password_hash FROM users WHERE id=$1 AND is_active FOR UPDATE")
-        .bind(principal.user.id).fetch_optional(&mut *tx).await?;
+    let current_hash: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id=$1 AND is_active FOR UPDATE")
+            .bind(principal.user.id)
+            .fetch_optional(&mut *tx)
+            .await?;
     if current_hash.as_deref() != Some(old_hash.as_str()) {
         return Err(AppError::unauthorized());
     }
     sqlx::query("UPDATE users SET password_hash=$2,updated_at=now() WHERE id=$1")
-        .bind(principal.user.id).bind(new_hash).execute(&mut *tx).await?;
+        .bind(principal.user.id)
+        .bind(new_hash)
+        .execute(&mut *tx)
+        .await?;
     management::revoke_credentials(&mut tx, principal.user.id).await?;
-    management::audit(&mut tx, principal.user.id, "auth.password_changed", principal.user.id, id.0).await?;
+    management::audit(
+        &mut tx,
+        principal.user.id,
+        "auth.password_changed",
+        principal.user.id,
+        id.0,
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -137,27 +174,52 @@ pub async fn change_email(
     }
     let new_email = management::email(&input.new_email)?;
     if principal.user.email.as_deref() == Some(new_email.as_str()) {
-        return Err(AppError::invalid("New email must differ from the current email"));
+        return Err(AppError::invalid(
+            "New email must differ from the current email",
+        ));
     }
-    let old_hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id=$1 AND is_active")
-        .bind(principal.user.id).fetch_optional(state.pool()?).await?.ok_or_else(AppError::unauthorized)?;
+    let old_hash: String =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id=$1 AND is_active")
+            .bind(principal.user.id)
+            .fetch_optional(state.pool()?)
+            .await?
+            .ok_or_else(AppError::unauthorized)?;
     if !runtime.verify(input.current_password, old_hash).await? {
         return Err(AppError::unauthorized());
     }
     let used: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE email=$1) OR EXISTS(SELECT 1 FROM email_verifications WHERE email=$1 AND user_id<>$2 AND expires_at>now())")
         .bind(&new_email).bind(principal.user.id).fetch_one(state.pool()?).await?;
-    if used { return Err(AppError::conflict("Email address is already in use")); }
+    if used {
+        return Err(AppError::conflict("Email address is already in use"));
+    }
     let recent: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM email_verifications WHERE user_id=$1 AND created_at>now()-interval '1 minute')")
         .bind(principal.user.id).fetch_one(state.pool()?).await?;
-    if recent { return Err(AppError::busy()); }
-    state.email_verifications.as_ref().ok_or_else(AppError::mail_unavailable)?
+    if recent {
+        return Err(AppError::busy());
+    }
+    state
+        .email_verifications
+        .as_ref()
+        .ok_or_else(AppError::mail_unavailable)?
         .enqueue_change(principal.user.id, new_email, id.0)?;
     let mut tx = state.pool()?.begin().await?;
-    management::audit(&mut tx, principal.user.id, "auth.email_change_requested", principal.user.id, id.0).await?;
+    management::audit(
+        &mut tx,
+        principal.user.id,
+        "auth.email_change_requested",
+        principal.user.id,
+        id.0,
+    )
+    .await?;
     tx.commit().await?;
-    Ok((StatusCode::ACCEPTED, Json(EmailChangeAccepted {
-        message: "Подтвердите новый адрес по ссылке из письма. После подтверждения войдите снова.".into(),
-    })))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(EmailChangeAccepted {
+            message:
+                "Подтвердите новый адрес по ссылке из письма. После подтверждения войдите снова."
+                    .into(),
+        }),
+    ))
 }
 
 #[utoipa::path(post, path="/api/v1/auth/register", tag="auth", request_body=RegisterRequest,
@@ -240,32 +302,42 @@ pub async fn login(
     sqlx::query("DELETE FROM access_tokens WHERE id IN (SELECT id FROM access_tokens WHERE user_id=$1 ORDER BY created_at DESC,id OFFSET 9)").bind(user_id).execute(&mut *tx).await?;
     let refresh_token = auth::new_token();
     let refresh_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO refresh_sessions(id,user_id,token_hash,expires_at) VALUES ($1,$2,$3,$4)")
-        .bind(refresh_id).bind(user_id).bind(auth::digest(&refresh_token))
-        .bind(Utc::now() + Duration::seconds(REFRESH_LIFETIME_SECONDS))
-        .execute(&mut *tx).await?;
+    sqlx::query(
+        "INSERT INTO refresh_sessions(id,user_id,token_hash,expires_at) VALUES ($1,$2,$3,$4)",
+    )
+    .bind(refresh_id)
+    .bind(user_id)
+    .bind(auth::digest(&refresh_token))
+    .bind(Utc::now() + Duration::seconds(REFRESH_LIFETIME_SECONDS))
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("DELETE FROM refresh_sessions WHERE id IN (SELECT id FROM refresh_sessions WHERE user_id=$1 ORDER BY created_at DESC,id DESC OFFSET 9)")
         .bind(user_id).execute(&mut *tx).await?;
     let token_id = Uuid::new_v4();
     let expires = Utc::now() + Duration::seconds(state.config.jwt_ttl_seconds);
     let access_token = state.jwt()?.issue(user_id, token_id, expires.timestamp())?;
-    sqlx::query("INSERT INTO access_tokens(id,user_id,expires_at,refresh_session_id) VALUES ($1,$2,$3,$4)")
-        .bind(token_id)
-        .bind(user_id)
-        .bind(expires)
-        .bind(refresh_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO access_tokens(id,user_id,expires_at,refresh_session_id) VALUES ($1,$2,$3,$4)",
+    )
+    .bind(token_id)
+    .bind(user_id)
+    .bind(expires)
+    .bind(refresh_id)
+    .execute(&mut *tx)
+    .await?;
     management::audit(&mut tx, user_id, "auth.login", user_id, id.0).await?;
     tx.commit().await?;
     let mut headers = HeaderMap::new();
     headers.insert(SET_COOKIE, refresh_cookie(&refresh_token));
-    Ok((headers, Json(TokenResponse {
-        user,
-        access_token,
-        token_type: "Bearer".into(),
-        expires_in: state.config.jwt_ttl_seconds,
-    })))
+    Ok((
+        headers,
+        Json(TokenResponse {
+            user,
+            access_token,
+            token_type: "Bearer".into(),
+            expires_in: state.config.jwt_ttl_seconds,
+        }),
+    ))
 }
 
 #[utoipa::path(post, path="/api/v1/auth/refresh", tag="auth",
@@ -291,20 +363,35 @@ pub async fn refresh(
     let token_id = Uuid::new_v4();
     let access_token = state.jwt()?.issue(user_id, token_id, expires.timestamp())?;
     sqlx::query("DELETE FROM access_tokens WHERE user_id=$1 AND expires_at<=now()")
-        .bind(user_id).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO access_tokens(id,user_id,expires_at,refresh_session_id) VALUES ($1,$2,$3,$4)")
-        .bind(token_id).bind(user_id).bind(expires).bind(refresh_id)
-        .execute(&mut *tx).await?;
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO access_tokens(id,user_id,expires_at,refresh_session_id) VALUES ($1,$2,$3,$4)",
+    )
+    .bind(token_id)
+    .bind(user_id)
+    .bind(expires)
+    .bind(refresh_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("UPDATE refresh_sessions SET expires_at=$2 WHERE id=$1")
-        .bind(refresh_id).bind(Utc::now() + Duration::seconds(REFRESH_LIFETIME_SECONDS))
-        .execute(&mut *tx).await?;
+        .bind(refresh_id)
+        .bind(Utc::now() + Duration::seconds(REFRESH_LIFETIME_SECONDS))
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     let mut response_headers = HeaderMap::new();
     response_headers.insert(SET_COOKIE, refresh_cookie(token));
-    Ok((response_headers, Json(TokenResponse {
-        user, access_token, token_type: "Bearer".into(),
-        expires_in: state.config.jwt_ttl_seconds,
-    })))
+    Ok((
+        response_headers,
+        Json(TokenResponse {
+            user,
+            access_token,
+            token_type: "Bearer".into(),
+            expires_in: state.config.jwt_ttl_seconds,
+        }),
+    ))
 }
 
 #[utoipa::path(get,path="/api/v1/auth/me",tag="auth",security(("bearer"=[])),responses((status=200,body=MeResponse),(status=403,body=crate::errors::ErrorResponse),(status=401,body=crate::errors::ErrorResponse)))]
@@ -326,18 +413,26 @@ pub async fn logout(
     let mut tx = state.pool()?.begin().await?;
     if let Some(token) = cookie_token(&headers) {
         let user_id: Option<Uuid> = sqlx::query_scalar(
-            "DELETE FROM refresh_sessions WHERE token_hash=$1 RETURNING user_id"
-        ).bind(auth::digest(token)).fetch_optional(&mut *tx).await?;
+            "DELETE FROM refresh_sessions WHERE token_hash=$1 RETURNING user_id",
+        )
+        .bind(auth::digest(token))
+        .fetch_optional(&mut *tx)
+        .await?;
         if let Some(user_id) = user_id {
             management::audit(&mut tx, user_id, "auth.logout", user_id, id.0).await?;
         }
     }
-    if let Some(value) = headers.get(axum::http::header::AUTHORIZATION).and_then(|h| h.to_str().ok())
+    if let Some(value) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
         && let Some(token) = value.strip_prefix("Bearer ")
         && let Ok(claims) = state.jwt()?.verify(token)
     {
         sqlx::query("DELETE FROM access_tokens WHERE id=$1 AND user_id=$2")
-            .bind(claims.jti).bind(claims.sub).execute(&mut *tx).await?;
+            .bind(claims.jti)
+            .bind(claims.sub)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     let mut response_headers = HeaderMap::new();

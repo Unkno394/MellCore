@@ -74,6 +74,13 @@ impl AppError {
             message: "Database is unavailable",
         }
     }
+    pub fn center_unavailable() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "center_unavailable",
+            message: "Center is unavailable or rejected the command",
+        }
+    }
     pub fn busy() -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -128,6 +135,18 @@ impl From<sqlx::Error> for AppError {
             | sqlx::Error::PoolClosed
             | sqlx::Error::Io(_)
             | sqlx::Error::Tls(_) => Self::unavailable(),
+            sqlx::Error::Database(ref db) => {
+                // PostgreSQL's message and detail can include bound data. Log
+                // only structured diagnostics that identify the failing class
+                // or constraint without exposing query parameters.
+                tracing::error!(
+                    sqlstate = db.code().as_deref().unwrap_or("unknown"),
+                    constraint = ?db.constraint(),
+                    table = ?db.table(),
+                    "database operation failed"
+                );
+                Self::internal()
+            }
             _ => {
                 // Do not log SQLx error text: it can contain bound values/DSNs.
                 tracing::error!("database operation failed");

@@ -33,19 +33,19 @@ use uuid::Uuid;
 
 const AGENT_HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
+mod backend_registry;
 mod clickhouse;
 mod credentials;
-mod postgres_graph_sink;
-mod backend_registry;
 mod ingress_budget;
-mod telemetry_store;
+mod postgres_graph_sink;
 mod security_state;
-use clickhouse::ClickHouseTelemetry;
-use postgres_graph_sink::PostgresGraphSink;
+mod telemetry_store;
 use backend_registry::BackendRegistry;
+use clickhouse::ClickHouseTelemetry;
 use credentials::CredentialStore;
-use telemetry_store::TelemetryStore;
+use postgres_graph_sink::PostgresGraphSink;
 use security_state::{AgentSecurityStore, CompromisedAgent, IsolatedTrap, ResponseTier};
+use telemetry_store::TelemetryStore;
 
 #[derive(Parser)]
 struct Args {
@@ -142,6 +142,8 @@ struct BootstrapRequest {
     ssh_private_key: Option<String>,
     /// Optional passphrase for `ssh_private_key`.
     ssh_key_passphrase: Option<String>,
+    /// Optional sudo password; defaults to the SSH password when one was used.
+    sudo_password: Option<String>,
     /// Optional first trap, deployed by the newly installed agent without a second SSH session.
     initial_high_ubuntu: Option<InitialHighUbuntuRequest>,
 }
@@ -284,6 +286,8 @@ struct AgentPresence {
     connected: bool,
     can_reboot: bool,
     can_uninstall: bool,
+    can_share_tcp_ports: bool,
+    last_heartbeat_age_ms: Option<u64>,
 }
 
 fn default_ssh_port() -> u16 {
@@ -304,21 +308,45 @@ const EXISTING_AGENT_ERROR: &str = "existing HoneyForge agent identity on target
 
 fn bootstrap_failure_message(error: &CoreError) -> &'static str {
     match error {
-        CoreError::Transport(detail) if detail == EXISTING_AGENT_ERROR =>
-            "На сервере уже установлен агент. Используйте существующий сервер в панели или удалите старого агента перед новой установкой.",
+        CoreError::Transport(detail) if detail == EXISTING_AGENT_ERROR => {
+            "На сервере найден файл регистрации /var/lib/honeyforge/identity.json; это не означает, что агент сейчас запущен. Для этого VDS восстановите hf-agent и его службу через существующую карточку сервера, сохранив identity.json. Для новой регистрации сначала отзовите старого агента в Центре и полностью очистите его состояние."
+        }
         CoreError::Transport(detail)
             if detail.starts_with("SSH password authentication failed:")
                 || detail.starts_with("SSH public-key authentication failed:")
                 || detail == "SSH authentication was rejected" =>
-            "SSH-сервер отклонил вход. Проверьте имя пользователя и пароль SSH или приватный ключ; для защищённого ключа укажите его пароль.",
-        CoreError::Transport(detail) if detail.starts_with("SSH TCP connection failed:") =>
-            "Не удалось подключиться к SSH. Проверьте IP-адрес или домен, SSH-порт, сетевой доступ и правила firewall.",
-        CoreError::Transport(detail) if detail.starts_with("SSH handshake failed:") =>
-            "На указанном адресе и порту не удалось установить SSH-соединение. Проверьте адрес и SSH-порт.",
-        CoreError::Transport(detail) if detail.starts_with("remote installer returned exit status") =>
-            "SSH-доступ подтверждён, но установка агента завершилась ошибкой. На целевом сервере проверьте /tmp/hf-agent-bootstrap.log; на сервере MellCore — journalctl -u hf-center -n 100 --no-pager.",
-        _ =>
-            "Не удалось завершить установку агента. Проверьте SSH-доступ; если данные верны, посмотрите journalctl -u hf-center -n 100 --no-pager и /tmp/hf-agent-bootstrap.log на целевом сервере.",
+        {
+            "SSH-сервер отклонил вход. Проверьте имя пользователя и пароль SSH или приватный ключ; для защищённого ключа укажите его пароль."
+        }
+        CoreError::Transport(detail) if detail.starts_with("SSH TCP connection failed:") => {
+            "Не удалось подключиться к SSH. Проверьте IP-адрес или домен, SSH-порт, сетевой доступ и правила firewall."
+        }
+        CoreError::Transport(detail) if detail.starts_with("SSH handshake failed:") => {
+            "На указанном адресе и порту не удалось установить SSH-соединение. Проверьте адрес и SSH-порт."
+        }
+        CoreError::Transport(detail) if detail.starts_with("sudo authentication required") => {
+            "SSH-вход выполнен, но для установки нужны права root. Укажите пароль sudo в форме подключения или используйте пользователя с sudo без пароля."
+        }
+        CoreError::Transport(detail) if detail.starts_with("sudo authentication failed") => {
+            "SSH-вход выполнен, но sudo отклонил пароль или у пользователя нет прав sudo. Проверьте пароль sudo и права пользователя."
+        }
+        CoreError::Transport(detail) if detail.starts_with("agent registration timed out") => {
+            "Служба hf-agent запустилась, но не зарегистрировалась в Центре за 60 секунд. Причина записана на целевом сервере в /tmp/hf-agent-bootstrap.log и journalctl -u hf-agent."
+        }
+        CoreError::Transport(detail)
+            if detail == "installer upload is empty or incomplete on target"
+                || detail == "agent binary upload is empty or incomplete on target" =>
+        {
+            "SSH-вход прошёл, но файл агента или скрипт установки передался на сервер пустым либо не полностью. Агент не устанавливался. Проверьте SSH/SCP на целевом сервере."
+        }
+        CoreError::Transport(detail)
+            if detail.starts_with("remote installer returned exit status") =>
+        {
+            "SSH-доступ подтверждён, но установка агента завершилась ошибкой. На целевом сервере проверьте /tmp/hf-agent-bootstrap.log; на сервере MellCore — journalctl -u hf-center -n 100 --no-pager."
+        }
+        _ => {
+            "Не удалось завершить установку агента. Проверьте SSH-доступ; если данные верны, посмотрите journalctl -u hf-center -n 100 --no-pager и /tmp/hf-agent-bootstrap.log на целевом сервере."
+        }
     }
 }
 
@@ -433,7 +461,9 @@ async fn main() -> anyhow::Result<()> {
         hysteria_auth_budget: Arc::new(Mutex::new((std::time::Instant::now(), 0))),
     };
     if let (Ok(local_id), Ok(local_host)) = (
-        std::env::var("HF_LOCAL_AGENT_ID"), std::env::var("HF_LOCAL_AGENT_TARGET")) {
+        std::env::var("HF_LOCAL_AGENT_ID"),
+        std::env::var("HF_LOCAL_AGENT_TARGET"),
+    ) {
         let local_id: Uuid = local_id.parse()?;
         let mut security = state.agent_security.lock().await;
         if security.target(&local_id).is_none() {
@@ -469,8 +499,13 @@ async fn main() -> anyhow::Result<()> {
                 interval.tick().await;
                 match sink.flush_spool(&spool).await {
                     Ok(0) => {}
-                    Ok(events) => info!(events, "Center graph spool records processed (rejections retained separately)"),
-                    Err(error) => warn!(%error, "PostgreSQL graph ingestion failed; durable Center spool retained"),
+                    Ok(events) => info!(
+                        events,
+                        "Center graph spool records processed (rejections retained separately)"
+                    ),
+                    Err(error) => {
+                        warn!(%error, "PostgreSQL graph ingestion failed; durable Center spool retained")
+                    }
                 }
             }
         });
@@ -484,7 +519,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/agents/bootstrap", post(bootstrap))
         .route("/v1/agents/bootstrap/{job_id}", get(bootstrap_status))
         .route("/v1/agents/register", post(register))
-        .route("/v1/hysteria/auth", post(hysteria_auth).layer(DefaultBodyLimit::max(4096)))
+        .route(
+            "/v1/hysteria/auth",
+            post(hysteria_auth).layer(DefaultBodyLimit::max(4096)),
+        )
         .route("/v1/agents/{agent_id}/commands", post(queue_command))
         .route(
             "/v1/agents/{agent_id}/commands/{message_id}",
@@ -492,7 +530,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/agents/{agent_id}/revoke", post(revoke_agent))
         .route("/v1/agents/{agent_id}/presence", get(agent_presence))
-        .route("/v1/agents/{agent_id}/traps/register", post(register_existing_trap))
+        .route(
+            "/v1/agents/{agent_id}/traps/register",
+            post(register_existing_trap),
+        )
         .route("/v1/agents/compromised", get(list_compromised_agents))
         .route("/v1/traps/isolated", get(list_isolated_traps))
         .with_state(state);
@@ -538,6 +579,9 @@ async fn bootstrap(
         "private_key"
     };
     info!(host = %request.host, port = request.ssh_port, user = %request.ssh_user, authentication, "starting SSH bootstrap");
+    let sudo_password = request
+        .sudo_password
+        .or_else(|| request.ssh_password.clone());
     let auth = match (request.ssh_password, request.ssh_private_key) {
         (Some(password), None) => hf_core::SshAuthentication::Password(password),
         (None, Some(pem)) => hf_core::SshAuthentication::PrivateKey {
@@ -547,7 +591,13 @@ async fn bootstrap(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
     let agent_id = Uuid::new_v4();
-    if let Err(error) = state.agent_security.lock().await.set_target(agent_id, target, request.ssh_port) {
+    if let Err(error) =
+        state
+            .agent_security
+            .lock()
+            .await
+            .set_target(agent_id, target, request.ssh_port)
+    {
         tracing::error!(%error, %agent_id, "could not persist target host for new agent");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -578,6 +628,7 @@ async fn bootstrap(
         port: request.ssh_port,
         user: request.ssh_user,
         auth,
+        sudo_password,
     };
     state
         .enrollment_tokens
@@ -607,7 +658,10 @@ async fn bootstrap(
             Err(error) => {
                 warn!(%error, %job_id, "bootstrap failed");
                 enrollment_tokens.lock().await.remove(&token_for_job);
-                (BootstrapJobState::Failed, Some(bootstrap_failure_message(&error).into()))
+                (
+                    BootstrapJobState::Failed,
+                    Some(bootstrap_failure_message(&error).into()),
+                )
             }
         };
         if let Some(job) = jobs.lock().await.get_mut(&job_id) {
@@ -646,7 +700,11 @@ async fn bootstrap_status(
     let connected = if state.hysteria_connection.is_none() {
         registered
     } else {
-        state.agent_heartbeats.lock().await.get(&job.agent_id)
+        state
+            .agent_heartbeats
+            .lock()
+            .await
+            .get(&job.agent_id)
             .is_some_and(|last_seen| last_seen.elapsed() < AGENT_HEARTBEAT_TIMEOUT)
     };
     Ok(Json(BootstrapJobStatus {
@@ -659,6 +717,13 @@ async fn bootstrap_status(
 }
 
 fn validate_bootstrap_request(request: &BootstrapRequest) -> Result<(), StatusCode> {
+    if request.sudo_password.as_ref().is_some_and(|password| {
+        password.is_empty()
+            || password.len() > 8192
+            || password.chars().any(|c| c == '\n' || c == '\r')
+    }) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let host_is_invalid = request.host.trim().is_empty()
         || request.host != request.host.trim()
         || request.host.starts_with('[')
@@ -765,7 +830,12 @@ async fn hysteria_auth(
     if budget.0.elapsed() >= std::time::Duration::from_secs(1) {
         *budget = (std::time::Instant::now(), 0);
     }
-    if budget.1 >= 512 { return Json(HysteriaAuthResponse { ok: false, id: None }); }
+    if budget.1 >= 512 {
+        return Json(HysteriaAuthResponse {
+            ok: false,
+            id: None,
+        });
+    }
     budget.1 += 1;
     drop(budget);
     let security = state.agent_security.lock().await;
@@ -792,25 +862,55 @@ async fn register_existing_trap(
     Json(input): Json<ExistingTrapRegistration>,
 ) -> Result<Json<ExistingTrapResponse>, StatusCode> {
     authorize_control(&state, &headers)?;
-    if input.trap_id.is_nil() || input.host_port == 0
-        || !matches!(input.tier.as_str(), "low" | "middle") {
+    if input.trap_id.is_nil()
+        || input.host_port == 0
+        || !matches!(input.tier.as_str(), "low" | "middle")
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let registry = state.backend_registry.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let registry = state
+        .backend_registry
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let mut security = state.agent_security.lock().await;
-    if security.is_compromised(&agent_id) { return Err(StatusCode::GONE); }
-    if state.agent_credentials.lock().await.get(&agent_id).is_none() {
+    if security.is_compromised(&agent_id) {
+        return Err(StatusCode::GONE);
+    }
+    if state
+        .agent_credentials
+        .lock()
+        .await
+        .get(&agent_id)
+        .is_none()
+    {
         return Err(StatusCode::NOT_FOUND);
     }
     let (target, ssh_port) = security.target(&agent_id).ok_or(StatusCode::CONFLICT)?;
-    let server_id = registry.register(agent_id, input.trap_id, target, ssh_port,
-        &input.tier, input.host_port).await.map_err(|error| {
-            warn!(%error, "existing trap registration failed"); StatusCode::BAD_GATEWAY
+    let server_id = registry
+        .register(
+            agent_id,
+            input.trap_id,
+            target,
+            ssh_port,
+            &input.tier,
+            input.host_port,
+        )
+        .await
+        .map_err(|error| {
+            warn!(%error, "existing trap registration failed");
+            StatusCode::BAD_GATEWAY
         })?;
-    security.register_trap(agent_id, input.trap_id).map_err(|error| {
-        warn!(%error, "could not persist existing trap ownership"); StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    Ok(Json(ExistingTrapResponse { agent_id, server_id, trap_id: input.trap_id }))
+    security
+        .register_trap(agent_id, input.trap_id)
+        .map_err(|error| {
+            warn!(%error, "could not persist existing trap ownership");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(ExistingTrapResponse {
+        agent_id,
+        server_id,
+        trap_id: input.trap_id,
+    }))
 }
 
 async fn queue_command(
@@ -829,10 +929,15 @@ async fn queue_command(
     let deploys_isolated = match &command {
         AgentCommand::DeployKozyavka(item) => security.is_trap_isolated(item.trap_id),
         AgentCommand::DeployPritvoryashka(item) => security.is_trap_isolated(item.trap_id),
-        AgentCommand::ReconcileTcpPortGroup(group) => group.members.iter().any(|member| security.is_trap_isolated(member.trap_id)),
+        AgentCommand::ReconcileTcpPortGroup(group) => group
+            .members
+            .iter()
+            .any(|member| security.is_trap_isolated(member.trap_id)),
         _ => false,
     };
-    if deploys_isolated { return Err(StatusCode::CONFLICT); }
+    if deploys_isolated {
+        return Err(StatusCode::CONFLICT);
+    }
     let credential = state
         .agent_credentials
         .lock()
@@ -842,24 +947,64 @@ async fn queue_command(
         .ok_or(StatusCode::NOT_FOUND)?;
     match &mut command {
         AgentCommand::DeployKozyavka(deployment) => {
-            let registry = state.backend_registry.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            let registry = state
+                .backend_registry
+                .as_ref()
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
             let (target, ssh_port) = security.target(&agent_id).ok_or(StatusCode::CONFLICT)?;
-            registry.register(agent_id, deployment.trap_id, target, ssh_port, "low", deployment.host_port)
-                .await.map_err(|error| { warn!(%error, "backend trap registration failed"); StatusCode::BAD_GATEWAY })?;
-            security.register_trap(agent_id, deployment.trap_id)
-                .map_err(|error| { warn!(%error, "could not persist trap ownership"); StatusCode::INTERNAL_SERVER_ERROR })?;
+            registry
+                .register(
+                    agent_id,
+                    deployment.trap_id,
+                    target,
+                    ssh_port,
+                    "low",
+                    deployment.host_port,
+                )
+                .await
+                .map_err(|error| {
+                    warn!(%error, "backend trap registration failed");
+                    StatusCode::BAD_GATEWAY
+                })?;
+            security
+                .register_trap(agent_id, deployment.trap_id)
+                .map_err(|error| {
+                    warn!(%error, "could not persist trap ownership");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
         }
         AgentCommand::DeployPritvoryashka(deployment) => {
-            let registry = state.backend_registry.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            let registry = state
+                .backend_registry
+                .as_ref()
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
             let (target, ssh_port) = security.target(&agent_id).ok_or(StatusCode::CONFLICT)?;
-            let server_id = registry.register(agent_id, deployment.trap_id, target, ssh_port, "middle", deployment.host_port)
-                .await.map_err(|error| { warn!(%error, "backend trap registration failed"); StatusCode::BAD_GATEWAY })?;
+            let server_id = registry
+                .register(
+                    agent_id,
+                    deployment.trap_id,
+                    target,
+                    ssh_port,
+                    "middle",
+                    deployment.host_port,
+                )
+                .await
+                .map_err(|error| {
+                    warn!(%error, "backend trap registration failed");
+                    StatusCode::BAD_GATEWAY
+                })?;
             deployment.server_id = server_id;
-            security.register_trap(agent_id, deployment.trap_id)
-                .map_err(|error| { warn!(%error, "could not persist trap ownership"); StatusCode::INTERNAL_SERVER_ERROR })?;
+            security
+                .register_trap(agent_id, deployment.trap_id)
+                .map_err(|error| {
+                    warn!(%error, "could not persist trap ownership");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
         }
         AgentCommand::StopTrap { trap_id, .. } | AgentCommand::RemoveTrap { trap_id, .. } => {
-            if !security.owns_trap(agent_id, *trap_id) { return Err(StatusCode::NOT_FOUND); }
+            if !security.owns_trap(agent_id, *trap_id) {
+                return Err(StatusCode::NOT_FOUND);
+            }
         }
         _ => {}
     }
@@ -867,19 +1012,28 @@ async fn queue_command(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default();
-    let removal = match &command { AgentCommand::RemoveTrap { trap_id, .. } => Some(*trap_id), _ => None };
+    let removal = match &command {
+        AgentCommand::RemoveTrap { trap_id, .. } => Some(*trap_id),
+        _ => None,
+    };
     let envelope = KazikEnvelope::new(agent_id, credential, now, KazikBody::Command { command });
     let message_id = envelope.message_id;
     if let Some(trap_id) = removal {
-        security.record_removal(message_id, agent_id, trap_id).map_err(|error| {
-            warn!(%error, "could not persist pending trap removal"); StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        security
+            .record_removal(message_id, agent_id, trap_id)
+            .map_err(|error| {
+                warn!(%error, "could not persist pending trap removal");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
     }
-    state.command_statuses.lock().await.insert(message_id, CommandStatus {
-        agent_id,
-        status: "queued",
-        detail: None,
-    });
+    state.command_statuses.lock().await.insert(
+        message_id,
+        CommandStatus {
+            agent_id,
+            status: "queued",
+            detail: None,
+        },
+    );
     state
         .pending_commands
         .lock()
@@ -888,6 +1042,7 @@ async fn queue_command(
         .or_default()
         .push_back(envelope);
     drop(security);
+    info!(%agent_id, %message_id, "agent command queued for delivery");
     Ok(Json(QueuedCommandResponse {
         message_id,
         status: "queued",
@@ -942,10 +1097,15 @@ async fn revoke_agent(
             tracing::error!(%error, %agent_id, "could not persist agent revocation");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    state.agent_security.lock().await.remove_agent(agent_id).map_err(|error| {
-        tracing::error!(%error, %agent_id, "could not remove revoked agent state");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    state
+        .agent_security
+        .lock()
+        .await
+        .remove_agent(agent_id)
+        .map_err(|error| {
+            tracing::error!(%error, %agent_id, "could not remove revoked agent state");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     state
         .enrollment_tokens
         .lock()
@@ -978,15 +1138,37 @@ async fn agent_presence(
     headers: HeaderMap,
 ) -> Result<Json<AgentPresence>, StatusCode> {
     authorize_control(&state, &headers)?;
-    let registered = state.agent_credentials.lock().await.get(&agent_id).is_some();
-    let connected = registered && (state.hysteria_connection.is_none()
-        || state.agent_heartbeats.lock().await.get(&agent_id)
-            .is_some_and(|seen| seen.elapsed() < AGENT_HEARTBEAT_TIMEOUT));
-    let capabilities = state.agent_capabilities.lock().await.get(&agent_id).cloned().unwrap_or_default();
+    let registered = state
+        .agent_credentials
+        .lock()
+        .await
+        .get(&agent_id)
+        .is_some();
+    let last_heartbeat_age_ms = state
+        .agent_heartbeats
+        .lock()
+        .await
+        .get(&agent_id)
+        .map(|seen| seen.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+    let connected = registered
+        && (state.hysteria_connection.is_none()
+            || last_heartbeat_age_ms
+                .is_some_and(|age| age < AGENT_HEARTBEAT_TIMEOUT.as_millis() as u64));
+    let capabilities = state
+        .agent_capabilities
+        .lock()
+        .await
+        .get(&agent_id)
+        .cloned()
+        .unwrap_or_default();
     Ok(Json(AgentPresence {
-        registered, connected,
+        registered,
+        connected,
         can_reboot: connected && capabilities.iter().any(|item| item == "reboot_system"),
         can_uninstall: connected && capabilities.iter().any(|item| item == "uninstall_agent"),
+        can_share_tcp_ports: connected
+            && capabilities.iter().any(|item| item == "shared_tcp_ports"),
+        last_heartbeat_age_ms,
     }))
 }
 
@@ -999,7 +1181,8 @@ async fn list_compromised_agents(
 }
 
 async fn list_isolated_traps(
-    State(state): State<AppState>, headers: HeaderMap,
+    State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<IsolatedTrap>>, StatusCode> {
     authorize_control(&state, &headers)?;
     Ok(Json(state.agent_security.lock().await.isolated_traps()))
@@ -1066,7 +1249,12 @@ async fn retry_compromised_kicks(state: AppState) {
         interval.tick().await;
         let records = state.agent_security.lock().await.compromised();
         for record in records {
-            if let Err(error) = state.agent_credentials.lock().await.remove(&record.agent_id) {
+            if let Err(error) = state
+                .agent_credentials
+                .lock()
+                .await
+                .remove(&record.agent_id)
+            {
                 tracing::error!(%error, agent_id=%record.agent_id, "retry of credential revocation failed");
             }
             if !record.transport_disconnected {
@@ -1096,7 +1284,9 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
             }
         };
         // Reject floods before HFSP parsing, JSON allocation or credential lookup.
-        if !budget.allow_preauth(length, std::time::Instant::now()) { continue; }
+        if !budget.allow_preauth(length, std::time::Instant::now()) {
+            continue;
+        }
         let Ok((envelope, sequence, _)) = KazikEnvelope::decode_hfsp(&buffer[..length]) else {
             tracing::debug!(%peer, "discarded malformed Kazik packet");
             continue;
@@ -1121,9 +1311,15 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
             continue; // No ACK: retry after the budget resets.
         }
         if let KazikBody::Heartbeat { status } = &envelope.body {
-            state.agent_heartbeats.lock().await
+            state
+                .agent_heartbeats
+                .lock()
+                .await
                 .insert(envelope.agent_id, std::time::Instant::now());
-            state.agent_capabilities.lock().await
+            state
+                .agent_capabilities
+                .lock()
+                .await
                 .insert(envelope.agent_id, status.capabilities.clone());
         }
         let mut unregistered_telemetry = false;
@@ -1131,34 +1327,55 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
             if length > MAX_TELEMETRY_PACKET_BYTES
                 || events.is_empty()
                 || events.len() > MAX_TELEMETRY_BATCH_EVENTS
-                || events.iter().any(|event|
-                event.event_id.is_nil() || event.trap_id.is_nil()
-                || event.event_type.is_empty() || event.event_type.len() > 128
-                || event.service_type.len() > 64 || event.protocol.len() > 32
-                || !event.payload.is_object() || !event.metadata.is_object()) {
+                || events.iter().any(|event| {
+                    event.event_id.is_nil()
+                        || event.trap_id.is_nil()
+                        || event.event_type.is_empty()
+                        || event.event_type.len() > 128
+                        || event.service_type.len() > 64
+                        || event.protocol.len() > 32
+                        || !event.payload.is_object()
+                        || !event.metadata.is_object()
+                })
+            {
                 tracing::debug!(agent_id=%envelope.agent_id, "discarded invalid telemetry shape");
                 continue;
             }
             let security = state.agent_security.lock().await;
-            if events.iter().any(|event| !security.owns_trap(envelope.agent_id, event.trap_id)) {
+            if events
+                .iter()
+                .any(|event| !security.owns_trap(envelope.agent_id, event.trap_id))
+            {
                 unregistered_telemetry = true;
             }
         }
         if let KazikBody::Ack(ack) = &envelope.body {
-            if matches!(ack.disposition, AckDisposition::Applied | AckDisposition::Duplicate | AckDisposition::Rejected) {
+            if matches!(
+                ack.disposition,
+                AckDisposition::Applied | AckDisposition::Duplicate | AckDisposition::Rejected
+            ) {
                 let mut security = state.agent_security.lock().await;
                 if let Some(removal) = security.pending_removal(ack.acknowledged_message_id) {
-                    if removal.agent_id != envelope.agent_id { continue; }
+                    if removal.agent_id != envelope.agent_id {
+                        continue;
+                    }
                     let applied = !matches!(ack.disposition, AckDisposition::Rejected);
                     if applied {
-                        let Some(registry) = state.backend_registry.as_ref() else { continue };
-                        if let Err(error) = registry.mark_removed(envelope.agent_id, removal.trap_id).await {
+                        let Some(registry) = state.backend_registry.as_ref() else {
+                            continue;
+                        };
+                        if let Err(error) = registry
+                            .mark_removed(envelope.agent_id, removal.trap_id)
+                            .await
+                        {
                             tracing::error!(%error, agent_id=%envelope.agent_id,
                                 "backend trap removal not confirmed; agent ACK will retry");
                             continue;
                         }
                     }
-                    if let Err(error) = security.finish_removal(ack.acknowledged_message_id, applied) {
+                    if let Err(error) =
+                        security.finish_removal(ack.acknowledged_message_id, applied)
+                    {
                         tracing::error!(%error, "could not persist completed trap removal; agent ACK will retry");
                         continue;
                     }
@@ -1181,6 +1398,8 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
                     };
                     status.detail = ack.detail.clone();
                 }
+                info!(agent_id=%envelope.agent_id, message_id=%ack.acknowledged_message_id,
+                    disposition=?ack.disposition, "agent command result received");
             }
             // Agent stores command-result ACKs in SQLite. Confirm receipt; the agent does not
             // ACK this reply, so there is no ACK loop.
@@ -1209,7 +1428,12 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
         let disposition = match &envelope.body {
             KazikBody::Telemetry { events } => {
                 if unregistered_telemetry {
-                    match state.telemetry_store.lock().await.reject(envelope.agent_id, events) {
+                    match state
+                        .telemetry_store
+                        .lock()
+                        .await
+                        .reject(envelope.agent_id, events)
+                    {
                         Ok(count) => tracing::warn!(agent_id=%envelope.agent_id, count,
                             "quarantined telemetry for unregistered trap"),
                         Err(error) => {
@@ -1218,9 +1442,13 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
                             continue;
                         }
                     }
-                    if let Some(incident) = events.iter().find(|event|
-                        AgentSecurityStore::response_for_event(event) == ResponseTier::QuarantineHost) {
-                        if let Err(error) = mark_agent_compromised(&state, envelope.agent_id, incident).await {
+                    if let Some(incident) = events.iter().find(|event| {
+                        AgentSecurityStore::response_for_event(event)
+                            == ResponseTier::QuarantineHost
+                    }) {
+                        if let Err(error) =
+                            mark_agent_compromised(&state, envelope.agent_id, incident).await
+                        {
                             tracing::error!(%error, agent_id=%envelope.agent_id,
                                 "unregistered incident quarantined but revocation failed; leaving unacknowledged");
                             continue;
@@ -1229,34 +1457,51 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
                     }
                     AckDisposition::Accepted
                 } else {
-                let stored = match state.telemetry_store.lock().await.persist(envelope.agent_id, events) {
-                    Ok(stored) => stored,
-                    Err(error) => {
-                        tracing::error!(%error, agent_id = %envelope.agent_id, events = events.len(), "could not persist Kazik telemetry; leaving it unacknowledged");
-                        continue;
-                    }
-                };
-                tracing::info!(agent_id = %envelope.agent_id, received = events.len(), stored, "Kazik telemetry persisted");
-                let mut isolation_failed = false;
-                for event in events.iter().filter(|event|
-                    AgentSecurityStore::response_for_event(event) == ResponseTier::IsolateTrap) {
-                    if let Err(error) = state.agent_security.lock().await.mark_trap_isolated(envelope.agent_id, event) {
-                        tracing::error!(%error, trap_id=%event.trap_id,
+                    let stored = match state
+                        .telemetry_store
+                        .lock()
+                        .await
+                        .persist(envelope.agent_id, events)
+                    {
+                        Ok(stored) => stored,
+                        Err(error) => {
+                            tracing::error!(%error, agent_id = %envelope.agent_id, events = events.len(), "could not persist Kazik telemetry; leaving it unacknowledged");
+                            continue;
+                        }
+                    };
+                    tracing::info!(agent_id = %envelope.agent_id, received = events.len(), stored, "Kazik telemetry persisted");
+                    let mut isolation_failed = false;
+                    for event in events.iter().filter(|event| {
+                        AgentSecurityStore::response_for_event(event) == ResponseTier::IsolateTrap
+                    }) {
+                        if let Err(error) = state
+                            .agent_security
+                            .lock()
+                            .await
+                            .mark_trap_isolated(envelope.agent_id, event)
+                        {
+                            tracing::error!(%error, trap_id=%event.trap_id,
                             "could not persist isolated trap state; leaving telemetry unacknowledged");
-                        isolation_failed = true;
-                        break;
+                            isolation_failed = true;
+                            break;
+                        }
                     }
-                }
-                if isolation_failed { continue; }
-                if let Some(incident) = events.iter().find(|event|
-                    AgentSecurityStore::response_for_event(event) == ResponseTier::QuarantineHost) {
-                    if let Err(error) = mark_agent_compromised(&state, envelope.agent_id, incident).await {
-                        tracing::error!(%error, agent_id = %envelope.agent_id, "could not persist compromise state; leaving incident unacknowledged");
+                    if isolation_failed {
                         continue;
                     }
-                    compromise_to_kick = Some(envelope.agent_id);
-                }
-                AckDisposition::Accepted
+                    if let Some(incident) = events.iter().find(|event| {
+                        AgentSecurityStore::response_for_event(event)
+                            == ResponseTier::QuarantineHost
+                    }) {
+                        if let Err(error) =
+                            mark_agent_compromised(&state, envelope.agent_id, incident).await
+                        {
+                            tracing::error!(%error, agent_id = %envelope.agent_id, "could not persist compromise state; leaving incident unacknowledged");
+                            continue;
+                        }
+                        compromise_to_kick = Some(envelope.agent_id);
+                    }
+                    AckDisposition::Accepted
                 }
             }
             KazikBody::Heartbeat { .. } => AckDisposition::Accepted,
@@ -1293,7 +1538,9 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
             // ACK the durable incident before closing the QUIC session so the agent
             // can stop retrying and execute its locally armed emergency response.
             let kick_state = state.clone();
-            tokio::spawn(async move { disconnect_compromised_agent(&kick_state, agent_id).await; });
+            tokio::spawn(async move {
+                disconnect_compromised_agent(&kick_state, agent_id).await;
+            });
         }
         if matches!(envelope.body, KazikBody::Heartbeat { .. }) {
             send_next_command(&socket, peer, &state, envelope.agent_id).await;
@@ -1310,12 +1557,18 @@ async fn send_next_command(
     if state.agent_security.lock().await.is_compromised(&agent_id) {
         return;
     }
+    // A lost result ACK must not block all later commands for this agent.
+    // Rotate the queue so every unacknowledged command is retried in turn.
     let command = state
         .pending_commands
         .lock()
         .await
-        .get(&agent_id)
-        .and_then(|commands| commands.front().cloned());
+        .get_mut(&agent_id)
+        .and_then(|commands| {
+            let command = commands.pop_front()?;
+            commands.push_back(command.clone());
+            Some(command)
+        });
     let Some(command) = command else {
         return;
     };
@@ -1332,9 +1585,51 @@ async fn send_next_command(
 
 fn render_install_script(token: &str, center_url: &str) -> String {
     let script = format!(
-        "#!/bin/sh\nset -eu\nif [ \"$(id -u)\" -eq 0 ]; then SUDO=''; else SUDO='sudo -n'; fi\nif [ -f /var/lib/honeyforge/identity.json ]; then echo 'Existing HoneyForge agent identity on host; remove the old agent before enrollment' >&2; exit 42; fi\nensure_docker() {{\n  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then return; fi\n  [ -r /etc/os-release ] || {{ echo 'Cannot identify Linux distribution' >&2; exit 1; }}\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        echo 'Regional Ubuntu mirror configured; switching to archive.ubuntu.com before package update' >&2\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 bpftrace nftables\n      $SUDO systemctl enable --now docker\n      ;;\n    fedora)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    rhel|centos|rocky|almalinux)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    arch|manjaro)\n      $SUDO pacman -Sy --noconfirm docker docker-compose\n      $SUDO systemctl enable --now docker\n      ;;\n    alpine)\n      $SUDO apk add docker docker-cli-compose\n      $SUDO rc-update add docker default\n      $SUDO service docker start\n      ;;\n    *) echo \"Unsupported Linux distribution: $ID\" >&2; exit 1 ;;\n  esac\n  docker compose version >/dev/null\n}}\nif ! command -v bpftrace >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1; then\n  if [ ! -r /etc/os-release ]; then echo 'Cannot identify Linux distribution' >&2; exit 1; fi\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y bpftrace nftables\n      ;;\n    *) echo 'Install bpftrace and nftables for HoneyForge security monitoring' >&2 ;;\n  esac\nfi\n$SUDO install -d -m 0700 /etc/honeyforge\n$SUDO install -m 0755 /tmp/hf-agent-bootstrap /usr/local/bin/hf-agent\nif [ -f /tmp/hf-kozyavka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-kozyavka-image.tar\n  rm -f /tmp/hf-kozyavka-image.tar\nfi\nprintf '%s' '{token}' | $SUDO tee /etc/honeyforge/enrollment-token >/dev/null\nif [ -f /tmp/hf-high-ubuntu-ssh.tar.gz ]; then\n  $SUDO install -d -m 0755 /usr/local/lib/honeyforge\n  $SUDO tar -xzf /tmp/hf-high-ubuntu-ssh.tar.gz -C /usr/local/lib/honeyforge\n  $SUDO chmod -R a-w /usr/local/lib/honeyforge/high-ubuntu-ssh/cloud-init\n  $SUDO find /usr/local/lib/honeyforge/high-ubuntu-ssh/scripts -type f -exec chmod 0755 {{}} \\;\n  rm -f /tmp/hf-high-ubuntu-ssh.tar.gz\nfi\nif [ -f /tmp/hf-initial-command.json ]; then\n  $SUDO install -d -m 0700 /var/lib/honeyforge/inbox\n  $SUDO install -m 0600 /tmp/hf-initial-command.json /var/lib/honeyforge/inbox/initial-high.json\n  rm -f /tmp/hf-initial-command.json\nfi\nif [ -f /tmp/hf-dispatcher-bootstrap ]; then\n  if ! command -v systemctl >/dev/null 2>&1; then echo 'Shared TCP ports require systemd' >&2; exit 1; fi\n  $SUDO install -m 0755 /tmp/hf-dispatcher-bootstrap /usr/local/bin/hf-dispatcher\n  $SUDO tee /etc/systemd/system/hf-dispatcher.service >/dev/null <<'DISPATCHER_UNIT'\n[Unit]\nDescription=HoneyForge TCP dispatcher\nAfter=network-online.target docker.service\nWants=network-online.target\n[Service]\nType=simple\nExecStart=/usr/local/bin/hf-dispatcher --config /etc/honeyforge/dispatcher.json\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\nDISPATCHER_UNIT\n  $SUDO systemctl daemon-reload\n  rm -f /tmp/hf-dispatcher-bootstrap\nfi\nif [ -f /tmp/hysteria-bootstrap ]; then\n  $SUDO install -m 0755 /tmp/hysteria-bootstrap /usr/local/bin/hysteria\n  rm -f /tmp/hysteria-bootstrap\nfi\nif [ -f /tmp/hf-pritvoryashka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-pritvoryashka-image.tar\n  rm -f /tmp/hf-pritvoryashka-image.tar\nfi\nif command -v systemctl >/dev/null 2>&1; then\n  $SUDO tee /etc/systemd/system/hf-agent.service >/dev/null <<'UNIT'\n[Unit]\nDescription=HoneyForge agent\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nEnvironment=HF_CENTER_URL={center_url}\nEnvironment=HF_KOZYAVKA_IMAGE=honeyforge-low:local\nExecStart=/usr/local/bin/hf-agent\nRestart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\nUNIT\n  $SUDO systemctl daemon-reload\n  $SUDO systemctl enable --now hf-agent.service\nelif command -v rc-update >/dev/null 2>&1; then\n  $SUDO tee /etc/init.d/hf-agent >/dev/null <<'OPENRC'\n#!/sbin/openrc-run\nname=\"HoneyForge agent\"\ncommand=\"/usr/local/bin/hf-agent\"\ncommand_background=\"yes\"\npidfile=\"/run/hf-agent.pid\"\nexport HF_CENTER_URL={center_url}\nexport HF_KOZYAVKA_IMAGE=honeyforge-low:local\nOPENRC\n  $SUDO chmod 0755 /etc/init.d/hf-agent\n  $SUDO rc-update add hf-agent default\n  $SUDO rc-service hf-agent start\nelse\n  echo 'Unsupported init system: systemd or OpenRC is required' >&2\n  exit 1\nfi\nrm -f /tmp/hf-agent-bootstrap\n"
+        "#!/bin/sh\nset -eu\necho 'hf-agent bootstrap: checking host prerequisites'\nif [ \"$(id -u)\" -eq 0 ]; then SUDO=''; else SUDO='sudo -n'; fi\nif [ -f /var/lib/honeyforge/identity.json ]; then echo 'Existing HoneyForge agent identity on host; remove the old agent before enrollment' >&2; exit 42; fi\n# A previous uninstall may still be waiting in systemd after its server row was deleted.\nif command -v systemctl >/dev/null 2>&1; then\n  systemctl list-units --all --type=timer --plain --no-legend 'hf-agent-uninstall-*.timer' 2>/dev/null | while read -r unit rest; do\n    case \"$unit\" in hf-agent-uninstall-*.timer) $SUDO systemctl stop \"$unit\" ;; esac\n  done\nfi\nensure_docker() {{\n  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then return; fi\n  [ -r /etc/os-release ] || {{ echo 'Cannot identify Linux distribution' >&2; exit 1; }}\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        echo 'Regional Ubuntu mirror configured; switching to archive.ubuntu.com before package update' >&2\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 bpftrace nftables\n      $SUDO systemctl enable --now docker\n      ;;\n    fedora)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    rhel|centos|rocky|almalinux)\n      $SUDO dnf install -y dnf-plugins-core\n      $SUDO dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo\n      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\n      $SUDO systemctl enable --now docker\n      ;;\n    arch|manjaro)\n      $SUDO pacman -Sy --noconfirm docker docker-compose\n      $SUDO systemctl enable --now docker\n      ;;\n    alpine)\n      $SUDO apk add docker docker-cli-compose\n      $SUDO rc-update add docker default\n      $SUDO service docker start\n      ;;\n    *) echo \"Unsupported Linux distribution: $ID\" >&2; exit 1 ;;\n  esac\n  docker compose version >/dev/null\n}}\nif ! command -v bpftrace >/dev/null 2>&1 || ! command -v nft >/dev/null 2>&1; then\n  if [ ! -r /etc/os-release ]; then echo 'Cannot identify Linux distribution' >&2; exit 1; fi\n  . /etc/os-release\n  case \"$ID\" in\n    ubuntu|debian|linuxmint)\n      if [ \"$ID\" = ubuntu ] && grep -Rqs 'ru.archive.ubuntu.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then\n        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do\n          [ -f \"$source\" ] || continue\n          $SUDO sed -i 's/ru.archive.ubuntu.com/archive.ubuntu.com/g' \"$source\"\n        done\n      fi\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update\n      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y bpftrace nftables\n      ;;\n    *) echo 'Install bpftrace and nftables for HoneyForge security monitoring' >&2 ;;\n  esac\nfi\n$SUDO install -d -m 0700 /etc/honeyforge\necho 'hf-agent bootstrap: installing agent binary'\n$SUDO install -m 0755 /tmp/hf-agent-bootstrap /usr/local/bin/hf-agent\nif [ -f /tmp/hf-kozyavka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-kozyavka-image.tar\n  rm -f /tmp/hf-kozyavka-image.tar\nfi\nprintf '%s' '{token}' | $SUDO tee /etc/honeyforge/enrollment-token >/dev/null\nif [ -f /tmp/hf-high-ubuntu-ssh.tar.gz ]; then\n  $SUDO install -d -m 0755 /usr/local/lib/honeyforge\n  $SUDO tar -xzf /tmp/hf-high-ubuntu-ssh.tar.gz -C /usr/local/lib/honeyforge\n  $SUDO chmod -R a-w /usr/local/lib/honeyforge/high-ubuntu-ssh/cloud-init\n  $SUDO find /usr/local/lib/honeyforge/high-ubuntu-ssh/scripts -type f -exec chmod 0755 {{}} \\;\n  rm -f /tmp/hf-high-ubuntu-ssh.tar.gz\nfi\nif [ -f /tmp/hf-initial-command.json ]; then\n  $SUDO install -d -m 0700 /var/lib/honeyforge/inbox\n  $SUDO install -m 0600 /tmp/hf-initial-command.json /var/lib/honeyforge/inbox/initial-high.json\n  rm -f /tmp/hf-initial-command.json\nfi\nif [ -f /tmp/hf-dispatcher-bootstrap ]; then\n  if ! command -v systemctl >/dev/null 2>&1; then echo 'Shared TCP ports require systemd' >&2; exit 1; fi\n  $SUDO install -m 0755 /tmp/hf-dispatcher-bootstrap /usr/local/bin/hf-dispatcher\n  $SUDO tee /etc/systemd/system/hf-dispatcher.service >/dev/null <<'DISPATCHER_UNIT'\n[Unit]\nDescription=HoneyForge TCP dispatcher\nAfter=network-online.target docker.service\nWants=network-online.target\n[Service]\nType=simple\nExecStart=/usr/local/bin/hf-dispatcher --config /etc/honeyforge/dispatcher.json\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\nDISPATCHER_UNIT\n  $SUDO systemctl daemon-reload\n  rm -f /tmp/hf-dispatcher-bootstrap\nfi\nif [ -f /tmp/hysteria-bootstrap ]; then\n  $SUDO install -m 0755 /tmp/hysteria-bootstrap /usr/local/bin/hysteria\n  rm -f /tmp/hysteria-bootstrap\nfi\nif [ -f /tmp/hf-pritvoryashka-image.tar ]; then\n  ensure_docker\n  $SUDO docker load -i /tmp/hf-pritvoryashka-image.tar\n  rm -f /tmp/hf-pritvoryashka-image.tar\nfi\nif command -v systemctl >/dev/null 2>&1; then\n  echo 'hf-agent bootstrap: writing and starting systemd service'\n  $SUDO tee /etc/systemd/system/hf-agent.service >/dev/null <<'UNIT'\n[Unit]\nDescription=HoneyForge agent\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nEnvironment=HF_CENTER_URL={center_url}\nEnvironment=HF_KOZYAVKA_IMAGE=honeyforge-low:local\nExecStart=/usr/local/bin/hf-agent\nRestart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\nUNIT\n  $SUDO systemctl daemon-reload\n  $SUDO systemctl enable --now hf-agent.service\n  $SUDO systemctl is-active --quiet hf-agent.service || {{ echo 'hf-agent.service did not become active' >&2; exit 1; }}\n  echo 'hf-agent bootstrap: waiting for Center registration'\n  attempt=0\n  while [ ! -s /var/lib/honeyforge/identity.json ] && [ \"$attempt\" -lt 60 ]; do\n    sleep 1\n    attempt=$((attempt + 1))\n  done\n  if [ ! -s /var/lib/honeyforge/identity.json ]; then\n    echo 'hf-agent failed to register with Center within 60 seconds; recent service log:' >&2\n    $SUDO journalctl -u hf-agent.service -n 30 --no-pager >&2 || true\n    exit 43\n  fi\nelif command -v rc-update >/dev/null 2>&1; then\n  echo 'hf-agent bootstrap: writing and starting OpenRC service'\n  $SUDO tee /etc/init.d/hf-agent >/dev/null <<'OPENRC'\n#!/sbin/openrc-run\nname=\"HoneyForge agent\"\ncommand=\"/usr/local/bin/hf-agent\"\ncommand_background=\"yes\"\npidfile=\"/run/hf-agent.pid\"\nexport HF_CENTER_URL={center_url}\nexport HF_KOZYAVKA_IMAGE=honeyforge-low:local\nOPENRC\n  $SUDO chmod 0755 /etc/init.d/hf-agent\n  $SUDO rc-update add hf-agent default\n  $SUDO rc-service hf-agent start\n  $SUDO rc-service hf-agent status >/dev/null || {{ echo 'hf-agent OpenRC service did not become active' >&2; exit 1; }}\nelse\n  echo 'Unsupported init system: systemd or OpenRC is required' >&2\n  exit 1\nfi\nrm -f /tmp/hf-agent-bootstrap\n"
     );
     script
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BootstrapPrivilege {
+    Root,
+    PasswordlessSudo,
+    PasswordSudo,
+}
+
+fn write_sudo_password(channel: &mut ssh2::Channel, password: &str) -> Result<(), CoreError> {
+    channel
+        .write_all(password.as_bytes())
+        .and_then(|_| channel.write_all(b"\n"))
+        .map_err(|error| CoreError::Transport(format!("cannot send sudo credential: {error}")))
+}
+
+fn remote_status(
+    session: &Session,
+    command: &str,
+    sudo_password: Option<&str>,
+) -> Result<i32, CoreError> {
+    let mut channel = session.channel_session().map_err(|error| {
+        CoreError::Transport(format!("cannot open SSH preflight channel: {error}"))
+    })?;
+    channel
+        .exec(command)
+        .map_err(|error| CoreError::Transport(format!("cannot run SSH preflight: {error}")))?;
+    if let Some(password) = sudo_password {
+        write_sudo_password(&mut channel, password)?;
+    }
+    channel.send_eof().map_err(|error| {
+        CoreError::Transport(format!("cannot finish SSH preflight input: {error}"))
+    })?;
+    channel.wait_eof().map_err(|error| {
+        CoreError::Transport(format!("SSH preflight did not reach EOF: {error}"))
+    })?;
+    channel
+        .wait_close()
+        .map_err(|error| CoreError::Transport(format!("SSH preflight failed: {error}")))?;
+    channel
+        .exit_status()
+        .map_err(|error| CoreError::Transport(format!("cannot read SSH preflight status: {error}")))
 }
 
 fn run_ssh_install(
@@ -1382,21 +1677,46 @@ fn run_ssh_install(
         ));
     }
     info!(host = %target.host, user = %target.user, "SSH authentication succeeded");
-    let mut preflight = session.channel_session()
-        .map_err(|error| CoreError::Transport(format!("cannot open SSH preflight channel: {error}")))?;
-    preflight.exec("sh -c 'if [ \"$(id -u)\" -eq 0 ]; then [ ! -f /var/lib/honeyforge/identity.json ] || exit 42; elif sudo -n test -f /var/lib/honeyforge/identity.json; then exit 42; fi'")
-        .map_err(|error| CoreError::Transport(format!("cannot check remote agent identity: {error}")))?;
-    preflight.wait_eof()
-        .map_err(|error| CoreError::Transport(format!("remote identity check did not reach EOF: {error}")))?;
-    preflight.wait_close()
-        .map_err(|error| CoreError::Transport(format!("remote identity check failed: {error}")))?;
-    let preflight_status = preflight.exit_status()
-        .map_err(|error| CoreError::Transport(format!("cannot read remote identity check status: {error}")))?;
-    if preflight_status == 42 {
+    let privilege = if remote_status(&session, "test \"$(id -u)\" -eq 0", None)? == 0 {
+        BootstrapPrivilege::Root
+    } else if remote_status(&session, "sudo -n sh -c true", None)? == 0 {
+        BootstrapPrivilege::PasswordlessSudo
+    } else {
+        let password = target.sudo_password.as_deref().ok_or_else(|| {
+            CoreError::Transport("sudo authentication required: no sudo password supplied".into())
+        })?;
+        if remote_status(&session, "sudo -S -p '' sh -c true", Some(password))? != 0 {
+            return Err(CoreError::Transport(
+                "sudo authentication failed: password rejected or sudo access denied".into(),
+            ));
+        }
+        BootstrapPrivilege::PasswordSudo
+    };
+    let identity_command = match privilege {
+        BootstrapPrivilege::Root => "test ! -f /var/lib/honeyforge/identity.json",
+        BootstrapPrivilege::PasswordlessSudo => {
+            "sudo -n test ! -f /var/lib/honeyforge/identity.json"
+        }
+        BootstrapPrivilege::PasswordSudo => {
+            "sudo -S -p '' test ! -f /var/lib/honeyforge/identity.json"
+        }
+    };
+    let identity_status = remote_status(
+        &session,
+        identity_command,
+        if privilege == BootstrapPrivilege::PasswordSudo {
+            target.sudo_password.as_deref()
+        } else {
+            None
+        },
+    )?;
+    if identity_status == 1 {
         return Err(CoreError::Transport(EXISTING_AGENT_ERROR.into()));
     }
-    if preflight_status != 0 {
-        return Err(CoreError::Transport("remote identity check returned an unexpected status".into()));
+    if identity_status != 0 {
+        return Err(CoreError::Transport(
+            "remote identity check returned an unexpected status".into(),
+        ));
     }
     let metadata = std::fs::metadata(&agent_binary)
         .map_err(|error| CoreError::Transport(format!("cannot read agent artifact: {error}")))?;
@@ -1458,9 +1778,7 @@ fn run_ssh_install(
             CoreError::Transport(format!("cannot upload initial trap command: {error}"))
         })?;
         remote.send_eof().map_err(|error| {
-            CoreError::Transport(format!(
-                "cannot finish initial trap command upload: {error}"
-            ))
+            CoreError::Transport(format!("cannot finish initial trap command upload: {error}"))
         })?;
         remote.wait_eof().map_err(|error| {
             CoreError::Transport(format!("initial trap command did not reach EOF: {error}"))
@@ -1470,30 +1788,60 @@ fn run_ssh_install(
         })?;
         debug!(host = %target.host, "initial trap command upload completed");
     }
-    let mut channel = session
-        .channel_session()
-        .map_err(|error| CoreError::Transport(format!("cannot open SSH channel: {error}")))?;
-    channel
-        .exec("sh -s >/tmp/hf-agent-bootstrap.log 2>&1")
-        .map_err(|error| CoreError::Transport(format!("cannot start remote installer: {error}")))?;
-    channel
-        .write_all(script.contents.as_bytes())
-        .map_err(|error| CoreError::Transport(format!("cannot upload installer: {error}")))?;
-    channel
-        .send_eof()
-        .map_err(|error| CoreError::Transport(format!("cannot finish installer input: {error}")))?;
-    channel.wait_eof().map_err(|error| {
-        CoreError::Transport(format!("remote installer did not reach EOF: {error}"))
-    })?;
-    channel
-        .wait_close()
-        .map_err(|error| CoreError::Transport(format!("remote installer failed: {error}")))?;
-    match channel.exit_status().unwrap_or(-1) {
+    let installer_command = match privilege {
+        BootstrapPrivilege::Root => "sh -s >/tmp/hf-agent-bootstrap.log 2>&1".to_owned(),
+        BootstrapPrivilege::PasswordlessSudo => {
+            "sudo -n sh -s >/tmp/hf-agent-bootstrap.log 2>&1".to_owned()
+        }
+        BootstrapPrivilege::PasswordSudo => {
+            "sudo -S -p '' sh -s >/tmp/hf-agent-bootstrap.log 2>&1".to_owned()
+        }
+    };
+    let install_result = (|| -> Result<i32, CoreError> {
+        let mut channel = session
+            .channel_session()
+            .map_err(|error| CoreError::Transport(format!("cannot open SSH channel: {error}")))?;
+        channel.exec(&installer_command).map_err(|error| {
+            CoreError::Transport(format!("cannot start remote installer: {error}"))
+        })?;
+        if privilege == BootstrapPrivilege::PasswordSudo {
+            write_sudo_password(&mut channel, target.sudo_password.as_deref().unwrap())?;
+        }
+        channel
+            .write_all(script.contents.as_bytes())
+            .map_err(|error| CoreError::Transport(format!("cannot stream installer over SSH: {error}")))?;
+        channel.send_eof().map_err(|error| {
+            CoreError::Transport(format!("cannot finish installer input: {error}"))
+        })?;
+        channel.wait_eof().map_err(|error| {
+            CoreError::Transport(format!("remote installer did not reach EOF: {error}"))
+        })?;
+        channel
+            .wait_close()
+            .map_err(|error| CoreError::Transport(format!("remote installer failed: {error}")))?;
+        channel
+            .exit_status()
+            .map_err(|error| CoreError::Transport(format!("cannot read installer status: {error}")))
+    })();
+    match install_result? {
         0 => {}
         42 => return Err(CoreError::Transport(EXISTING_AGENT_ERROR.into())),
-        status => return Err(CoreError::Transport(format!(
-            "remote installer returned exit status {status}; see /tmp/hf-agent-bootstrap.log on target"
-        ))),
+        43 => {
+            return Err(CoreError::Transport(
+                "agent registration timed out; inspect /tmp/hf-agent-bootstrap.log on target".into(),
+            ));
+        }
+        status => {
+            return Err(CoreError::Transport(format!(
+                "remote installer returned exit status {status}; see /tmp/hf-agent-bootstrap.log on target"
+            )));
+        }
+    }
+    let verify_command = "if command -v systemctl >/dev/null 2>&1; then test -x /usr/local/bin/hf-agent && test -f /etc/systemd/system/hf-agent.service && systemctl is-enabled --quiet hf-agent.service && systemctl is-active --quiet hf-agent.service; elif command -v rc-service >/dev/null 2>&1; then test -x /usr/local/bin/hf-agent && test -f /etc/init.d/hf-agent && rc-service hf-agent status >/dev/null; else exit 1; fi";
+    if remote_status(&session, verify_command, None)? != 0 {
+        return Err(CoreError::Transport(
+            "installer returned success, but the hf-agent binary or service is missing/inactive; inspect /tmp/hf-agent-bootstrap.log on target".into(),
+        ));
     }
     info!(host = %target.host, "remote hf-agent service installed and started");
     Ok(())
@@ -1543,6 +1891,7 @@ mod tests {
             ssh_password: Some("secret".into()),
             ssh_private_key: None,
             ssh_key_passphrase: None,
+            sudo_password: None,
             initial_high_ubuntu: None,
         }
     }
@@ -1584,6 +1933,15 @@ mod tests {
         assert!(validate_bootstrap_request(&request).is_err());
         request.ssh_private_key = None;
         assert!(validate_bootstrap_request(&request).is_ok());
+    }
+
+    #[test]
+    fn validates_ephemeral_sudo_password() {
+        let mut request = password_request("203.0.113.42");
+        request.sudo_password = Some("different-password".into());
+        assert!(validate_bootstrap_request(&request).is_ok());
+        request.sudo_password = Some("bad\npassword".into());
+        assert!(validate_bootstrap_request(&request).is_err());
     }
 
     #[test]

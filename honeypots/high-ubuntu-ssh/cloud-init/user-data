@@ -38,6 +38,9 @@ runcmd:
   - test -x /usr/bin/python3
   - test -x /usr/sbin/sshd
   - mkdir -p /srv/operations/backups
+  - mkdir -p /var/log/journal
+  - systemd-tmpfiles --create --prefix /var/log/journal
+  - journalctl --flush
   - systemctl daemon-reload
   - sh -c 'if command -v auditctl >/dev/null 2>&1; then augenrules --load && systemctl enable --now auditd; fi'
   - sh -c 'if command -v qemu-ga >/dev/null 2>&1; then systemctl enable --now qemu-guest-agent; fi'

@@ -239,14 +239,31 @@ impl Config {
                 reason: "requires at least 32 bytes of random secret material",
             });
         }
-        let center_ingest_token = lookup("CENTER_INGEST_TOKEN")?.filter(|s| !s.is_empty()).map(Secret);
-        if center_ingest_token.as_ref().is_some_and(|secret|
-            secret.expose().len() < 32 || telemetry_ingest_token.as_ref().is_some_and(|t| t.expose() == secret.expose())) {
-            return Err(ConfigError { key: "CENTER_INGEST_TOKEN", reason: "requires a separate random secret of at least 32 bytes" });
+        let center_ingest_token = lookup("CENTER_INGEST_TOKEN")?
+            .filter(|s| !s.is_empty())
+            .map(Secret);
+        if center_ingest_token.as_ref().is_some_and(|secret| {
+            secret.expose().len() < 32
+                || telemetry_ingest_token
+                    .as_ref()
+                    .is_some_and(|t| t.expose() == secret.expose())
+        }) {
+            return Err(ConfigError {
+                key: "CENTER_INGEST_TOKEN",
+                reason: "requires a separate random secret of at least 32 bytes",
+            });
         }
-        let center_control_token = lookup("CENTER_CONTROL_TOKEN")?.filter(|s| !s.is_empty()).map(Secret);
-        if center_control_token.as_ref().is_some_and(|secret| secret.expose().len() < 32) {
-            return Err(ConfigError { key: "CENTER_CONTROL_TOKEN", reason: "requires at least 32 bytes of random secret material" });
+        let center_control_token = lookup("CENTER_CONTROL_TOKEN")?
+            .filter(|s| !s.is_empty())
+            .map(Secret);
+        if center_control_token
+            .as_ref()
+            .is_some_and(|secret| secret.expose().len() < 32)
+        {
+            return Err(ConfigError {
+                key: "CENTER_CONTROL_TOKEN",
+                reason: "requires at least 32 bytes of random secret material",
+            });
         }
         let telemetry_public_endpoint =
             lookup("TELEMETRY_PUBLIC_ENDPOINT")?.filter(|value| !value.is_empty());

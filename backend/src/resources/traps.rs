@@ -37,8 +37,12 @@ async fn snapshot(
         crate::kozyavka::validate_ports(&input.ports)?;
     }
     if profile.honeypot_type == "pritvoryashka" {
-        crate::pritvoryashka::validate_profile(profile.level, &profile.service_type, &effective)?;
-        crate::pritvoryashka::validate_ports(&input.ports)?;
+        let settings = crate::pritvoryashka::validate_profile(
+            profile.level,
+            &profile.service_type,
+            &effective,
+        )?;
+        crate::pritvoryashka::validate_ports(&input.ports, &settings.vulnerability_profiles)?;
     }
     if profile.honeypot_type == "high_ubuntu_ssh" {
         crate::high_ubuntu::validate_profile(profile.level, &profile.service_type, &effective)?;
@@ -139,7 +143,11 @@ async fn reserve(
     }
     Ok(())
 }
-pub(crate) async fn in_tx(tx: &mut Transaction<'_, Postgres>, user: Uuid, id: Uuid) -> Result<Trap, AppError> {
+pub(crate) async fn in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user: Uuid,
+    id: Uuid,
+) -> Result<Trap, AppError> {
     Ok(sqlx::query_as(SELECT_ONE)
         .bind(id)
         .bind(user)
@@ -155,12 +163,11 @@ pub async fn create(
     input.trap.validate()?;
     let mut tx = owned_tx(pool, principal).await?;
     let server = servers::lock(&mut tx, principal.user.id, input.server_id).await?;
-    let deletion_pending: bool = sqlx::query_scalar(
-        "SELECT deletion_pending FROM servers WHERE server_id=$1",
-    )
-    .bind(server.server_id)
-    .fetch_one(&mut *tx)
-    .await?;
+    let deletion_pending: bool =
+        sqlx::query_scalar("SELECT deletion_pending FROM servers WHERE server_id=$1")
+            .bind(server.server_id)
+            .fetch_one(&mut *tx)
+            .await?;
     if deletion_pending {
         return Err(AppError::conflict(
             "This server is being deleted; trap creation is disabled.",
@@ -242,12 +249,11 @@ pub async fn update(
     input.trap.validate()?;
     let mut tx = owned_tx(pool, principal).await?;
     let server = lock_parent(&mut tx, principal.user.id, id).await?;
-    let deletion_pending: bool = sqlx::query_scalar(
-        "SELECT deletion_pending FROM servers WHERE server_id=$1",
-    )
-    .bind(server.server_id)
-    .fetch_one(&mut *tx)
-    .await?;
+    let deletion_pending: bool =
+        sqlx::query_scalar("SELECT deletion_pending FROM servers WHERE server_id=$1")
+            .bind(server.server_id)
+            .fetch_one(&mut *tx)
+            .await?;
     if deletion_pending {
         return Err(AppError::conflict(
             "This server is being deleted; trap changes are disabled.",

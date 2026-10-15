@@ -28,6 +28,8 @@ const MAX_PAST_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const SUPPORTED_EVENT_TYPES: &[&str] = &[
     "guest.boot",
     "guest.shutdown",
+    "guest.journal",
+    "guest.audit",
     "process.exec",
     "process.exit",
     "file.created",

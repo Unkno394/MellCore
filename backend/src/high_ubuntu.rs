@@ -14,12 +14,22 @@ pub const DEFAULT_BASE_IMAGE: &str = "/var/lib/honeyforge/images/noble-server-cl
 
 pub fn validate_profile(level: TrapLevel, service: &str, config: &Value) -> Result<(), AppError> {
     if level != TrapLevel::High || service != "ssh" {
-        return Err(AppError::invalid("high_ubuntu_ssh requires high interaction and ssh service"));
+        return Err(AppError::invalid(
+            "high_ubuntu_ssh requires high interaction and ssh service",
+        ));
     }
     if let Some(image) = config.get("base_image") {
-        let image = image.as_str().ok_or_else(|| AppError::invalid("base_image must be an absolute image path"))?;
-        if !image.is_empty() && (!image.starts_with('/') || image.len() > 4096 || image.chars().any(char::is_control)) {
-            return Err(AppError::invalid("base_image must be an absolute image path"));
+        let image = image
+            .as_str()
+            .ok_or_else(|| AppError::invalid("base_image must be an absolute image path"))?;
+        if !image.is_empty()
+            && (!image.starts_with('/')
+                || image.len() > 4096
+                || image.chars().any(char::is_control))
+        {
+            return Err(AppError::invalid(
+                "base_image must be an absolute image path",
+            ));
         }
     }
     Ok(())
@@ -36,9 +46,13 @@ pub fn deployment_command(trap: &Trap) -> Result<AgentCommand, AppError> {
         || trap.ports[0].route_mode != RouteMode::Direct
         || trap.ports[0].host_port == 0
     {
-        return Err(AppError::conflict("High SSH traps need one direct TCP port and cannot join a Dispatcher group"));
+        return Err(AppError::conflict(
+            "High SSH traps need one direct TCP port and cannot join a Dispatcher group",
+        ));
     }
-    let base_image = trap.effective_config.get("base_image")
+    let base_image = trap
+        .effective_config
+        .get("base_image")
         .and_then(Value::as_str)
         .filter(|path| !path.is_empty())
         .unwrap_or(DEFAULT_BASE_IMAGE);

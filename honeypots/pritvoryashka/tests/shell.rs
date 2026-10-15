@@ -1,15 +1,58 @@
 use chrono::{TimeZone, Utc};
+use hf_core::{BaitConfig, BaitFile, BaitKind};
 use pritvoryashka::{
     filesystem::VirtualFileSystem,
     shell::{Shell, commands::SUPPORTED, parser},
 };
+use uuid::Uuid;
 
 fn now() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).unwrap()
 }
 
 #[test]
-fn parser_supports_quotes_and_virtual_output_redirection_but_rejects_host_shell_operators() {
+fn configured_bait_is_a_real_virtual_file_and_records_only_opens() {
+    let bait = BaitFile {
+        id: Uuid::new_v4(),
+        name: "Financial report".into(),
+        path: Some("/home/admin/Documents/finance-2026.txt".into()),
+        content: "Quarterly revenue: decoy\n".into(),
+        kind: BaitKind::File,
+        implementation: None,
+        config: BaitConfig::default(),
+    };
+    let mut shell = Shell::with_baits("srv", 8192, now(), &[bait.clone()]);
+    let bait_path = bait.path.as_deref().unwrap();
+    assert!(shell.filesystem().exists(bait_path));
+    assert!(
+        shell
+            .execute("ls /home/admin/Documents", now())
+            .bait_opens
+            .is_empty()
+    );
+    let opened = shell.execute("cat /home/admin/Documents/finance-2026.txt", now());
+    assert_eq!(opened.output, bait.content);
+    assert_eq!(opened.bait_opens.len(), 1);
+    assert_eq!(opened.bait_opens[0].id, bait.id);
+    assert_eq!(opened.bait_opens[0].operation, "read");
+
+    let changed = BaitFile {
+        content: "Updated decoy\n".into(),
+        ..bait.clone()
+    };
+    let mut updated_shell = Shell::with_baits("srv", 8192, now(), &[changed]);
+    assert_eq!(
+        updated_shell
+            .execute("cat /home/admin/Documents/finance-2026.txt", now())
+            .output,
+        "Updated decoy\n"
+    );
+    let removed_shell = Shell::with_baits("srv", 8192, now(), &[]);
+    assert!(!removed_shell.filesystem().exists(bait_path));
+}
+
+#[test]
+fn parser_supports_quotes_redirection_and_virtual_shell_operators() {
     assert_eq!(
         parser::parse("echo 'hello world' \"again\"", 1024).unwrap(),
         ["echo", "hello world", "again"]
@@ -18,15 +61,26 @@ fn parser_supports_quotes_and_virtual_output_redirection_but_rejects_host_shell_
         parser::parse("echo \"$HOME\"", 1024).unwrap(),
         ["echo", "$HOME"]
     );
-    for dangerous in [
-        "cat /etc/passwd | sh",
-        "pwd && id",
-        "echo $(id)",
-        "echo `id`",
-        "pwd; id",
-    ] {
+    assert_eq!(
+        parser::parse("pwd && id; echo x | grep x", 1024).unwrap(),
+        ["pwd", "&&", "id", ";", "echo", "x", "|", "grep", "x"]
+    );
+    for dangerous in ["echo $(id)", "echo `id`", "pwd & id"] {
         assert!(parser::parse(dangerous, 1024).is_err(), "{dangerous}");
     }
+    let mut quoted_shell = Shell::new("srv", 8192, now());
+    assert_eq!(quoted_shell.execute("echo '|'", now()).output, "|\n");
+    assert_eq!(quoted_shell.execute("echo '>'", now()).output, ">\n");
+    assert_eq!(
+        quoted_shell
+            .execute("echo hello | grep hello", now())
+            .output,
+        "hello\n"
+    );
+    assert_eq!(
+        quoted_shell.execute("echo yes && echo done", now()).output,
+        "yes\ndone\n"
+    );
     assert_eq!(
         parser::parse("echo x > /tmp/x", 1024).unwrap(),
         ["echo", "x", ">", "/tmp/x"]
@@ -69,7 +123,11 @@ fn supported_commands_are_simulated_and_never_delegated() {
         "hostname",
         "date",
         "uptime",
+        "df -h",
+        "free -h",
         "ps",
+        "pgrep cron",
+        "pidof cron",
         "top",
         "kill -STOP 1312",
         "ip addr",
@@ -94,6 +152,7 @@ fn supported_commands_are_simulated_and_never_delegated() {
         "mv /tmp/copy /tmp/moved",
         "head /etc/passwd",
         "tail /etc/passwd",
+        "du /etc/passwd",
         "grep root /etc/passwd",
         "find /tmp",
         "rm /tmp/moved",
@@ -214,7 +273,7 @@ fn process_container_and_network_state_stay_consistent() {
 
     assert_eq!(
         shell
-            .execute("systemctl stop postgresql", now())
+            .execute("sudo systemctl stop postgresql", now())
             .exit_status,
         0
     );
@@ -237,27 +296,32 @@ fn process_container_and_network_state_stay_consistent() {
     );
     assert_eq!(
         shell
-            .execute("systemctl start postgresql", now())
+            .execute("sudo systemctl start postgresql", now())
             .exit_status,
         0
     );
     assert!(shell.execute("ss -lntp", now()).output.contains(":5432"));
     assert!(shell.filesystem().exists("/proc/721/status"));
 
-    assert_eq!(shell.execute("kill -STOP 763", now()).exit_status, 0);
+    assert_eq!(shell.execute("kill -STOP 1224", now()).exit_status, 0);
     assert!(
         shell
             .execute("ps aux", now())
             .output
             .lines()
-            .any(|line| { line.contains("763") && line.contains(" T ") })
+            .any(|line| { line.contains("1224") && line.contains(" T ") })
     );
     assert!(shell.execute("ss -lntp", now()).output.contains(":6379"));
-    assert_eq!(shell.execute("kill -CONT 763", now()).exit_status, 0);
-    assert_eq!(shell.execute("kill -KILL 763", now()).exit_status, 0);
-    assert!(!shell.execute("ss -lntp", now()).output.contains(":6379"));
-    assert!(!shell.execute("ps aux", now()).output.contains("763"));
-    assert!(!shell.filesystem().exists("/proc/763"));
+    assert_eq!(shell.execute("kill -CONT 1224", now()).exit_status, 0);
+    assert_eq!(shell.execute("kill -KILL 1224", now()).exit_status, 0);
+    let sockets_after_redis_exit = shell.execute("ss -lntp", now()).output;
+    assert!(
+        !sockets_after_redis_exit.contains(":6379"),
+        "Redis socket remained after process exit: {sockets_after_redis_exit}\nservice status: {}",
+        shell.execute("systemctl status redis-server", now()).output
+    );
+    assert!(!shell.execute("ps aux", now()).output.contains("1224"));
+    assert!(!shell.filesystem().exists("/proc/1224"));
 }
 
 #[test]
@@ -279,7 +343,12 @@ fn companyctl_help_is_a_successful_command() {
 #[test]
 fn stopping_docker_daemon_terminates_containers_until_explicit_restart() {
     let mut shell = Shell::new("srv", 8192, now());
-    assert_eq!(shell.execute("systemctl stop docker", now()).exit_status, 0);
+    assert_eq!(
+        shell
+            .execute("sudo systemctl stop docker", now())
+            .exit_status,
+        0
+    );
     let ps = shell.execute("ps aux", now()).output;
     for pid in ["901", "1134", "1188"] {
         assert!(!ps.lines().any(|line| line.contains(pid)), "PID {pid}");
@@ -295,7 +364,9 @@ fn stopping_docker_daemon_terminates_containers_until_explicit_restart() {
     );
 
     assert_eq!(
-        shell.execute("systemctl start docker", now()).exit_status,
+        shell
+            .execute("sudo systemctl start docker", now())
+            .exit_status,
         0
     );
     assert!(shell.filesystem().exists("/proc/901/status"));
@@ -455,7 +526,7 @@ fn mutable_bait_state_is_isolated_and_invalid_commands_are_bounded() {
         "kill nope",
         "kill -NOPE 1312",
         "docker inspect missing",
-        "systemctl restart missing",
+        "sudo systemctl restart missing",
         "psql -c 'drop database billing'",
         "authorized_keys add invalid",
         "companyctl backups restore missing",

@@ -19,6 +19,13 @@ Control Plane строит проверенный JSON вида example.json, а
 
 Изменение весов и целей на уже слушаемом порту применяется без обрыва действующих TCP-соединений. Добавление или удаление публичного порта требует controlled restart/reconcile диспетчера.
 
+Для Middle target использует PROXY protocol v2: Dispatcher сообщает исходный IP и
+порт клиента, подписывая адреса HMAC-SHA256 с индивидуальным ключом ловушки.
+Middle требует и проверяет подпись только на loopback-бэкенде. Dispatcher строит
+заголовок из адреса, полученного через `accept()`, поэтому присланные клиентом
+байты PROXY не могут подменить адрес для adaptive SSH-авторизации и telemetry.
+Low/Kozyavka targets остаются прозрачным TCP-проксированием без заголовка.
+
 Запуск: cargo run -p hf-dispatcher -- --config deploy/dispatcher/example.json
 
 Следующая связка с агентом: Control Plane генерирует этот конфиг из групп трапов по host_port, отправляет агенту команды перепубликовать Docker-порты в loopback и обновить Dispatcher через HFSP.

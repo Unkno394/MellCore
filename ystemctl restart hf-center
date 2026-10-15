@@ -1,0 +1,211 @@
+[33mcommit 90cc313464df5ff43aad215b10826b029a55b5f9[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m
+Merge: a7e08e9 16ebeb1
+Author: root <root@vm16006995.example.com>
+Date:   Tue Oct 13 19:12:01 2026 +0300
+
+    Merge remote-tracking branch 'origin/main'
+
+[33mcommit a7e08e931d40dde21a3751e1feea004b62147775[m
+Author: root <root@vm16006995.example.com>
+Date:   Tue Oct 13 19:11:26 2026 +0300
+
+    OMG ITS WORK
+
+[33mcommit 16ebeb19ebd58a70d918bfb3c826bb7dd238fd96[m[33m ([m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Author: abobafrog <allo100717@gmail.com>
+Date:   Tue Oct 13 17:07:19 2026 +0300
+
+    дебаггинг
+
+[33mcommit 9e8975a6235f27f4f69c066bd340301a801f34ac[m
+Merge: 9b4232b a3449f3
+Author: root <root@vm16006995.example.com>
+Date:   Tue Oct 13 03:35:38 2026 +0300
+
+    Merge remote-tracking branch 'origin/main'
+
+[33mcommit 9b4232bf7faed919d4ac91088d2e86f124294ccb[m
+Author: root <root@vm16006995.example.com>
+Date:   Tue Oct 13 03:33:16 2026 +0300
+
+    prostitytka
+
+[33mcommit a3449f3e4758bc8f4f7a34617d910967af7df585[m
+Merge: 3b69f2f b6b89cc
+Author: abobafrog <allo100717@gmail.com>
+Date:   Tue Oct 13 01:44:26 2026 +0300
+
+    Merge branch 'frontend-integration'
+
+[33mcommit b6b89cc96a4956d11c0813937982434f3e2873a9[m
+Author: abobafrog <allo100717@gmail.com>
+Date:   Tue Oct 13 01:43:50 2026 +0300
+
+    10 заболеваний венерологии
+
+[33mcommit 3b69f2f6b0a23d3202908082ecd55dfe0bfd99a9[m
+Author: root <root@vm16006995.example.com>
+Date:   Mon Oct 12 23:58:41 2026 +0300
+
+    epta
+
+[33mcommit c67508be0c2d7ef8bbff19e1385c449752aa01bc[m
+Author: root <root@vm16006995.example.com>
+Date:   Mon Oct 12 22:59:54 2026 +0300
+
+    blya
+
+[33mcommit 46c2c2f3794913a5cad0623087515dc03266f162[m
+Author: root <root@vm16006995.example.com>
+Date:   Mon Oct 12 14:59:41 2026 +0300
+
+    Trollface
+
+[33mcommit f4e95103f3e9ee677b24691f793dd087f497dc8b[m[33m ([m[1;32mmonitoring-security[m[33m)[m
+Merge: bd7c4b0 cf1a569
+Author: root <root@vm16006995.example.com>
+Date:   Mon Oct 12 14:55:13 2026 +0300
+
+    Merge frontend integration
+
+[33mcommit bd7c4b0338b785cd1774b2fa00db2c7e5cb808fb[m
+Author: root <root@vm16006995.example.com>
+Date:   Mon Oct 12 14:48:25 2026 +0300
+
+    Мониторинг и безопасность
+
+[33mcommit cf1a569250d6173b80761ce1e4dec93452a1f97e[m[33m ([m[1;31morigin/frontend-integration[m[33m)[m
+Author: abobafrog <allo100717@gmail.com>
+Date:   Mon Oct 12 14:20:28 2026 +0300
+
+    Update backend README
+
+[33mcommit 6fd9d8ff25a5e05a1a8a554fd7777868c861ae0c[m
+Author: abobafrog <allo100717@gmail.com>
+Date:   Mon Oct 12 12:57:34 2026 +0300
+
+    Integrate Dashboard with MellCore management API
+
+[33mcommit c10279aa9cebf6fd9e7cb3fddc56c99c339dccb8[m
+Merge: 3453f49 e3d206c
+Author: abobafrog <allo100717@gmail.com>
+Date:   Mon Oct 12 12:36:54 2026 +0300
+
+    Import HoneyPot Dashboard frontend
+    
+    git-subtree-dir: frontend
+    git-subtree-mainline: 3453f4942b5a6e31a81854c624b148272760b3ea
+    git-subtree-split: e3d206cb27baaa712ff83b4206bd481566edd98f
+
+[33mcommit 3453f4942b5a6e31a81854c624b148272760b3ea[m
+Merge: 9594e4a 7fbef2f
+Author: abobafrog <allo100717@gmail.com>
+Date:   Mon Oct 12 12:27:28 2026 +0300
+
+    Merge High telemetry with Kazik and ClickHouse
+
+[33mcommit 9594e4aa4b66b33dcf37cf94001c5bfa550c88e1[m
+Author: abobafrog <allo100717@gmail.com>
+Date:   Mon Oct 12 12:01:05 2026 +0300
+
+    Implement High honeypot telemetry and VM lifecycle
+
+[33mcommit 7fbef2f9b51937ed0c9447c8b63ed69fe49629bd[m
+Author: root <root@vm16006995.example.com>
+Date:   Mon Oct 12 04:06:56 2026 +0300
+
+    add clickhouse and kazik
+
+[33mcommit e3d206cb27baaa712ff83b4206bd481566edd98f[m
+Author: Krivenko Eva <evakrivenko08@mail.ru>
+Date:   Mon Oct 12 02:47:03 2026 +0300
+
+    уведы
+
+[33mcommit e4ffd551a3236aff3ce377933bc6cd0477c22332[m
+Author: Krivenko Eva <evakrivenko08@mail.ru>
+Date:   Mon Oct 12 01:52:04 2026 +0300
+
+    Обновлен MellCore
+
+[33mcommit 7eabcc378ec34a387fc9767477cec97c5d7f2f89[m
+Author: root <root@vm16006995.example.com>
+Date:   Mon Oct 12 01:01:04 2026 +0300
+
+    Add trap telemetry forwarding and VPS deployment
+
+[33mcommit 7a787790372f0de928459561b3a6e8f01a791196[m
+Merge: d339144 6e2ce41
+Author: gwiill25 <evakrivenko08@mail.ru>
+Date:   Sun Oct 11 19:31:22 2026 +0300
+
+    Merge pull request #1 from gwiill25/feature/live-feed-sessions-settings
+    
+    Add Live Feed, Sessions and Settings pages
+
+[33mcommit 7f11966e915ff0ada60fa97fc97e16590e3f2ed2[m
+Author: unkno394 <akimenkovaleria403@gmail.com>
+Date:   Sun Oct 11 19:28:40 2026 +0300
+
+    add agent-managed low and middle honeypot deployment
+
+[33mcommit 6e2ce41f547b77337afa24ba0f4dad72066e3a53[m
+Author: dubinciktimofej <dubinciktimofej18@gmail.com>
+Date:   Sun Oct 11 19:20:19 2026 +0300
+
+    Add Live Feed, Sessions and Settings pages
+
+[33mcommit 1a817188de6e86975ed60ab073ad649ae03497ee[m
+Author: Тимофей <timofej@MacBook-Air-Timofej.local>
+Date:   Sun Oct 11 14:09:44 2026 +0300
+
+    Pritvoryashka and math
+
+[33mcommit 70553501946abc33de7b50fa396eaaeae89737ee[m
+Author: unkno394 <akimenkovaleria403@gmail.com>
+Date:   Sun Oct 11 04:30:07 2026 +0300
+
+    add Ubuntu VM honeypot bootstrap and minimal agent
+
+[33mcommit d339144e613883d439be8b7bd9039d2100e3637e[m
+Author: Krivenko Eva <evakrivenko08@mail.ru>
+Date:   Sun Oct 11 01:45:10 2026 +0300
+
+    Connect honeypot creation with inventory
+
+[33mcommit 447473d4888bb4ef996941d3520dc2116fdd3a78[m
+Merge: 939c1d1 933c1c7
+Author: unkno394 <akimenkovaleria403@gmail.com>
+Date:   Sat Oct 10 21:26:13 2026 +0300
+
+    Merge branch 'mell_telifon_67'
+
+[33mcommit 933c1c784db2c58e9e5032c2a6ffe3f12c41164b[m[33m ([m[1;31morigin/mell_telifon_67[m[33m)[m
+Author: Тимофей <timofej@MacBook-Air-Timofej.local>
+Date:   Sat Oct 10 21:08:01 2026 +0300
+
+    spooky scary
+
+[33mcommit 8e8726ef54deec46d404781077549b5f138b07b4[m
+Author: Krivenko Eva <evakrivenko08@mail.ru>
+Date:   Sat Oct 10 20:17:48 2026 +0300
+
+    Add MellCore authentication interface
+
+[33mcommit 939c1d15b3991e94bcecc014cadc7fe06f873ddf[m
+Author: unkno394 <akimenkovaleria403@gmail.com>
+Date:   Sat Oct 10 15:59:46 2026 +0300
+
+    first commit
+
+[33mcommit 26d390becbab26c5d22cbf696de15cfbae06d5e5[m
+Author: Krivenko Eva <evakrivenko08@mail.ru>
+Date:   Sat Oct 10 01:32:04 2026 +0300
+
+    Add honeypots and profiles pages
+
+[33mcommit 804871f23b0a69a49e8fb33f4503f2a1c41f8186[m
+Author: Krivenko Eva <evakrivenko08@mail.ru>
+Date:   Fri Oct 9 22:26:06 2026 +0300
+
+    Initial commit: Honeypot Dashboard

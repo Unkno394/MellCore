@@ -96,6 +96,11 @@ fn normalize(event: &IncomingEvent, trusted_center: bool) -> Action {
             resource_class = resource(event.payload["path"].as_str().unwrap_or(""));
             "filesystem.access"
         }
+        "bait.opened" if simulated => {
+            process = "virtual_filesystem".into();
+            resource_class = "bait_file";
+            "deception.bait_open"
+        }
         "security.host_exec_from_trap" if kernel => "boundary.host_exec",
         "security.namespace_mismatch" if kernel => "boundary.namespace_mismatch",
         "security.escape_confirmed" if confirmed => "boundary.escape_confirmed",
@@ -133,7 +138,16 @@ fn normalize(event: &IncomingEvent, trusted_center: bool) -> Action {
         }
         _ => "event.other",
     };
-    let outcome = if confirmed {
+    let outcome = if event.event_type == "bait.opened" && simulated {
+        match (
+            event.payload["accepted"].as_bool(),
+            event.payload["success"].as_bool(),
+        ) {
+            (Some(true), _) | (None, Some(true)) | (None, None) => "succeeded",
+            (Some(false), _) => "denied",
+            (None, Some(false)) => "failed",
+        }
+    } else if confirmed {
         "confirmed"
     } else if kernel && event.event_type == "security.resource_access" {
         match event.payload["outcome"].as_str() {
@@ -197,7 +211,10 @@ fn normalize(event: &IncomingEvent, trusted_center: bool) -> Action {
             "resource":event.payload.get("resource"),"outcome":event.payload.get("outcome"),
             "cgroup":event.payload.get("cgroup"),"pid_namespace":event.payload.get("pid_namespace"),
             "mount_namespace":event.payload.get("mount_namespace"),"boot_id":event.payload.get("boot_id"),
-            "pid":event.payload.get("pid"),"start_ticks":event.payload.get("start_ticks")}),
+            "pid":event.payload.get("pid"),"start_ticks":event.payload.get("start_ticks"),
+            "bait_id":event.payload.get("bait_id"),"bait_name":event.payload.get("bait_name"),
+            "bait_kind":event.payload.get("bait_kind"),
+            "bait_path":event.payload.get("path")}),
     }
 }
 
@@ -249,7 +266,7 @@ pub async fn observe(
     for node in nodes {
         let technique: Uuid = node.get("technique_id");
         let node_id: Uuid = node.get("node_id");
-        let prior = sqlx::query("SELECT active_nodes,evidence_event_ids,status,last_occurred_at FROM attack_graph_progress WHERE agent_id=$1 AND trap_id=$2 AND session_key=$3 AND technique_id=$4 FOR UPDATE")
+        let prior = sqlx::query("SELECT active_nodes,evidence_event_ids,node_evidence,status,last_occurred_at FROM attack_graph_progress WHERE agent_id=$1 AND trap_id=$2 AND session_key=$3 AND technique_id=$4 FOR UPDATE")
             .bind(agent_id).bind(event.trap_id).bind(&action.session_key).bind(technique).fetch_optional(&mut **tx).await?;
         // One event may satisfy several wildcard nodes; count it once per
         // technique so a single syscall cannot invent a multi-step attack.
@@ -295,11 +312,28 @@ pub async fn observe(
         };
         active.truncate(MAX_NODES);
         evidence.truncate(MAX_EVIDENCE);
-        let reachable = node.get::<bool, _>("is_start") || active.contains(&node_id)
-            || sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM attack_graph_edges WHERE from_node=ANY($1) AND to_node=$2)")
-                .bind(&active).bind(node_id).fetch_one(&mut **tx).await?;
+        let mut node_evidence = if expired {
+            json!({})
+        } else {
+            prior
+                .as_ref()
+                .map(|r| r.get::<Value, _>("node_evidence"))
+                .unwrap_or_else(|| json!({}))
+        };
+        let parent: Option<Uuid> = sqlx::query_scalar("SELECT from_node FROM attack_graph_edges WHERE from_node=ANY($1) AND to_node=$2 ORDER BY from_node LIMIT 1")
+            .bind(&active).bind(node_id).fetch_optional(&mut **tx).await?;
+        let reachable =
+            node.get::<bool, _>("is_start") || active.contains(&node_id) || parent.is_some();
         if !reachable && !action.confirmed {
             continue;
+        }
+        if !active.contains(&node_id) {
+            node_evidence[node_id.to_string()] = json!({
+                "event_id": event.event_id,
+                "observed_outcome": action.outcome,
+                "occurred_at": event.occurred_at,
+                "from_node": parent,
+            });
         }
         extend(&mut active, &mut evidence, node_id, event.event_id);
         let status = if action.confirmed {
@@ -311,14 +345,15 @@ pub async fn observe(
         };
         let coverage =
             (active.len() as f32 / node.get::<i64, _>("node_count").max(1) as f32).min(1.0);
-        sqlx::query(r#"INSERT INTO attack_graph_progress(agent_id,trap_id,session_key,technique_id,active_nodes,evidence_event_ids,status,similarity,last_occurred_at)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        sqlx::query(r#"INSERT INTO attack_graph_progress(agent_id,trap_id,session_key,technique_id,active_nodes,evidence_event_ids,status,similarity,last_occurred_at,node_evidence)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             ON CONFLICT(agent_id,trap_id,session_key,technique_id) DO UPDATE SET
             active_nodes=EXCLUDED.active_nodes,evidence_event_ids=EXCLUDED.evidence_event_ids,
             status=CASE WHEN attack_graph_progress.status='confirmed' THEN 'confirmed' ELSE EXCLUDED.status END,
-            similarity=EXCLUDED.similarity,last_occurred_at=GREATEST(attack_graph_progress.last_occurred_at,EXCLUDED.last_occurred_at),updated_at=now()"#)
+            similarity=EXCLUDED.similarity,last_occurred_at=GREATEST(attack_graph_progress.last_occurred_at,EXCLUDED.last_occurred_at),
+            node_evidence=EXCLUDED.node_evidence,updated_at=now()"#)
             .bind(agent_id).bind(event.trap_id).bind(&action.session_key).bind(technique)
-            .bind(&active).bind(&evidence).bind(status).bind(coverage).bind(event.occurred_at).execute(&mut **tx).await?;
+            .bind(&active).bind(&evidence).bind(status).bind(coverage).bind(event.occurred_at).bind(&node_evidence).execute(&mut **tx).await?;
     }
     // Ordinary logins/connections are not proposed as new Docker escape variants.
     if !matched_semantics
@@ -341,6 +376,23 @@ pub async fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bait_open_is_normalized_with_identity_for_engagement_analysis() {
+        let bait_id = Uuid::new_v4();
+        let action = normalize(
+            &event(
+                "bait.opened",
+                json!({"bait_id":bait_id,"bait_name":"Report","path":"/home/admin/Documents/report.txt","operation":"read"}),
+            ),
+            false,
+        );
+        assert_eq!(action.kind, "deception.bait_open");
+        assert_eq!(action.resource, "bait_file");
+        assert_eq!(action.outcome, "succeeded");
+        assert_eq!(action.environment["bait_id"], json!(bait_id));
+        assert!(!action.confirmed);
+    }
     fn event(kind: &str, payload: Value) -> IncomingEvent {
         IncomingEvent {
             event_id: Uuid::new_v4(),

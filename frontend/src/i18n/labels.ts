@@ -25,6 +25,7 @@ export function eventLabel(value: string): string {
     'auth.succeeded': 'Вход выполнен', 'session.started': 'Сеанс начат',
     'session.ended': 'Сеанс завершён', 'command.executed': 'Выполнена команда',
     'filesystem.accessed': 'Доступ к файлу',
+    'bait.opened': 'Открыта приманка',
   }
   return labels[value] ?? value
 }

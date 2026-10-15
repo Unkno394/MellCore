@@ -11,8 +11,8 @@ use anyhow::{Context, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use hf_services::kazik_outbox::SqliteKazikOutbox;
 use kazik_protocol::{
-    DurableOutbox, KazikBody, KazikEnvelope, MAX_TELEMETRY_BATCH_EVENTS,
-    MAX_TELEMETRY_BATCH_WAIT, MAX_TELEMETRY_PACKET_BYTES, TrapEvent,
+    DurableOutbox, KazikBody, KazikEnvelope, MAX_TELEMETRY_BATCH_EVENTS, MAX_TELEMETRY_BATCH_WAIT,
+    MAX_TELEMETRY_PACKET_BYTES, TrapEvent,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -131,7 +131,9 @@ fn collect_middle(
                 event.trap_id = trap_id;
                 event
             })),
-            Err(error) => tracing::warn!(%error, trap_id = %trap_id, "skipping malformed Middle telemetry line"),
+            Err(error) => {
+                tracing::warn!(%error, trap_id = %trap_id, "skipping malformed Middle telemetry line")
+            }
         }
     }
     let count = queue_events(events, identity, outbox)?;
@@ -246,22 +248,26 @@ pub(crate) fn batch_wait() -> std::time::Duration {
 }
 
 pub(crate) fn is_critical_event(event: &TrapEvent) -> bool {
-    let host_observer = event.metadata.get("source").and_then(Value::as_str)
-        == Some("hf-agent-ebpf");
-    (host_observer && matches!(
-        event.event_type.as_str(),
-        "security.escape_confirmed"
-            | "security.namespace_mismatch"
-            | "security.host_exec_from_trap"
-    )) || matches!(
-        event.event_type.as_str(),
-        "security.trap_quarantined" | "security.trap_quarantine_failed"
-    ) || (host_observer
-        && (event.payload.get("policy_decision").and_then(Value::as_str) == Some("isolate_trap")
+    let host_observer =
+        event.metadata.get("source").and_then(Value::as_str) == Some("hf-agent-ebpf");
+    (host_observer
+        && matches!(
+            event.event_type.as_str(),
+            "security.escape_confirmed"
+                | "security.namespace_mismatch"
+                | "security.host_exec_from_trap"
+        ))
         || matches!(
-            event.metadata.get("assessment").and_then(Value::as_str),
-            Some("confirmed" | "isolated")
-        )))
+            event.event_type.as_str(),
+            "security.trap_quarantined" | "security.trap_quarantine_failed"
+        )
+        || (host_observer
+            && (event.payload.get("policy_decision").and_then(Value::as_str)
+                == Some("isolate_trap")
+                || matches!(
+                    event.metadata.get("assessment").and_then(Value::as_str),
+                    Some("confirmed" | "isolated")
+                )))
 }
 
 pub(crate) fn enqueue_immediate_event(
@@ -308,7 +314,10 @@ fn plan_batches(
             }
             let envelope = telemetry_envelope(identity, sent_at_unix_ms, vec![event.clone()]);
             ensure_packet_size(&envelope).with_context(|| {
-                format!("critical event {} cannot fit in one HFSP packet", event.event_id)
+                format!(
+                    "critical event {} cannot fit in one HFSP packet",
+                    event.event_id
+                )
             })?;
             chunks.push((vec![event], true));
             continue;
@@ -330,7 +339,10 @@ fn plan_batches(
             chunks.push((std::mem::take(&mut normal), false));
             let single = telemetry_envelope(identity, sent_at_unix_ms, vec![event.clone()]);
             ensure_packet_size(&single).with_context(|| {
-                format!("telemetry event {} cannot fit in one HFSP packet", event.event_id)
+                format!(
+                    "telemetry event {} cannot fit in one HFSP packet",
+                    event.event_id
+                )
             })?;
         }
         normal.push(event);
@@ -391,7 +403,9 @@ fn write_cursor(path: &Path, value: &[u8]) -> anyhow::Result<()> {
 impl From<MiddleEvent> for TrapEvent {
     fn from(mut event: MiddleEvent) -> Self {
         // Container-controlled JSON cannot impersonate the host observer.
-        if !event.metadata.is_object() { event.metadata = serde_json::json!({}); }
+        if !event.metadata.is_object() {
+            event.metadata = serde_json::json!({});
+        }
         event.metadata["source"] = serde_json::json!("pritvoryashka");
         event.metadata["evidence_domain"] = serde_json::json!("simulated");
         if let Some(metadata) = event.metadata.as_object_mut() {
@@ -457,12 +471,29 @@ mod tests {
     #[test]
     fn batches_preserve_order_fields_and_twenty_event_limit() {
         let identity = identity();
-        let input: Vec<_> = (0..45).map(|index| event(index, "command.executed", 4)).collect();
+        let input: Vec<_> = (0..45)
+            .map(|index| event(index, "command.executed", 4))
+            .collect();
         let expected = input.clone();
         let batches = plan_batches(input, &identity, 100).unwrap();
-        assert_eq!(batches.iter().map(|batch| events_in(batch).len()).collect::<Vec<_>>(), vec![20, 20, 5]);
-        assert!(batches.iter().all(|batch| events_in(batch).len() <= MAX_TELEMETRY_BATCH_EVENTS));
-        assert!(batches.iter().all(|batch| batch.envelope.encode_hfsp(0, 0).unwrap().len() <= MAX_TELEMETRY_PACKET_BYTES));
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| events_in(batch).len())
+                .collect::<Vec<_>>(),
+            vec![20, 20, 5]
+        );
+        assert!(
+            batches
+                .iter()
+                .all(|batch| events_in(batch).len() <= MAX_TELEMETRY_BATCH_EVENTS)
+        );
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.envelope.encode_hfsp(0, 0).unwrap().len()
+                    <= MAX_TELEMETRY_PACKET_BYTES)
+        );
         let actual: Vec<_> = batches.iter().flat_map(events_in).cloned().collect();
         assert_eq!(actual, expected);
     }
@@ -471,13 +502,29 @@ mod tests {
     fn splits_on_encoded_packet_size_and_rejects_one_oversized_event() {
         let identity = identity();
         let batches = plan_batches(
-            vec![event(1, "command.executed", 6_000), event(2, "command.executed", 6_000), event(3, "command.executed", 6_000)],
+            vec![
+                event(1, "command.executed", 6_000),
+                event(2, "command.executed", 6_000),
+                event(3, "command.executed", 6_000),
+            ],
             &identity,
             100,
-        ).unwrap();
-        assert_eq!(batches.iter().map(|batch| events_in(batch).len()).sum::<usize>(), 3);
+        )
+        .unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| events_in(batch).len())
+                .sum::<usize>(),
+            3
+        );
         assert!(batches.len() >= 2);
-        assert!(batches.iter().all(|batch| batch.envelope.encode_hfsp(0, 0).unwrap().len() <= MAX_TELEMETRY_PACKET_BYTES));
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.envelope.encode_hfsp(0, 0).unwrap().len()
+                    <= MAX_TELEMETRY_PACKET_BYTES)
+        );
         assert!(plan_batches(vec![event(4, "command.executed", 20_000)], &identity, 100).is_err());
     }
 
@@ -490,10 +537,17 @@ mod tests {
         critical.metadata = serde_json::json!({"source":"hf-agent-ebpf","assessment":"confirmed"});
         let normal_after = event(3, "command.executed", 0);
         let mut outbox = SqliteKazikOutbox::open(state_dir.join("outbox.sqlite")).unwrap();
-        queue_events(vec![normal_before, critical.clone(), normal_after], &identity, &mut outbox).unwrap();
+        queue_events(
+            vec![normal_before, critical.clone(), normal_after],
+            &identity,
+            &mut outbox,
+        )
+        .unwrap();
         let pending = outbox.pending(10).unwrap();
         assert_eq!(pending.len(), 3);
-        let KazikBody::Telemetry { events } = &pending[0].body else { panic!("expected telemetry") };
+        let KazikBody::Telemetry { events } = &pending[0].body else {
+            panic!("expected telemetry")
+        };
         assert_eq!(events.as_slice(), &[critical]);
         drop(outbox);
         fs::remove_dir_all(state_dir).unwrap();

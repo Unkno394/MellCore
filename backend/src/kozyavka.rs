@@ -91,7 +91,12 @@ pub fn runtime_config(trap: &Trap) -> Result<RuntimeConfig, AppError> {
     }
     let settings = validate_profile(profile.level, &profile.service_type, &trap.effective_config)?;
     let port = validate_ports(&trap.ports)?;
-    let container_port = if trap.ports[0].route_mode == crate::resources::RouteMode::DispatcherBackend { 2222 } else { port };
+    let container_port =
+        if trap.ports[0].route_mode == crate::resources::RouteMode::DispatcherBackend {
+            2222
+        } else {
+            port
+        };
     Ok(RuntimeConfig {
         bind_address: settings.bind_address,
         port: container_port,

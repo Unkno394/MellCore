@@ -2,6 +2,7 @@ import { ApiClient } from './client'
 import type {
   AttackEvent,
   AttackGraphMatch,
+  BaitEngagement,
   BootstrapProgress,
   BootstrapServerInput,
   CursorPage,
@@ -99,7 +100,7 @@ export function createApi(client: ApiClient) {
           body: { expected_version: server.version, server: input },
         }),
       delete: (id: string) =>
-        client.request<DeleteServerResult>(`/servers/${id}`, { method: 'DELETE' }),
+        client.request<DeleteServerResult>(`/servers/${id}`, { method: 'DELETE', timeoutMs: 60_000 }),
       action: (id: string, action: 'reboot') =>
         client.request<ServerActionProgress>(`/servers/${id}/actions`, { method: 'POST', body: { action } }),
       actionStatus: (serverId: string, actionId: string) =>
@@ -121,8 +122,11 @@ export function createApi(client: ApiClient) {
         }),
       delete: (id: string) =>
         client.request<void>(`/traps/${id}`, { method: 'DELETE' }),
-      events: async (id: string): Promise<CursorPage<AttackEvent>> => {
-        const page = await client.request<CursorPage<StoredAttackEvent>>(`/traps/${id}/events?limit=100`)
+      events: async (id: string, after: string | null = null, limit = 100, q = ''): Promise<CursorPage<AttackEvent>> => {
+        const params = new URLSearchParams({ limit: String(limit) })
+        if (after) params.set('after', after)
+        if (q.trim()) params.set('q', q.trim())
+        const page = await client.request<CursorPage<StoredAttackEvent>>(`/traps/${id}/events?${params}`)
         return {
           ...page,
           items: page.items.map(({ schema_version, agent_id, server_id, received_at, expires_at, ...event }) => ({
@@ -130,8 +134,14 @@ export function createApi(client: ApiClient) {
           })),
         }
       },
+      event: async (id: string, eventId: string): Promise<AttackEvent> => {
+        const { schema_version, agent_id, server_id, received_at, expires_at, ...event } = await client.request<StoredAttackEvent>(`/traps/${id}/events/${eventId}`)
+        return { schema_version, agent_id, server_id, received_at, expires_at, event }
+      },
       attackMatches: (id: string) =>
         client.request<AttackGraphMatch[]>(`/traps/${id}/attack-matches`),
+      baitEngagement: (id: string) =>
+        client.request<BaitEngagement[]>(`/traps/${id}/bait-engagement`),
       action: (id: string, action: TrapAction) =>
         client.request<TrapActionProgress>(`/traps/${id}/actions`, { method: 'POST', body: { action } }),
       actionStatus: (trapId: string, actionId: string) =>

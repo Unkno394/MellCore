@@ -67,11 +67,19 @@ pub struct ContainerResourceLimits {
 
 impl ContainerResourceLimits {
     pub fn low_default() -> Self {
-        Self { cpu_cores: 0.5, memory_mb: 128, pids: 64 }
+        Self {
+            cpu_cores: 0.5,
+            memory_mb: 128,
+            pids: 64,
+        }
     }
 
     pub fn middle_default() -> Self {
-        Self { cpu_cores: 1.0, memory_mb: 512, pids: 256 }
+        Self {
+            cpu_cores: 1.0,
+            memory_mb: 512,
+            pids: 256,
+        }
     }
 
     pub fn validate_for_level(&self, level: crate::models::TrapLevel) -> Result<(), AppError> {
@@ -80,21 +88,33 @@ impl ContainerResourceLimits {
             crate::models::TrapLevel::Medium => (1.0, 512, 256),
             crate::models::TrapLevel::High => (0.5, 128, 64),
         };
-        if !self.cpu_cores.is_finite() || self.cpu_cores < 0.05 || self.cpu_cores > cpu
-            || !(32..=memory).contains(&self.memory_mb) || !(16..=pids).contains(&self.pids) {
-            return Err(AppError::invalid("Container resource limits are outside the selected trap tier policy"));
+        if !self.cpu_cores.is_finite()
+            || self.cpu_cores < 0.05
+            || self.cpu_cores > cpu
+            || !(32..=memory).contains(&self.memory_mb)
+            || !(16..=pids).contains(&self.pids)
+        {
+            return Err(AppError::invalid(
+                "Container resource limits are outside the selected trap tier policy",
+            ));
         }
         Ok(())
     }
 }
 
 impl Default for ContainerResourceLimits {
-    fn default() -> Self { Self::low_default() }
+    fn default() -> Self {
+        Self::low_default()
+    }
 }
 
 impl From<ContainerResourceLimits> for AgentContainerResourceLimits {
     fn from(value: ContainerResourceLimits) -> Self {
-        Self { cpu_cores: value.cpu_cores, memory_mb: value.memory_mb, pids: value.pids }
+        Self {
+            cpu_cores: value.cpu_cores,
+            memory_mb: value.memory_mb,
+            pids: value.pids,
+        }
     }
 }
 
@@ -326,7 +346,9 @@ impl TrapInput {
                 || !seen.insert((port.transport, port.host_port))
                 || (port.route_mode == RouteMode::DispatcherBackend
                     && port.transport != Transport::Tcp)
-                || port.weight.is_some_and(|weight| weight == 0 || weight > 100)
+                || port
+                    .weight
+                    .is_some_and(|weight| weight == 0 || weight > 100)
                 || (port.route_mode == RouteMode::Direct && port.weight.is_some())
             {
                 return Err(AppError::invalid("Invalid or duplicate port binding"));

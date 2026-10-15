@@ -13,7 +13,9 @@ OpenSSH. Reset удаляет NAT-правила экземпляра, оста�
 следующий запуск создаёт чистый экземпляр.
 
 cloud-init настраивает уже присутствующий в trusted image OpenSSH, добавляет приманочные данные
-и офлайн устанавливает гостевой telemetry sensor из seed ISO. Во время cloud-init пакеты из
+и офлайн устанавливает гостевой telemetry sensor из seed ISO. Гостевой journal переводится в
+постоянное хранилище до запуска sensor, чтобы можно было дочитать записи после перезапуска VM.
+Во время cloud-init пакеты из
 Интернета не устанавливаются: в базовом образе должны присутствовать `python3`, `journalctl` и
 `sshd`. При первом запуске Agent сам скачивает
 официальный Ubuntu 24.04 amd64 cloud image в `/var/lib/honeyforge/images/`, сверяет SHA-256 с
@@ -46,7 +48,10 @@ libvirt создаёт приватный virtio-serial channel с именем
 Sensor не является полностью скрытым: root внутри скомпрометированной VM может увидеть,
 остановить или подменить его, поэтому host считает все guest-поля недоверенными.
 
-Sensor читает journal OpenSSH и `/var/log/audit/audit.log`. Он формирует `guest.boot`,
+Sensor передаёт записи всего systemd journal (кроме собственных сообщений, чтобы не создать
+петлю) как `guest.journal` и строки `/var/log/audit/audit.log` как `guest.audit`.
+Сообщения длиннее лимита кадра обрезаются с явным флагом `message_truncated` или
+`line_truncated`. Дополнительно он формирует `guest.boot`,
 `guest.shutdown`, `sensor.heartbeat`, SSH authentication/session, `process.exec`, ограниченный
 `process.exit`, file create/modify/delete/rename/permissions, outbound connect и sudo/su events.
 Audit records группируются по serial до `EOE`; `ses` используется как SSH/audit session context.
@@ -60,6 +65,10 @@ host ACK событие остаётся в ограниченном guest outbo
 Host queue по умолчанию ограничена 100000 событиями
 (`HF_HIGH_TELEMETRY_MAX_PENDING`). При заполнении ACK не отправляется, поэтому guest продолжает
 повтор. Guest outbox ограничен 10000 событиями и 16 MiB; переполнение явно пишется в journal.
+При исчерпании обеих очередей чтение journal останавливается до освобождения места; для
+дочитывания важна сохранность журнала в самой VM. Ротация audit.log при длительной недоступности
+агента может удалить ещё не считанные строки. Поэтому абсолютная доставка при исчерпании диска или
+ротации исходных журналов не гарантируется.
 Незавершённые audit groups также ограничены 1024; вытеснение отражается diagnostic counter/event.
 `process.exec` означает подтверждённый kernel audit syscall, а не обязательно строку, введённую в
 shell. Built-ins (`cd`, `export`, aliases) без `execve` не видны. `process.exit` отражает вызов

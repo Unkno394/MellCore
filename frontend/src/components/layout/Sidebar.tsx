@@ -1,20 +1,31 @@
-
+import {
+  Activity,
+  Bug,
+  Crosshair,
+  LayoutDashboard,
+  Server,
+  Settings,
+  ShieldCheck,
+  type LucideIcon,
+} from 'lucide-react'
 import FuzzyText from '../FuzzyText'
 
 export type PageName =
   | 'Dashboard'
   | 'Infrastructure'
-  | 'Profiles'
+  | 'Baits'
+  | 'Vulnerabilities'
   | 'LiveFeed'
   | 'Settings'
 
 const navItems = [
-  { page: 'Dashboard', label: 'Обзор', icon: '◫' },
-  { page: 'Infrastructure', label: 'Инфраструктура', icon: '⌘' },
-  { page: 'Profiles', label: 'Профили', icon: '◎' },
-  { page: 'LiveFeed', label: 'События', icon: '⌁' },
-  { page: 'Settings', label: 'Настройки', icon: '⚙' },
-] as const satisfies ReadonlyArray<{ page: PageName; label: string; icon: string }>
+  { page: 'Dashboard', label: 'Обзор', icon: LayoutDashboard },
+  { page: 'Infrastructure', label: 'Инфраструктура', icon: Server },
+  { page: 'Baits', label: 'Приманки', icon: Crosshair },
+  { page: 'Vulnerabilities', label: 'Уязвимости', icon: Bug },
+  { page: 'LiveFeed', label: 'События', icon: Activity },
+  { page: 'Settings', label: 'Настройки', icon: Settings },
+] as const satisfies ReadonlyArray<{ page: PageName; label: string; icon: LucideIcon }>
 
 type SidebarProps = {
   activePage: PageName
@@ -28,8 +39,8 @@ export default function Sidebar({
   return (
     <aside className="flex w-60 shrink-0 flex-col border-r border-white/10 bg-[#100a09]/85 p-5 backdrop-blur-xl">
       <div className="mb-10 flex items-center gap-3">
-        <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-orange-500/40 bg-orange-500/10 text-xl text-orange-400">
-          ⌘
+        <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-orange-500/40 bg-orange-500/10 text-orange-400">
+          <ShieldCheck aria-hidden="true" className="h-5 w-5" strokeWidth={1.8} />
         </div>
 
         <div>
@@ -50,6 +61,7 @@ export default function Sidebar({
       <nav className="flex flex-col gap-1">
         {navItems.map((item) => {
           const isActive = item.page === activePage
+          const Icon = item.icon
 
           return (
             <button
@@ -62,8 +74,8 @@ export default function Sidebar({
                   : 'text-[#e8dfda]/65 hover:bg-white/5 hover:text-white'
               }`}
             >
-              <span className="inline-flex w-5 shrink-0 justify-center whitespace-nowrap text-base">
-                {item.icon}
+              <span className="inline-flex w-5 shrink-0 justify-center">
+                <Icon aria-hidden="true" className="h-[18px] w-[18px]" strokeWidth={1.8} />
               </span>
 
               {isActive ? (

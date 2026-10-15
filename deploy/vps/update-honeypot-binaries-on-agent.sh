@@ -3,15 +3,26 @@ set -Eeuo pipefail
 umask 077
 
 bundle_dir=${1:-/tmp/hf-honeypot-update}
-state_dir=${HF_STATE_DIR:-/var/lib/honeyforge}
-trap_root=${HF_TRAP_ROOT:-$state_dir/traps}
+state_dir=${HF_STATE_DIR:-}
+trap_root=${HF_TRAP_ROOT:-}
+if [[ -r /etc/honeyforge/agent.env ]]; then
+    if [[ -z $state_dir ]]; then
+        state_dir=$(awk -F= '$1 == "HF_STATE_DIR" { sub(/^[^=]*=/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit }' /etc/honeyforge/agent.env)
+    fi
+    if [[ -z $trap_root ]]; then
+        trap_root=$(awk -F= '$1 == "HF_TRAP_ROOT" { sub(/^[^=]*=/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit }' /etc/honeyforge/agent.env)
+    fi
+fi
+state_dir=${state_dir:-/var/lib/honeyforge}
+trap_root=${trap_root:-$state_dir/traps}
+export HF_STATE_DIR=$state_dir HF_TRAP_ROOT=$trap_root
 low_image=honeyforge-low:local
 middle_image=honeyforge-pritvoryashka:local
 
 [[ $EUID -eq 0 ]] || { echo 'Запусти скрипт от root на сервере агента.' >&2; exit 1; }
 [[ -d $bundle_dir ]] || { echo "Не найден каталог артефактов: $bundle_dir" >&2; exit 1; }
 bundle_dir=$(realpath "$bundle_dir")
-for file in hf-agent honeyforge-low pritvoryashka docker-entrypoint.sh; do
+for file in hf-agent honeyforge-low pritvoryashka docker-entrypoint.sh config-schema-probe.json; do
     [[ -s $bundle_dir/$file ]] || { echo "Не найден файл: $bundle_dir/$file" >&2; exit 1; }
 done
 command -v docker >/dev/null 2>&1 || { echo 'Не найден Docker.' >&2; exit 1; }
@@ -37,10 +48,9 @@ while IFS= read -r -d '' compose; do
     fi
 done < <(find "$trap_root" -mindepth 2 -maxdepth 2 -type f -name compose.yaml -print0)
 
-(( ${#low_compose[@]} + ${#middle_compose[@]} > 0 )) || {
-    echo "В $trap_root нет compose.yaml с тегами $low_image или $middle_image." >&2
-    exit 1
-}
+if (( ${#low_compose[@]} + ${#middle_compose[@]} == 0 )); then
+    echo "Активных Low/Middle ловушек в $trap_root нет; образы будут обновлены для следующих ловушек."
+fi
 
 work_dir=$(mktemp -d /tmp/hf-honeypot-image-update.XXXXXX)
 low_build_image=
@@ -57,6 +67,7 @@ mkdir -p "$low_context/config" "$middle_context"
 install -m 0755 "$bundle_dir/honeyforge-low" "$low_context/honeyforge-low"
 install -m 0755 "$bundle_dir/pritvoryashka" "$middle_context/pritvoryashka"
 install -m 0755 "$bundle_dir/docker-entrypoint.sh" "$middle_context/docker-entrypoint.sh"
+install -m 0644 "$bundle_dir/config-schema-probe.json" "$middle_context/config-schema-probe.json"
 
 cat > "$low_context/config/docker.json" <<'JSON'
 {
@@ -78,17 +89,26 @@ CMD ["--config", "/etc/honeyforge/config.json"]
 DOCKERFILE
 
 cat > "$middle_context/Dockerfile" <<'DOCKERFILE'
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssh-client ca-certificates \
+    && apt-get install -y --no-install-recommends openssh-client ca-certificates wget \
+    && wget -q https://packages.microsoft.com/config/debian/13/packages-microsoft-prod.deb -O /tmp/packages-microsoft-prod.deb \
+    && dpkg -i /tmp/packages-microsoft-prod.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends powershell \
+    && rm -f /tmp/packages-microsoft-prod.deb \
     && rm -rf /var/lib/apt/lists/*
 COPY pritvoryashka /usr/local/bin/pritvoryashka
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint
+COPY config-schema-probe.json /tmp/hf-middle-config-schema-probe.json
 RUN chmod 0755 /usr/local/bin/pritvoryashka /usr/local/bin/docker-entrypoint \
     && output="$(/usr/local/bin/pritvoryashka /__hf_missing_config_probe__.json 2>&1 || true)" \
     && printf '%s\n' "$output" | grep -Fq 'Error: Read(Os {' \
     && printf '%s\n' "$output" | grep -Fq 'No such file or directory' || \
-       { printf 'Middle binary did not start in Debian Bookworm:\n%s\n' "$output" >&2; exit 1; }
+       { printf 'Middle binary did not start in Debian Trixie:\n%s\n' "$output" >&2; exit 1; }
+RUN /usr/local/bin/pritvoryashka --check-config /tmp/hf-middle-config-schema-probe.json \
+    && /usr/local/bin/pritvoryashka --check-windows-parser \
+    && rm -f /tmp/hf-middle-config-schema-probe.json
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint"]
 CMD ["/etc/honeyforge/pritvoryashka.json"]
 DOCKERFILE
@@ -111,6 +131,15 @@ middle_probe=$(docker run --rm --entrypoint /usr/local/bin/pritvoryashka \
 if ! grep -Fq 'Error: Read(Os {' <<<"$middle_probe" \
     || ! grep -Fq 'No such file or directory' <<<"$middle_probe"; then
     printf 'Middle image не прошёл проверку запуска в runtime:\n%s\n' "$middle_probe" >&2
+    exit 1
+fi
+if middle_schema_probe=$(docker run --rm \
+    --volume "$bundle_dir/config-schema-probe.json:/tmp/hf-middle-config-schema-probe.json:ro" \
+    --entrypoint /usr/local/bin/pritvoryashka "$middle_build_image" \
+    --check-config /tmp/hf-middle-config-schema-probe.json 2>&1); then
+    printf '%s\n' "$middle_schema_probe"
+else
+    printf 'Middle image не принимает схему baits/virtual_processes:\n%s\n' "$middle_schema_probe" >&2
     exit 1
 fi
 

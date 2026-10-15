@@ -35,6 +35,7 @@ export default function ConnectServer({ api, readOnly, onChanged, notify }: Prop
   const [authKind, setAuthKind] = useState<'password' | 'key'>('password')
   const [sshSecret, setSshSecret] = useState('')
   const [keyPassphrase, setKeyPassphrase] = useState('')
+  const [sudoPassword, setSudoPassword] = useState('')
   const [pendingServerId, setPendingServerId] = useState<string | null>(
     () => window.localStorage.getItem('mellcore-pending-bootstrap'),
   )
@@ -79,9 +80,9 @@ export default function ConnectServer({ api, readOnly, onChanged, notify }: Prop
       } catch (requestError) {
         if (!cancelled && requestError instanceof ApiError && requestError.status === 404) {
           finished = true
-          const message = 'Задание установки не найдено. Центр мог перезапуститься во время подключения.'
+          const message = 'Статус установки недоступен: сервер или задание могли быть удалены либо Центр потерял задание. Проверьте список серверов и журнал hf-center.'
           finish({ status: 'failed', message })
-          notify('error', 'Задание установки не найдено', message)
+          notify('error', 'Не удалось найти задание установки', message)
         } else if (!cancelled && !pollErrorShown) {
           pollErrorShown = true
           const message = `Не удалось проверить статус установки. Проверка продолжится автоматически. ${apiErrorMessage(requestError)}`
@@ -109,10 +110,12 @@ export default function ConnectServer({ api, readOnly, onChanged, notify }: Prop
         ssh_password: authKind === 'password' ? sshSecret : null,
         ssh_private_key: authKind === 'key' ? sshSecret : null,
         ssh_key_passphrase: authKind === 'key' && keyPassphrase ? keyPassphrase : null,
+        sudo_password: sudoPassword || null,
       })
       setForm({ ...emptyServer })
       setSshSecret('')
       setKeyPassphrase('')
+      setSudoPassword('')
       window.localStorage.setItem('mellcore-pending-bootstrap', result.server_id)
       window.sessionStorage.removeItem(outcomeKey)
       setOutcome(null)
@@ -175,6 +178,10 @@ export default function ConnectServer({ api, readOnly, onChanged, notify }: Prop
         {authKind === 'key' && <label className="block text-sm text-white/70">Пароль ключа (если есть)
           <input type="password" autoComplete="off" disabled={readOnly || busy} value={keyPassphrase} onChange={(event) => setKeyPassphrase(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/30 px-4 py-3" />
         </label>}
+        <label className="block text-sm text-white/70">Пароль sudo (если требуется)
+          <input type="password" autoComplete="off" disabled={readOnly || busy} value={sudoPassword} onChange={(event) => setSudoPassword(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/30 px-4 py-3" />
+          <span className="mt-1 block text-xs text-white/45">При входе по паролю SSH можно оставить пустым, если пароль sudo совпадает. При входе по ключу укажите пароль sudo, если он нужен.</span>
+        </label>
         {readOnly ? <p className="text-sm text-white/50">Роль наблюдателя допускает только просмотр.</p> : <button type="submit" disabled={busy || Boolean(pendingServerId)} className="w-full rounded-lg bg-orange-600 px-5 py-3 text-sm font-semibold disabled:opacity-50">{busy ? 'Подключение…' : 'Подключить сервер и установить агента'}</button>}
       </form>
     </div>

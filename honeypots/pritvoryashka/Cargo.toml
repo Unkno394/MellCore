@@ -13,6 +13,8 @@ rand = "0.10"
 russh = "0.64.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.11"
+sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"

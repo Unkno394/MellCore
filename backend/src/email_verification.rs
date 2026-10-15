@@ -19,7 +19,16 @@ impl EmailVerifications {
         let (queue, mut receiver) = mpsc::channel::<VerificationRequest>(64);
         tokio::spawn(async move {
             while let Some(request) = receiver.recv().await {
-                if issue(&pool, delivery.as_ref(), request.user_id, &request.email, request.request_id).await.is_err() {
+                if issue(
+                    &pool,
+                    delivery.as_ref(),
+                    request.user_id,
+                    &request.email,
+                    request.request_id,
+                )
+                .await
+                .is_err()
+                {
                     tracing::warn!(request_id=%request.request_id,"email verification delivery failed");
                 }
             }
@@ -27,17 +36,29 @@ impl EmailVerifications {
         Self { queue }
     }
     pub fn enqueue(&self, email: String, request_id: Uuid) -> Result<(), AppError> {
-        self.enqueue_request(VerificationRequest { user_id: None, email, request_id })
+        self.enqueue_request(VerificationRequest {
+            user_id: None,
+            email,
+            request_id,
+        })
     }
-    pub fn enqueue_change(&self, user_id: Uuid, email: String, request_id: Uuid) -> Result<(), AppError> {
-        self.enqueue_request(VerificationRequest { user_id: Some(user_id), email, request_id })
+    pub fn enqueue_change(
+        &self,
+        user_id: Uuid,
+        email: String,
+        request_id: Uuid,
+    ) -> Result<(), AppError> {
+        self.enqueue_request(VerificationRequest {
+            user_id: Some(user_id),
+            email,
+            request_id,
+        })
     }
     fn enqueue_request(&self, request: VerificationRequest) -> Result<(), AppError> {
-        self.queue.try_send(request)
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => AppError::busy(),
-                mpsc::error::TrySendError::Closed(_) => AppError::mail_unavailable(),
-            })
+        self.queue.try_send(request).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => AppError::busy(),
+            mpsc::error::TrySendError::Closed(_) => AppError::mail_unavailable(),
+        })
     }
 }
 async fn issue(
@@ -49,9 +70,14 @@ async fn issue(
 ) -> Result<(), AppError> {
     let mut tx = pool.begin().await?;
     let user: Option<Uuid> = if let Some(user_id) = requested_user {
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND is_active)")
-            .bind(user_id).fetch_one(&mut *tx).await?;
-        if !exists { return Ok(()); }
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND is_active)")
+                .bind(user_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            return Ok(());
+        }
         Some(user_id)
     } else {
         sqlx::query_scalar("SELECT id FROM users WHERE email=$1 AND is_active AND email_verified_at IS NULL FOR UPDATE")
@@ -106,24 +132,46 @@ pub async fn consume(pool: &PgPool, token: &str, request_id: Uuid) -> Result<(),
     .await?
     .ok_or_else(invalid)?;
     let mut tx = pool.begin().await?;
-    let current_email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE id=$1 AND is_active FOR UPDATE")
-        .bind(user).fetch_optional(&mut *tx).await?.flatten();
+    let current_email: Option<String> =
+        sqlx::query_scalar("SELECT email FROM users WHERE id=$1 AND is_active FOR UPDATE")
+            .bind(user)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
     let current_email = current_email.ok_or_else(invalid)?;
     let email: String = sqlx::query_scalar("SELECT email FROM email_verifications WHERE user_id=$1 AND token_hash=$2 AND expires_at>now() FOR UPDATE")
         .bind(user).bind(&hash).fetch_optional(&mut *tx).await?.ok_or_else(invalid)?;
-    let conflict: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE email=$1 AND id<>$2)")
-        .bind(&email).bind(user).fetch_one(&mut *tx).await?;
-    if conflict { return Err(AppError::conflict("Email address is already in use")); }
+    let conflict: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE email=$1 AND id<>$2)")
+            .bind(&email)
+            .bind(user)
+            .fetch_one(&mut *tx)
+            .await?;
+    if conflict {
+        return Err(AppError::conflict("Email address is already in use"));
+    }
     let consumed=sqlx::query("DELETE FROM email_verifications WHERE user_id=$1 AND email=$2 AND token_hash=$3 AND expires_at>now()").bind(user).bind(&email).bind(&hash).execute(&mut *tx).await?.rows_affected();
     if consumed != 1 {
         return Err(invalid());
     }
     sqlx::query("UPDATE users SET email=$2,email_verified_at=now(),updated_at=now() WHERE id=$1")
-        .bind(user).bind(&email)
+        .bind(user)
+        .bind(&email)
         .execute(&mut *tx)
         .await?;
     management::revoke_credentials(&mut tx, user).await?;
-    management::audit(&mut tx, user, if current_email == email { "auth.email_verified" } else { "auth.email_changed" }, user, request_id).await?;
+    management::audit(
+        &mut tx,
+        user,
+        if current_email == email {
+            "auth.email_verified"
+        } else {
+            "auth.email_changed"
+        },
+        user,
+        request_id,
+    )
+    .await?;
     tx.commit().await?;
     Ok(())
 }

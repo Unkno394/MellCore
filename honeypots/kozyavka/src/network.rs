@@ -3,11 +3,11 @@ use crate::{
     telemetry::{ConnectionEvent, EventSink},
 };
 use russh::{
-    MethodKind, MethodSet,
+    MethodKind, MethodSet, Preferred, cipher, kex, mac,
     keys::{Algorithm, PrivateKey, load_secret_key},
     server::{self, Auth},
 };
-use std::{future::Future, io, path::Path, sync::Arc, time::Duration};
+use std::{borrow::Cow, future::Future, io, path::Path, sync::Arc, time::Duration};
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
@@ -18,6 +18,33 @@ use tokio::{
 
 const MAX_CONNECTIONS: usize = 64;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn openssh_89_preferences() -> Preferred {
+    Preferred {
+        kex: Cow::Borrowed(&[
+            kex::CURVE25519,
+            kex::CURVE25519_PRE_RFC_8731,
+            kex::DH_GEX_SHA256,
+            kex::DH_G14_SHA256,
+            kex::EXTENSION_SUPPORT_AS_SERVER,
+        ]),
+        key: Cow::Borrowed(&[Algorithm::Ed25519]),
+        cipher: Cow::Borrowed(&[
+            cipher::CHACHA20_POLY1305,
+            cipher::AES_128_CTR,
+            cipher::AES_256_CTR,
+            cipher::AES_128_GCM,
+            cipher::AES_256_GCM,
+        ]),
+        mac: Cow::Borrowed(&[
+            mac::HMAC_SHA256_ETM,
+            mac::HMAC_SHA512_ETM,
+            mac::HMAC_SHA256,
+            mac::HMAC_SHA512,
+        ]),
+        ..Preferred::default()
+    }
+}
 
 fn advertised_auth_methods() -> MethodSet {
     [MethodKind::PublicKey, MethodKind::Password]
@@ -43,10 +70,16 @@ pub async fn serve(
 ) -> io::Result<()> {
     config.validate()?;
     let host_key = load_or_create_host_key(config.host_key_path.as_deref()).await?;
+    let preferred = if config.banner.starts_with("SSH-2.0-OpenSSH_8.9p1") {
+        openssh_89_preferences()
+    } else {
+        Preferred::default()
+    };
     let ssh_config = Arc::new(server::Config {
         server_id: russh::SshId::Standard(config.banner.clone().into()),
         methods: advertised_auth_methods(),
         keys: vec![host_key],
+        preferred,
         max_auth_attempts: 6,
         auth_rejection_time: Duration::from_millis(750),
         inactivity_timeout: Some(HANDSHAKE_TIMEOUT),
@@ -215,5 +248,19 @@ mod auth_tests {
             }
             _ => panic!("rejected auth must preserve the advertised methods"),
         }
+    }
+}
+
+#[cfg(test)]
+mod ssh_algorithm_tests {
+    use super::*;
+
+    #[test]
+    fn openssh_89_profile_omits_mlkem_and_keeps_curve25519() {
+        let preferred = openssh_89_preferences();
+        let names: Vec<_> = preferred.kex.iter().map(AsRef::as_ref).collect();
+        assert!(!names.contains(&"mlkem768x25519-sha256"));
+        assert!(names.contains(&"curve25519-sha256"));
+        assert!(names.contains(&"diffie-hellman-group14-sha256"));
     }
 }

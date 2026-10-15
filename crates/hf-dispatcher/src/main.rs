@@ -13,8 +13,9 @@ use std::{
 use anyhow::Context;
 use clap::Parser;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::{
-    io::copy_bidirectional,
+    io::{AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream},
     sync::RwLock,
 };
@@ -57,6 +58,10 @@ struct TargetConfig {
     trap_id: Uuid,
     address: SocketAddr,
     weight: u8,
+    #[serde(default)]
+    proxy_protocol: bool,
+    #[serde(default)]
+    proxy_secret: Option<String>,
 }
 
 type Routing = HashMap<SocketAddr, Vec<TargetConfig>>;
@@ -95,6 +100,13 @@ fn parse_config(bytes: &[u8]) -> anyhow::Result<DispatcherConfig> {
                 target.address.ip().is_loopback(),
                 "target address must be loopback"
             );
+            anyhow::ensure!(
+                target.proxy_protocol == target.proxy_secret.is_some(),
+                "PROXY protocol targets require exactly one shared secret"
+            );
+            if let Some(secret) = &target.proxy_secret {
+                anyhow::ensure!(valid_proxy_secret(secret), "invalid PROXY protocol secret");
+            }
         }
     }
     Ok(config)
@@ -127,6 +139,90 @@ fn target_for_bucket(targets: &[TargetConfig], bucket: u8) -> &TargetConfig {
     unreachable!("validated weights cover buckets 0..99")
 }
 
+fn valid_proxy_secret(secret: &str) -> bool {
+    secret.len() == 32 && secret.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn decode_proxy_secret(secret: &str) -> [u8; 16] {
+    let mut key = [0_u8; 16];
+    for (index, pair) in secret.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16).expect("validated hex") as u8;
+        let low = (pair[1] as char).to_digit(16).expect("validated hex") as u8;
+        key[index] = (high << 4) | low;
+    }
+    key
+}
+
+fn proxy_mac(secret: &str, trap_id: Uuid, source: SocketAddr, destination: SocketAddr) -> [u8; 32] {
+    let mut message = b"HoneyForge PROXYv2 source v1\0".to_vec();
+    message.extend_from_slice(trap_id.as_bytes());
+    match (source.ip(), destination.ip()) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) => {
+            message.push(4);
+            message.extend_from_slice(&source.octets());
+            message.extend_from_slice(&destination.octets());
+        }
+        (IpAddr::V6(source), IpAddr::V6(destination)) => {
+            message.push(6);
+            message.extend_from_slice(&source.octets());
+            message.extend_from_slice(&destination.octets());
+        }
+        _ => unreachable!("PROXY addresses must use the same IP family"),
+    }
+    message.extend_from_slice(&source.port().to_be_bytes());
+    message.extend_from_slice(&destination.port().to_be_bytes());
+
+    let key = decode_proxy_secret(secret);
+    let mut inner_pad = [0x36_u8; 64];
+    let mut outer_pad = [0x5c_u8; 64];
+    for (index, byte) in key.iter().enumerate() {
+        inner_pad[index] ^= byte;
+        outer_pad[index] ^= byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+fn proxy_v2_header(
+    trap_id: Uuid,
+    source: SocketAddr,
+    destination: SocketAddr,
+    secret: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let mut header = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+    let (family, address_bytes) = match (source, destination) {
+        (SocketAddr::V4(source), SocketAddr::V4(destination)) => {
+            let mut addresses = Vec::with_capacity(12);
+            addresses.extend_from_slice(&source.ip().octets());
+            addresses.extend_from_slice(&destination.ip().octets());
+            addresses.extend_from_slice(&source.port().to_be_bytes());
+            addresses.extend_from_slice(&destination.port().to_be_bytes());
+            (0x11, addresses)
+        }
+        (SocketAddr::V6(source), SocketAddr::V6(destination)) => {
+            let mut addresses = Vec::with_capacity(36);
+            addresses.extend_from_slice(&source.ip().octets());
+            addresses.extend_from_slice(&destination.ip().octets());
+            addresses.extend_from_slice(&source.port().to_be_bytes());
+            addresses.extend_from_slice(&destination.port().to_be_bytes());
+            (0x21, addresses)
+        }
+        _ => anyhow::bail!("Dispatcher source and destination IP families differ"),
+    };
+    let payload_length = address_bytes.len() + 3 + 32;
+    header.extend_from_slice(&[0x21, family]);
+    header.extend_from_slice(&(payload_length as u16).to_be_bytes());
+    header.extend_from_slice(&address_bytes);
+    header.extend_from_slice(&[0xe0, 0, 32]);
+    header.extend_from_slice(&proxy_mac(secret, trap_id, source, destination));
+    Ok(header)
+}
+
 async fn serve_listener(listener: TcpListener, address: SocketAddr, routes: Arc<RwLock<Routing>>) {
     loop {
         let (mut inbound, peer) = match listener.accept().await {
@@ -155,6 +251,30 @@ async fn serve_listener(listener: TcpListener, address: SocketAddr, routes: Arc<
                     return;
                 }
             };
+            if target.proxy_protocol {
+                let destination = match inbound.local_addr() {
+                    Ok(address) => address,
+                    Err(error) => {
+                        warn!(%error, peer = %peer, trap_id = %target.trap_id, "cannot read Dispatcher listener address");
+                        return;
+                    }
+                };
+                let secret = target
+                    .proxy_secret
+                    .as_deref()
+                    .expect("validated target secret");
+                let header = match proxy_v2_header(target.trap_id, peer, destination, secret) {
+                    Ok(header) => header,
+                    Err(error) => {
+                        warn!(%error, peer = %peer, trap_id = %target.trap_id, "cannot build authenticated PROXY header");
+                        return;
+                    }
+                };
+                if let Err(error) = outbound.write_all(&header).await {
+                    warn!(%error, peer = %peer, trap_id = %target.trap_id, "cannot forward authenticated source address");
+                    return;
+                }
+            }
             match copy_bidirectional(&mut inbound, &mut outbound).await {
                 Ok((from_client, from_trap)) => {
                     info!(peer = %peer, trap_id = %target.trap_id, from_client, from_trap, "dispatch connection closed")
@@ -242,6 +362,8 @@ mod tests {
             trap_id: Uuid::new_v4(),
             address: "127.0.0.1:2200".parse().unwrap(),
             weight,
+            proxy_protocol: false,
+            proxy_secret: None,
         }
     }
 
@@ -292,11 +414,15 @@ mod tests {
                 trap_id: Uuid::new_v4(),
                 address: address_a,
                 weight: 50,
+                proxy_protocol: false,
+                proxy_secret: None,
             },
             TargetConfig {
                 trap_id: Uuid::new_v4(),
                 address: address_b,
                 weight: 50,
+                proxy_protocol: false,
+                proxy_secret: None,
             },
         ];
         let expected_reply = if expected < 50 { b"a" } else { b"b" };

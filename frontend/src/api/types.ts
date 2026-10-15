@@ -2,8 +2,62 @@ export type Role = 'admin' | 'viewer' | 'user'
 export type TrapLevel = 'low' | 'medium' | 'high'
 export type ServerStatus = 'unknown' | 'online' | 'offline' | 'error'
 export type TrapDesiredState = 'running' | 'stopped'
+export type MiddleSshAuthMode = 'realistic' | 'adaptive'
+export type SshCredential = { username: string; password: string }
 export type TrapAction = 'start' | 'stop' | 'restart' | 'remove'
 export type TrapActionProgress = { action_id: string; status: 'queued' | 'succeeded' | 'failed'; detail: string | null }
+export type BaitKind =
+  | 'account' | 'file' | 'credential' | 'database' | 'backup'
+  | 'network_service' | 'web_interface' | 'process' | 'system_config'
+  | 'source_code' | 'cloud_infrastructure' | 'network_pivot' | 'windows'
+  | 'canary' | 'history'
+export type BaitImplementation = 'virtual_file' | 'virtual_account' | 'virtual_process'
+export type VirtualShell = 'bash' | 'sh' | 'nologin'
+export type CredentialFormat = 'api_token' | 'ssh_key' | 'password' | 'environment_variables'
+export type CloudProvider = 'aws' | 'azure' | 'gcp' | 'kubernetes'
+export type WindowsArtifact = 'powershell_script' | 'configuration' | 'document' | 'registry_export'
+export type DatabaseFormat = 'sql_dump' | 'sqlite' | 'csv' | 'json'
+export type BackupFormat = 'sql_dump' | 'manifest' | 'tar_listing' | 'zip_listing'
+export type SystemConfigFormat = 'systemd_unit' | 'cron' | 'ssh_config' | 'application_config'
+export type HistoryFormat = 'bash_history' | 'application_log' | 'system_log'
+export type VirtualAccountConfig = { login: string; uid?: number | null; home_directory?: string | null; shell?: VirtualShell | null }
+export type BaitFileConfig = {
+  account?: VirtualAccountConfig
+  credential_format?: CredentialFormat
+  cloud_provider?: CloudProvider
+  windows_artifact?: WindowsArtifact
+  database_format?: DatabaseFormat
+  backup_format?: BackupFormat
+  canary_marker?: string
+  system_config_format?: SystemConfigFormat
+  history_format?: HistoryFormat
+}
+export type BaitFile = {
+  id: string
+  name: string
+  path: string | null
+  content: string
+  category?: Exclude<BaitKind, 'process'>
+  /** Legacy configuration alias, read for traps created before category/implementation split. */
+  kind?: Exclude<BaitKind, 'process'>
+  implementation?: 'virtual_file' | 'virtual_account'
+  config?: BaitFileConfig
+}
+export type VirtualProcess = {
+  id: string
+  title?: string
+  category?: Extract<BaitKind, 'process' | 'database' | 'network_service' | 'web_interface'>
+  /** Legacy configuration alias. */
+  kind?: Extract<BaitKind, 'process' | 'database' | 'network_service' | 'web_interface'>
+  implementation?: 'virtual_process'
+  name: string
+  user: string
+  command: string
+  running: boolean
+  listen_port: number | null
+  config?: { protocol?: 'tcp' | 'udp' }
+}
+export type BaitEngagement = { bait_id: string; opens: number; sessions: number; last_opened_at: string }
 export type ActualState =
   | 'unknown'
   | 'installing'
@@ -80,14 +134,15 @@ export type Server = ServerInput & {
   updated_at: string
 }
 
-export type ServerPresence = { registered: boolean; connected: boolean; can_reboot: boolean; can_uninstall: boolean }
-export type DeleteServerResult = { remote_cleanup: 'scheduled' | 'unreachable' | 'unsupported' | 'not_installed' }
+export type ServerPresence = { registered: boolean; connected: boolean; can_reboot: boolean; can_uninstall: boolean; can_share_tcp_ports: boolean; last_heartbeat_age_ms: number | null }
+export type DeleteServerResult = { remote_cleanup: 'scheduled' | 'unreachable' | 'unsupported' | 'unconfirmed' | 'not_installed' }
 
 export type BootstrapServerInput = {
   server: ServerInput
   ssh_password: string | null
   ssh_private_key: string | null
   ssh_key_passphrase: string | null
+  sudo_password: string | null
 }
 
 export type BootstrapProgress = {
@@ -178,14 +233,42 @@ export type AttackEvent = {
 }
 
 export type AttackGraphMatch = {
+  scenario_id: string
+  trap_id: string
   session_key: string
   evidence_domain: string
   technique_key: string
   technique_name: string
   status: 'candidate' | 'attempt' | 'confirmed' | string
   similarity: number
+  coverage: number
   evidence_event_ids: string[]
+  matched_event_ids: string[]
+  nodes: AttackGraphNode[]
+  edges: AttackGraphEdge[]
   updated_at: string
+}
+
+export type AttackGraphNode = {
+  node_id: string
+  node_key: string
+  action_kind: string
+  process_class: string
+  resource_class: string
+  status: 'matched' | 'missing' | 'legacy_unattributed' | 'outcome_mismatch' | 'observed_unlinked'
+  matched_event_ids: string[]
+  observed_outcome: string | null
+  expected_outcome: string
+}
+
+export type AttackGraphEdge = {
+  from_node: string
+  to_node: string
+  status: 'matched' | 'missing' | 'legacy_unattributed'
+  matched_event_ids: string[]
+  observed_outcome: string | null
+  expected_outcome: string
+  time_delta_ms: number | null
 }
 
 export type CursorPage<T> = {
