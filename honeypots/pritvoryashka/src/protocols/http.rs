@@ -81,11 +81,14 @@ pub async fn serve_web(
         && (request.target.contains("cmd=")
             || request.target.contains("host=")
             || !request.body.is_empty())
-        && has_command_operator(&format!(
-            "{} {}",
-            request.target,
-            String::from_utf8_lossy(&request.body)
-        ))
+        && {
+            let probe = format!(
+                "{} {}",
+                request.target,
+                String::from_utf8_lossy(&request.body)
+            );
+            has_command_operator(&probe) || has_command_parameter(&probe)
+        }
     {
         telemetry.emit(
             "vulnerability.exploit_attempt",
@@ -390,10 +393,40 @@ fn has_command_operator(value: &str) -> bool {
         || decoded.contains('`')
 }
 
+fn has_command_parameter(value: &str) -> bool {
+    decode_url(value)
+        .split(['?', '&', ' '])
+        .filter_map(|part| part.split_once('='))
+        .any(|(name, command)| {
+            matches!(name.rsplit('/').next().unwrap_or(name), "cmd" | "command")
+                && matches!(
+                    command.split_whitespace().next().unwrap_or_default(),
+                    "echo" | "id" | "whoami" | "uname" | "ping"
+                )
+        })
+}
+
 fn fake_command_output(target: &str, body: &[u8]) -> String {
     let input = format!("{} {}", decode_url(target), String::from_utf8_lossy(body));
     let lower = input.to_ascii_lowercase();
-    if lower.contains("whoami") {
+    let command = decode_url(target)
+        .split_once('?')
+        .and_then(|(_, query)| {
+            query
+                .split('&')
+                .filter_map(|part| part.split_once('='))
+                .find(|(name, _)| matches!(*name, "cmd" | "command"))
+                .map(|(_, command)| command.to_owned())
+        })
+        .or_else(|| {
+            let form = parse_form(&String::from_utf8_lossy(body));
+            form.get("cmd").or_else(|| form.get("command")).cloned()
+        });
+    if let Some(command) = command
+        && let Some(value) = command.trim().strip_prefix("echo ")
+    {
+        format!("{}\n", value.trim())
+    } else if lower.contains("whoami") {
         "www-data\n".into()
     } else if lower.contains("uname") {
         "Linux app-01 5.15.0-91-generic x86_64 GNU/Linux\n".into()
@@ -415,4 +448,71 @@ fn parse_form(body: &str) -> std::collections::HashMap<String, String> {
 
 fn truncate(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::{Distribution, TelemetryConfig},
+        protocols::{FtpDataRegistry, VirtualState},
+        telemetry::EventEmitter,
+    };
+    use std::{collections::HashSet, sync::Arc, time::Duration};
+    use tokio::{io::AsyncReadExt, net::TcpListener};
+    use uuid::Uuid;
+
+    async fn request_over_listener(request: &[u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut telemetry_config = TelemetryConfig::default();
+        telemetry_config.jsonl_path = None;
+        let emitter = EventEmitter::start(
+            telemetry_config,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            8080,
+        )
+        .unwrap();
+        let context = ServiceContext {
+            profiles: Arc::new(HashSet::from(["http_admin_panel_exposure".to_owned()])),
+            state: Arc::new(VirtualState::default()),
+            distribution: Distribution::Ubuntu,
+            max_input_bytes: 8192,
+            idle_timeout: Duration::from_secs(5),
+            ftp_data_port: None,
+            ftp_data_registry: Arc::new(FtpDataRegistry::default()),
+        };
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let telemetry = emitter.service_session(peer, 8080, "http");
+            serve_web(stream, peer, context, telemetry).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server.await.unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_panel_and_login_are_reachable_through_http_listener() {
+        let page = request_over_listener(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(page.starts_with("HTTP/1.1 200 OK"));
+        assert!(page.contains("<title>Administration</title>"));
+        assert!(page.contains("action=/login"));
+
+        let body = b"username=admin&password=admin";
+        let post = format!(
+            "POST /login HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let dashboard = request_over_listener(post.as_bytes()).await;
+        assert!(dashboard.starts_with("HTTP/1.1 200 OK"));
+        assert!(dashboard.contains("<h1>Admin dashboard</h1>"));
+    }
 }

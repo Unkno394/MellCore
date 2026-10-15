@@ -26,6 +26,7 @@ export function eventLabel(value: string): string {
     'session.ended': 'Сеанс завершён', 'command.executed': 'Выполнена команда',
     'filesystem.accessed': 'Доступ к файлу',
     'bait.opened': 'Открыта приманка',
+    'vulnerability.exploit_attempt': 'Попытка взаимодействия с уязвимостью',
   }
   return labels[value] ?? value
 }

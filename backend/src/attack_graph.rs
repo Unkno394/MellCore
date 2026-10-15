@@ -101,6 +101,11 @@ fn normalize(event: &IncomingEvent, trusted_center: bool) -> Action {
             resource_class = "bait_file";
             "deception.bait_open"
         }
+        "vulnerability.exploit_attempt" if simulated => {
+            process = "virtual_vulnerability".into();
+            resource_class = "vulnerability";
+            "vulnerability.attempt"
+        }
         "security.host_exec_from_trap" if kernel => "boundary.host_exec",
         "security.namespace_mismatch" if kernel => "boundary.namespace_mismatch",
         "security.escape_confirmed" if confirmed => "boundary.escape_confirmed",
@@ -138,7 +143,18 @@ fn normalize(event: &IncomingEvent, trusted_center: bool) -> Action {
         }
         _ => "event.other",
     };
-    let outcome = if event.event_type == "bait.opened" && simulated {
+    let outcome = if event.event_type == "vulnerability.exploit_attempt" && simulated {
+        let details = &event.payload["details"];
+        match event
+            .payload["accepted"]
+            .as_bool()
+            .or_else(|| details["accepted"].as_bool())
+        {
+            Some(true) => "succeeded",
+            Some(false) => "denied",
+            None => "attempted",
+        }
+    } else if event.event_type == "bait.opened" && simulated {
         match (
             event.payload["accepted"].as_bool(),
             event.payload["success"].as_bool(),
@@ -202,7 +218,7 @@ fn normalize(event: &IncomingEvent, trusted_center: bool) -> Action {
         domain,
         session_key: format!("{domain}:{scope}"),
         confirmed,
-        environment: json!({"evidence_domain":domain,"normalizer_version":2,
+        environment: json!({"evidence_domain":domain,"normalizer_version":3,
             "service_type":event.service_type,"protocol":event.protocol,
             "destination_port":event.destination_port,"source":source,
             "subject":event.payload.get("subject"),
@@ -214,7 +230,8 @@ fn normalize(event: &IncomingEvent, trusted_center: bool) -> Action {
             "pid":event.payload.get("pid"),"start_ticks":event.payload.get("start_ticks"),
             "bait_id":event.payload.get("bait_id"),"bait_name":event.payload.get("bait_name"),
             "bait_kind":event.payload.get("bait_kind"),
-            "bait_path":event.payload.get("path")}),
+            "bait_path":event.payload.get("path"),
+            "vulnerability_profile_id":event.payload.get("profile_id")}),
     }
 }
 

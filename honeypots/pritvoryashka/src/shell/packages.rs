@@ -1620,7 +1620,7 @@ pub fn install(
         let arch_package = arch_lookup(name).ok_or(FsError::NotFound)?;
         return install_arch(fs, arch_package, now);
     }
-    if installed(fs, package.name) {
+    if installed(fs, package.name) && package.command.is_none_or(|command| fs.exists(command)) {
         return Ok(());
     }
     if fs.distribution() == Distribution::Arch {

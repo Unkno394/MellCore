@@ -375,7 +375,32 @@ impl Shell {
             self.virtual_server
                 .sync_history(&mut self.fs, &self.history, now);
         }
-        let result = self.execute_script(line, now);
+        let mut result = self.execute_script(line, now);
+        for profile_id in classify_vulnerability_probe(line, &self.vulnerability_profiles) {
+            if result
+                .vulnerability_attempts
+                .iter()
+                .any(|attempt| attempt.profile_id == profile_id)
+            {
+                continue;
+            }
+            let probe_status = if result.output.contains("command not found") {
+                "client_unavailable"
+            } else if result.output.contains("unsupported shell syntax") {
+                "invalid_shell_syntax"
+            } else {
+                "virtual_network_probe_not_reached"
+            };
+            result.vulnerability_attempts.push(VulnerabilityAttempt {
+                profile_id,
+                details: serde_json::json!({
+                    "source":"ssh_terminal",
+                    "probe_status":probe_status,
+                    "reached_endpoint":false,
+                    "exit_status":result.exit_status,
+                }),
+            });
+        }
         self.last_exit_status = result.exit_status;
         result
     }
@@ -3376,15 +3401,42 @@ impl Shell {
         if !self.fs.exists(pid_path) {
             return failure("Could not connect to Redis at 127.0.0.1:6379: Connection refused\n");
         }
+        let mut host = "127.0.0.1";
+        let mut port = 6379_u16;
         let mut index = 0;
         while index < args.len() {
             match args[index].as_str() {
-                "-h" | "--host" | "-p" | "--port" | "-a" | "--pass" | "-n" | "-c" => {
+                "-h" | "--host" => {
+                    if let Some(value) = args.get(index + 1) {
+                        host = value;
+                    }
+                    index = (index + 2).min(args.len());
+                }
+                "-p" | "--port" => {
+                    if let Some(value) = args.get(index + 1) {
+                        port = value.parse().unwrap_or(0);
+                    }
+                    index = (index + 2).min(args.len());
+                }
+                "-a" | "--pass" | "-n" | "-c" => {
                     index = (index + 2).min(args.len());
                 }
                 "--raw" | "--no-auth-warning" => index += 1,
                 _ => break,
             }
+        }
+        if !(host.eq_ignore_ascii_case("localhost")
+            || host == "127.0.0.1"
+            || host.starts_with("127.")
+            || host == "::1"
+            || host == "[::1]")
+        {
+            return failure("redis-cli: outbound network access is disabled in the virtual SSH shell; test the public listener from an external client\n");
+        }
+        if port != 6379 || !self.vulnerability_profiles.contains("redis_unauthenticated_access") {
+            return failure(format!(
+                "Could not connect to Redis at {host}:{port}: Connection refused\n"
+            ));
         }
         let Some(command) = args.get(index).map(|value| value.to_ascii_uppercase()) else {
             return failure(
@@ -3617,11 +3669,49 @@ impl Shell {
         if !packages::installed(&self.fs, "curl") || !self.fs.exists("/usr/bin/curl") {
             return failure("bash: curl: command not found\n");
         }
+        if let Some(target) = args.iter().find(|arg| arg.starts_with("ftp://")) {
+            let url = target.trim_start_matches("ftp://");
+            let (host_port, _) = url.split_once('/').unwrap_or((url, ""));
+            let (host, port) = host_port
+                .rsplit_once(':')
+                .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
+                .unwrap_or((host_port, 21));
+            let is_loopback = host.starts_with("localhost")
+                || host.starts_with("127.0.0.1")
+                || host.starts_with("[::1]");
+            if !is_loopback {
+                return failure("curl: (7) Outbound network access is disabled in the virtual SSH shell; test the public listener from an external client.\n");
+            }
+            if port != 2121 || !self.vulnerability_profiles.contains("ftp_anonymous_login") {
+                return failure(format!(
+                    "curl: (7) Failed to connect to {host} port {port}: Connection refused\n"
+                ));
+            }
+            let mut result = success(
+                "Connected to localhost (127.0.0.1) port 2121\n220 MellCore FTP service ready\n230 Anonymous access granted\n-rw-r--r-- 1 0 0 23 Oct 14 00:00 README.txt\n",
+            );
+            result.vulnerability_attempts.push(VulnerabilityAttempt {
+                profile_id: "ftp_anonymous_login".into(),
+                details: serde_json::json!({"source":"ssh_terminal","username":"anonymous","port":port,"accepted":true,"client":"curl"}),
+            });
+            return result;
+        }
         let target = args
             .iter()
             .find(|arg| arg.starts_with("http://") || arg.starts_with("https://"))
-            .map(String::as_str)
-            .unwrap_or("");
+            .cloned()
+            .unwrap_or_default();
+        let get_parameter = args
+            .windows(2)
+            .find(|pair| pair[0] == "--data-urlencode")
+            .map(|pair| pair[1].replace(' ', "+"));
+        let target = if args.iter().any(|arg| arg == "--get")
+            && let Some(parameter) = get_parameter
+        {
+            format!("{target}{}{parameter}", if target.contains('?') { "&" } else { "?" })
+        } else {
+            target
+        };
         let method = args
             .windows(2)
             .find(|pair| pair[0] == "-X" || pair[0] == "--request")
@@ -3641,7 +3731,7 @@ impl Shell {
         let url = target
             .strip_prefix("http://")
             .or_else(|| target.strip_prefix("https://"))
-            .unwrap_or(target);
+            .unwrap_or(target.as_str());
         let (host_port, path) = url.split_once('/').unwrap_or((url, ""));
         let port = host_port
             .rsplit_once(':')
@@ -3652,6 +3742,7 @@ impl Shell {
                 80
             });
         let path = format!("/{path}");
+        let route = path.split('?').next().unwrap_or("/");
         let is_loopback = host_port.starts_with("localhost")
             || host_port.starts_with("127.0.0.1")
             || host_port.starts_with("[::1]");
@@ -3718,9 +3809,27 @@ impl Shell {
                 && (path.contains(';')
                     || path.contains('|')
                     || lowered.contains("%3b")
-                    || lowered.contains("%7c"))
+                    || lowered.contains("%7c")
+                    || lowered.contains("cmd=echo")
+                    || lowered.contains("cmd=id")
+                    || lowered.contains("cmd=whoami")
+                    || lowered.contains("cmd=uname"))
             {
-                let mut result = success("uid=1001(app) gid=1001(app) groups=1001(app)\n");
+                let output = if let Some((_, command)) = path.split_once("cmd=echo") {
+                    format!(
+                        "{}\n",
+                        command
+                            .trim_start_matches(|ch| ch == '+' || ch == ' ')
+                            .replace('+', " ")
+                    )
+                } else if lowered.contains("cmd=whoami") {
+                    "app\n".into()
+                } else if lowered.contains("cmd=uname") {
+                    "Linux srv-app-01 5.15.0-119-generic x86_64 GNU/Linux\n".into()
+                } else {
+                    "uid=1001(app) gid=1001(app) groups=1001(app)\n".into()
+                };
+                let mut result = success(output);
                 result.vulnerability_attempts.push(VulnerabilityAttempt {
                     profile_id: "web_command_injection".into(),
                     details: serde_json::json!({"source":"ssh_terminal","path":path,"executed":false}),
@@ -3753,7 +3862,7 @@ impl Shell {
                     });
                     return result;
                 }
-                if path == "/" || path.starts_with("/admin") {
+                if route == "/" || route.starts_with("/admin") {
                     let mut result = success(
                         "<html><title>Administration</title><form method=post action=/login><input name=username><input name=password type=password><button>Sign in</button></form></html>\n",
                     );
@@ -3776,6 +3885,9 @@ impl Shell {
             return failure(
                 "curl: (7) Failed to connect to localhost port 80: Connection refused\n",
             );
+        }
+        if !is_loopback && !host_port.is_empty() {
+            return failure("curl: (7) Outbound network access is disabled in the virtual SSH shell; test the public listener from an external client.\n");
         }
         failure("curl: (6) Could not resolve host\n")
     }
@@ -5355,6 +5467,72 @@ fn success(output: impl Into<String>) -> ShellOutput {
         output: output.into(),
         ..ShellOutput::default()
     }
+}
+
+fn classify_vulnerability_probe(
+    input: &str,
+    enabled: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let lower = input.to_ascii_lowercase();
+    let mut words = input.split_whitespace();
+    let mut executable = words
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|ch| ch == '\'' || ch == '"');
+    if executable == "sudo" {
+        executable = words
+            .find(|word| !word.starts_with('-'))
+            .unwrap_or_default()
+            .trim_matches(|ch| ch == '\'' || ch == '"');
+    }
+    let executable = executable.rsplit('/').next().unwrap_or(executable);
+    let mut profiles = Vec::new();
+    let mut add = |profile: &str| {
+        if enabled.contains(profile) && !profiles.iter().any(|existing| existing == profile) {
+            profiles.push(profile.to_owned());
+        }
+    };
+
+    match executable {
+        "redis-cli" | "valkey-cli" => add("redis_unauthenticated_access"),
+        "psql" | "mysql" | "mariadb" => {
+            add("sql_database_weak_credentials");
+        }
+        "ftp" => add("ftp_anonymous_login"),
+        "curl" if lower.contains("ftp://") => add("ftp_anonymous_login"),
+        "curl" if lower.contains("http://") || lower.contains("https://") => {
+            let docker_route = lower.contains(":2375") || lower.contains("/containers/json");
+            let traversal_route = lower.contains("../")
+                || lower.contains("%2e%2e")
+                || lower.contains("..%2f");
+            let injection_route = (lower.contains("cmd=") || lower.contains("host="))
+                && (lower.contains(';')
+                    || lower.contains('|')
+                    || lower.contains("%3b")
+                    || lower.contains("%7c")
+                    || lower.contains("cmd=echo")
+                    || lower.contains("cmd=id")
+                    || lower.contains("cmd=whoami")
+                    || lower.contains("cmd=uname"));
+            if docker_route {
+                add("docker_api_exposed");
+            }
+            if traversal_route {
+                add("web_path_traversal");
+            }
+            if injection_route {
+                add("web_command_injection");
+            }
+            let admin_route = lower.contains(":8080")
+                && (lower.ends_with("/") || lower.contains("/admin"));
+            if (!docker_route && !traversal_route && !injection_route) || admin_route
+            {
+                add("http_admin_panel_exposure");
+            }
+        }
+        _ => {}
+    }
+    profiles
 }
 
 fn failure(output: impl Into<String>) -> ShellOutput {

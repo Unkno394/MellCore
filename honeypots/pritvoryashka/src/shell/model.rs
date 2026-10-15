@@ -3648,6 +3648,27 @@ impl VirtualServer {
             .iter()
             .find(|arg| arg.starts_with("postgres://") || arg.starts_with("postgresql://"))
             .map(String::as_str);
+        let requested_host = args
+            .windows(2)
+            .find(|pair| pair[0] == "-h" || pair[0] == "--host")
+            .map(|pair| pair[1].as_str())
+            .or_else(|| {
+                connection_string
+                    .and_then(|url| url.split_once("@"))
+                    .and_then(|(_, rest)| rest.split('/').next())
+                    .map(|authority| authority.rsplit_once(':').map_or(authority, |(host, _)| host))
+            });
+        if requested_host.is_some_and(|host| {
+            host.parse::<std::net::IpAddr>()
+                .is_ok_and(|address| !address.is_loopback())
+        }) {
+            return VirtualCommand::failure(
+                "postgresql",
+                "connect",
+                requested_host.map(str::to_owned),
+                "psql: outbound network access is disabled in the virtual SSH shell; test the public listener from an external client\n",
+            );
+        }
         let public_port_requested = args
             .windows(2)
             .any(|pair| matches!(pair[0].as_str(), "-p" | "--port") && pair[1] == "15432")

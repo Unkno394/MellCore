@@ -36,6 +36,24 @@ type Attack = {
   match: AttackGraphMatch | null
 }
 
+type VulnerabilityEvidence = { item: AttackEvent; profileId: string }
+
+const vulnerabilityNames: Record<string, string> = {
+  ssh_weak_credentials: 'SSH: слабые учётные данные',
+  ssh_root_login_enabled: 'SSH: вход root',
+  redis_unauthenticated_access: 'Redis без пароля',
+  docker_api_exposed: 'Открытый Docker API',
+  http_admin_panel_exposure: 'Открытая панель управления',
+  sql_database_weak_credentials: 'SQL: слабые учётные данные',
+  ftp_anonymous_login: 'Анонимный FTP',
+  web_path_traversal: 'Обход пути на сайте',
+  web_command_injection: 'Внедрение команды на сайте',
+  win_autologon_credentials: 'Windows: учётные данные автологина',
+  win_always_install_elevated: 'Windows: AlwaysInstallElevated',
+  win_writable_service_binary: 'Windows: доступный для записи сервис',
+  win_guest_share: 'Windows: гостевая общая папка',
+}
+
 type DetailSection = 'summary' | 'timeline' | 'scenario' | 'comparison' | 'logs'
 
 const DETAIL_TABS: { id: DetailSection; label: string }[] = [
@@ -82,6 +100,68 @@ function eventDetail(item: AttackEvent) {
   return command || path || resource || null
 }
 
+function objectValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : {}
+}
+
+function profilesForEvent(item: AttackEvent, traps: Trap[]): string[] {
+  const payload = objectValue(item.event.payload)
+  if (item.event.event_type === 'vulnerability.exploit_attempt') {
+    return typeof payload.profile_id === 'string' ? [payload.profile_id] : []
+  }
+  if (item.event.event_type !== 'command.executed') return []
+  const trap = traps.find((candidate) => candidate.trap_id === item.event.trap_id)
+  const configured = trap?.effective_config.vulnerability_profiles
+  const enabled = Array.isArray(configured) ? configured.filter((value): value is string => typeof value === 'string') : []
+  const input = typeof payload.input === 'string' ? payload.input.toLowerCase() : ''
+  const eventCommand = typeof payload.command === 'string' ? payload.command.toLowerCase().split('/').at(-1) ?? '' : ''
+  const command = eventCommand === 'sudo' ? input.trim().split(/\s+/)[1]?.split('/').at(-1) ?? 'sudo' : eventCommand
+  if ((command === 'redis-cli' || command === 'valkey-cli') && enabled.includes('redis_unauthenticated_access')) return ['redis_unauthenticated_access']
+  if (['psql', 'mysql', 'mariadb'].includes(command) && enabled.includes('sql_database_weak_credentials')) return ['sql_database_weak_credentials']
+  if (command === 'ftp' && enabled.includes('ftp_anonymous_login')) return ['ftp_anonymous_login']
+  if (command === 'docker' && enabled.includes('docker_api_exposed') && input.includes('tcp://')) return ['docker_api_exposed']
+  if (command !== 'curl') return []
+  if (input.includes('ftp://') && enabled.includes('ftp_anonymous_login')) return ['ftp_anonymous_login']
+  if (input.includes(':2375') && enabled.includes('docker_api_exposed')) return ['docker_api_exposed']
+  if ((input.includes('../') || input.includes('%2e%2e') || input.includes('..%2f')) && enabled.includes('web_path_traversal')) return ['web_path_traversal']
+  if ((input.includes('cmd=') || input.includes('host='))
+    && (/[;|]|%3b|%7c/.test(input) || /cmd=(echo|id|whoami|uname)/.test(input))
+    && enabled.includes('web_command_injection')) return ['web_command_injection']
+  if ((input.includes('http://') || input.includes('https://')) && enabled.includes('http_admin_panel_exposure')) return ['http_admin_panel_exposure']
+  return []
+}
+
+function vulnerabilityEvidence(items: AttackEvent[], traps: Trap[]): VulnerabilityEvidence[] {
+  const explicit = items.filter((item) => item.event.event_type === 'vulnerability.exploit_attempt')
+  const explicitBySession = new Set(explicit.flatMap((item) => profilesForEvent(item, traps).map((profileId) => `${item.event.trap_id}:${item.event.session_id ?? item.event.event_id}:${profileId}`)))
+  const evidence: VulnerabilityEvidence[] = explicit.flatMap((item) => profilesForEvent(item, traps).map((profileId) => ({ item, profileId })))
+  for (const item of items) {
+    if (item.event.event_type !== 'command.executed') continue
+    for (const profileId of profilesForEvent(item, traps)) {
+      const key = `${item.event.trap_id}:${item.event.session_id ?? item.event.event_id}:${profileId}`
+      if (!explicitBySession.has(key)) evidence.push({ item, profileId })
+    }
+  }
+  return evidence
+}
+
+function vulnerabilityStatus(item: AttackEvent) {
+  const payload = objectValue(item.event.payload)
+  const details = objectValue(payload.details)
+  const accepted = typeof payload.accepted === 'boolean' ? payload.accepted : details.accepted
+  if (item.event.event_type === 'command.executed') {
+    const input = typeof payload.input === 'string' ? payload.input : ''
+    if (input.includes('<_>')) return 'Shell отверг синтаксис; endpoint не проверен'
+    if (payload.exit_status !== 0) return 'Команда завершилась до ответа сервиса'
+    return 'Команда выполнена в виртуальной оболочке'
+  }
+  if (details.probe_status === 'client_unavailable') return 'Клиент отсутствует; endpoint не проверен'
+  if (details.probe_status === 'invalid_shell_syntax') return 'Shell отверг синтаксис; endpoint не проверен'
+  if (accepted === true) return 'Виртуальная модель приняла попытку'
+  if (accepted === false) return 'Виртуальная модель отказала'
+  return 'Попытка записана в виртуальном сценарии'
+}
+
 function actionClass(item: AttackEvent) {
   const type = item.event.event_type
   const detail = eventDetail(item)?.toLowerCase() ?? ''
@@ -91,6 +171,7 @@ function actionClass(item: AttackEvent) {
   if (type === 'session.ended') return 'Завершение сессии'
   if (type === 'filesystem.accessed') return detail.includes('read') || detail.includes('cat') ? 'Чтение файлов' : 'Обзор файлов'
   if (type === 'bait.opened') return 'Открытие приманки'
+  if (type === 'vulnerability.exploit_attempt') return 'Проверка уязвимости'
   if (type === 'command.executed') {
     if (/\b(curl|wget|fetch)\b/.test(detail)) return 'Загрузка из сети'
     if (/\b(sudo|su|pkexec|capsh|setcap)\b/.test(detail)) return 'Повышение привилегий'
@@ -112,6 +193,13 @@ function jaccard(left: Attack, right: Attack) {
 
 function outcome(item: AttackEvent) {
   const payload = item.event.payload as Record<string, unknown>
+  const details = objectValue(payload?.details)
+  if (item.event.event_type === 'vulnerability.exploit_attempt') {
+    const accepted = typeof payload?.accepted === 'boolean' ? payload.accepted : details.accepted
+    if (accepted === true) return 'виртуальный сервис принял попытку'
+    if (accepted === false) return 'виртуальный сервис отказал'
+    return 'попытка'
+  }
   if (payload?.accepted === false || item.event.event_type === 'auth.failed' || payload?.outcome === 'denied_or_failed') return 'отказ'
   if (payload?.success === false) return 'ошибка'
   if (typeof payload?.exit_status === 'number' && payload.exit_status !== 0) return 'ошибка'
@@ -306,6 +394,12 @@ export default function LiveFeed({ api, events, traps, initialTrapId = null, loa
     for (const attack of matched) if (attack.match) counts.set(attack.match.technique_name, (counts.get(attack.match.technique_name) ?? 0) + 1)
     return [...counts].sort((a, b) => b[1] - a[1]).slice(0, 3)
   }, [matched])
+  const vulnerabilityAttempts = useMemo(
+    () => vulnerabilityEvidence([...events, ...extraEvents], traps),
+    [events, extraEvents, traps],
+  )
+  const vulnerabilityProfileCount = new Set(vulnerabilityAttempts.map((item) => item.profileId)).size
+  const selectedVulnerabilities = selected ? vulnerabilityEvidence(selected.events, traps) : []
 
   return <section className="space-y-6 p-5 sm:p-7">
     <header className="flex flex-wrap items-end justify-between gap-4">
@@ -314,10 +408,11 @@ export default function LiveFeed({ api, events, traps, initialTrapId = null, loa
     </header>
     {error && <p role="alert" className="rounded-lg border border-red-400/20 bg-red-400/5 px-4 py-3 text-sm text-red-300">{error}</p>}
 
-    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
       <Metric icon="activity" label="Атакующие сессии" value={attacks.length} detail="Сгруппировано по сеансам" color="text-orange-300" />
       <Metric icon="alert" label="Подтверждённые инциденты" value={confirmedCount} detail="Есть подтверждающие события" color="text-red-300" />
       <Metric icon="shield" label="Активные подозрения" value={suspicionCount} detail="Кандидаты и попытки по графу" color="text-amber-200" />
+      <Metric icon="alert" label="Попытки уязвимостей" value={vulnerabilityAttempts.length} detail={`${vulnerabilityProfileCount} сценариев · по телеметрии и командам`} color="text-violet-200" />
       <section className="rounded-xl border border-white/10 bg-[#160e0c]/75 p-4 shadow-lg shadow-black/10"><div className="flex items-center gap-2 text-white/45"><Icon name="network" className="h-4 w-4 text-violet-300"/><span className="text-xs">Частые сценарии</span></div>{scenarios.length ? <div className="mt-3 space-y-2">{scenarios.map(([name, count]) => <div key={name} className="flex items-center justify-between gap-3"><span className="truncate text-sm text-white/80">{name}</span><span className="rounded-md bg-violet-300/10 px-2 py-0.5 text-xs text-violet-200">{count}</span></div>)}</div> : <p className="mt-3 text-sm text-white/35">Пока нет совпадений</p>}</section>
     </div>
 
@@ -346,6 +441,7 @@ export default function LiveFeed({ api, events, traps, initialTrapId = null, loa
           <nav role="tablist" aria-label="Разделы деталей атаки" className="flex gap-1 overflow-x-auto border-b border-white/5 px-3 py-2">{DETAIL_TABS.map((tab) => <button key={tab.id} type="button" role="tab" aria-selected={detailSection === tab.id} onClick={() => setDetailSection(tab.id)} className={`shrink-0 rounded-lg px-3 py-2 text-xs transition ${detailSection === tab.id ? 'bg-violet-300/10 text-violet-100' : 'text-white/45 hover:bg-white/5 hover:text-white/80'}`}>{tab.label}</button>)}</nav>
           {detailSection === 'summary' && <>
           <div className="grid gap-3 border-b border-white/5 p-5 sm:grid-cols-3 sm:p-6"><Info label="Ловушка" value={trapNames.get(selected.trapId) ?? selected.trapId}/><Info label="Источник" value={selected.sourceIp ?? 'Не определён'} mono/><Info label="Время" value={dateTime(selected.first)}/></div>
+          {selectedVulnerabilities.length > 0 && <div className="mx-5 mt-5 rounded-lg border border-violet-300/15 bg-violet-300/[0.04] p-4 sm:mx-6"><div className="flex items-center justify-between gap-3"><div><h4 className="text-sm font-medium text-violet-100">Сценарии уязвимостей</h4><p className="mt-1 text-xs text-white/40">Попытки из сетевого обработчика и команд виртуального терминала.</p></div><span className="rounded-full bg-violet-300/10 px-2.5 py-1 text-xs text-violet-100">{selectedVulnerabilities.length}</span></div><div className="mt-3 space-y-2">{selectedVulnerabilities.map(({ item, profileId }) => <div key={`${item.event.event_id}:${profileId}`} className="rounded-md border border-white/5 bg-black/10 px-3 py-2.5"><div className="flex flex-wrap items-center justify-between gap-2"><span className="text-sm text-white/80">{vulnerabilityNames[profileId] ?? profileId}</span><span className="text-[11px] text-white/45">{vulnerabilityStatus(item)}</span></div>{eventDetail(item) && <p className="mt-1 truncate font-mono text-[10px] text-white/35">{eventDetail(item)}</p>}</div>)}</div><p className="mt-3 text-[11px] leading-5 text-white/35">Ответ «принято» описывает виртуальную модель. Для проверки публичного порта запускайте клиент снаружи SSH-оболочки.</p></div>}
           {selected.match && <div className="mx-5 mt-5 rounded-lg border border-violet-300/15 bg-violet-300/[0.04] p-4 sm:mx-6"><div className="flex items-center justify-between gap-3"><div><p className="text-sm font-medium">Совпадение со сценарием</p><p className="mt-1 text-xs text-white/40">{selected.match.technique_key} · покрытие узлов сценария</p></div><span className="text-2xl font-semibold text-violet-200">{Math.round(selected.match.similarity * 100)}<span className="text-sm">%</span></span></div><div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/5"><div className="h-full rounded-full bg-gradient-to-r from-violet-400 to-orange-300" style={{ width: `${Math.max(0, Math.min(100, selected.match.similarity * 100))}%` }}/></div></div>}
           </>}
           {detailSection === 'scenario' && <>

@@ -105,6 +105,188 @@ fn sync_configured_baits(
     Ok(())
 }
 
+fn sync_scenario_packages(
+    filesystem: &mut PersistentVirtualFileSystem,
+    vulnerability_profiles: &[String],
+) -> io::Result<()> {
+    if vulnerability_profiles.is_empty() {
+        return Ok(());
+    }
+
+    let mut virtual_filesystem = filesystem.filesystem().clone();
+    let now = chrono::Utc::now();
+    let profiles = vulnerability_profiles
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let has_http = profiles.iter().any(|profile| {
+        matches!(
+            profile.as_str(),
+            "http_admin_panel_exposure" | "web_path_traversal" | "web_command_injection"
+        )
+    });
+
+    if has_http {
+        ensure_scenario_package(&mut virtual_filesystem, "curl", now)?;
+        ensure_scenario_executable(
+            &mut virtual_filesystem,
+            "/usr/bin/curl",
+            "ELF virtual curl executable\n",
+            now,
+        )?;
+    }
+    if profiles.contains("redis_unauthenticated_access") {
+        ensure_scenario_package(&mut virtual_filesystem, "redis-server", now)?;
+        let profile = virtual_filesystem.distribution().linux_profile();
+        let redis_cli = profile.map_or("/usr/bin/redis-cli", |profile| profile.redis_cli_executable);
+        let redis_config = profile.map_or("/etc/redis/redis.conf", |profile| profile.redis_config_file);
+        let redis_pid = profile.map_or("/run/redis-server.pid", |profile| profile.redis_pid_file);
+        let redis_data_dir = profile.map_or("/var/lib/redis", |profile| profile.redis_data_dir);
+        let redis_store = profile.map_or("/var/lib/redis/virtual-store.json", |profile| profile.redis_store_file);
+        ensure_scenario_directory(&mut virtual_filesystem, redis_data_dir, now)?;
+        ensure_scenario_directory(&mut virtual_filesystem, "/etc/redis", now)?;
+        ensure_scenario_directory(&mut virtual_filesystem, "/run", now)?;
+        ensure_scenario_file(
+            &mut virtual_filesystem,
+            redis_config,
+            "bind 0.0.0.0\nprotected-mode no\nport 6379\n",
+            now,
+        );
+        ensure_scenario_file(&mut virtual_filesystem, redis_pid, "2101\n", now);
+        ensure_scenario_file(
+            &mut virtual_filesystem,
+            redis_store,
+            r#"{"service:mode":"production","app:environment":"production","cache:health":"ok"}"#,
+            now,
+        );
+        ensure_scenario_executable(
+            &mut virtual_filesystem,
+            redis_cli,
+            "ELF virtual Redis-compatible command-line client\n",
+            now,
+        )?;
+    }
+    if profiles.contains("sql_database_weak_credentials") {
+        ensure_scenario_package(&mut virtual_filesystem, "postgresql", now)?;
+        ensure_scenario_package(&mut virtual_filesystem, "mysql-server", now)?;
+        for (path, description) in [
+            ("/usr/bin/psql", "ELF virtual PostgreSQL client\n"),
+            ("/usr/bin/mysql", "ELF virtual MySQL client\n"),
+            ("/usr/bin/mariadb", "ELF virtual MySQL-compatible client\n"),
+        ] {
+            ensure_scenario_executable(&mut virtual_filesystem, path, description, now)?;
+        }
+    }
+    if profiles.contains("ftp_anonymous_login") {
+        ensure_scenario_executable(
+            &mut virtual_filesystem,
+            "/usr/bin/ftp",
+            "ELF virtual FTP client\n",
+            now,
+        )?;
+        ensure_scenario_executable(
+            &mut virtual_filesystem,
+            "/usr/sbin/vsftpd",
+            "ELF virtual FTP server\n",
+            now,
+        )?;
+    }
+
+    filesystem.replace(virtual_filesystem)
+}
+
+fn ensure_scenario_package(
+    filesystem: &mut crate::filesystem::VirtualFileSystem,
+    name: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> io::Result<()> {
+    if crate::shell::packages::installed(filesystem, name) {
+        return Ok(());
+    }
+    let package = crate::shell::packages::lookup(name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("virtual package is unavailable for scenario: {name}"),
+        )
+    })?;
+    crate::shell::packages::install(filesystem, package, now).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not install virtual package {name} for vulnerability scenario: {error}"),
+        )
+    })
+}
+
+fn ensure_scenario_executable(
+    filesystem: &mut crate::filesystem::VirtualFileSystem,
+    path: &str,
+    content: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> io::Result<()> {
+    ensure_scenario_file(filesystem, path, content, now);
+    let node = filesystem.node_mut(path).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not prepare virtual scenario client {path}: {error}"),
+        )
+    })?;
+    node.permissions = crate::filesystem::permissions::Permissions(0o755);
+    Ok(())
+}
+
+fn ensure_scenario_file(
+    filesystem: &mut crate::filesystem::VirtualFileSystem,
+    path: &str,
+    content: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    if !filesystem.exists(path) {
+        filesystem.put_file(path, content, now);
+    }
+}
+
+fn ensure_scenario_directory(
+    filesystem: &mut crate::filesystem::VirtualFileSystem,
+    path: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> io::Result<()> {
+    if filesystem.exists(path) {
+        if filesystem.is_dir(path) {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("scenario directory path is not a directory: {path}"),
+        ));
+    }
+    let mut pending = Vec::new();
+    let mut current = path;
+    while !filesystem.exists(current) {
+        pending.push(current.to_owned());
+        current = current
+            .rsplit_once('/')
+            .map_or("/", |(parent, _)| if parent.is_empty() { "/" } else { parent });
+        if current == "/" {
+            break;
+        }
+    }
+    if filesystem.exists(current) && !filesystem.is_dir(current) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("scenario directory parent is not a directory: {current}"),
+        ));
+    }
+    for directory in pending.into_iter().rev() {
+        filesystem.mkdir(&directory, now).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("could not create virtual scenario directory {directory}: {error}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     #[error("cannot load SSH host key: {0}")]
@@ -146,6 +328,7 @@ pub async fn run(config: Config, emitter: EventEmitter) -> Result<(), ServerErro
         filesystem_path,
         initial_state.shell.filesystem().clone(),
     )?;
+    sync_scenario_packages(&mut persistent_filesystem, &config.vulnerability_profiles)?;
     sync_configured_baits(&mut persistent_filesystem, &config.baits)?;
     let persistent_filesystem = Arc::new(std::sync::Mutex::new(persistent_filesystem));
     let ssh_config = Arc::new(server::Config {
@@ -1085,5 +1268,42 @@ mod ssh_algorithm_tests {
         assert!(!names.contains(&"mlkem768x25519-sha256"));
         assert!(names.contains(&"curve25519-sha256"));
         assert!(names.contains(&"diffie-hellman-group14-sha256"));
+    }
+}
+
+#[cfg(test)]
+mod scenario_package_tests {
+    use super::*;
+    use crate::{
+        config::Distribution,
+        filesystem::{VirtualFileSystem, persistence::PersistentVirtualFileSystem},
+    };
+
+    #[test]
+    fn http_scenario_adds_curl_to_an_existing_virtual_filesystem_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("virtual-filesystem.json");
+        let now = chrono::Utc::now();
+        let initial =
+            VirtualFileSystem::linux_with_profile("srv-app-01", "admin", Distribution::Ubuntu, now);
+        let mut persistent = PersistentVirtualFileSystem::open(&path, initial).unwrap();
+        assert!(!crate::shell::packages::installed(
+            persistent.filesystem(),
+            "curl"
+        ));
+
+        sync_scenario_packages(&mut persistent, &["http_admin_panel_exposure".to_owned()]).unwrap();
+
+        assert!(crate::shell::packages::installed(
+            persistent.filesystem(),
+            "curl"
+        ));
+        assert!(persistent.filesystem().exists("/usr/bin/curl"));
+        let reopened = PersistentVirtualFileSystem::open(
+            &path,
+            VirtualFileSystem::linux_with_profile("srv-app-01", "admin", Distribution::Ubuntu, now),
+        )
+        .unwrap();
+        assert!(reopened.filesystem().exists("/usr/bin/curl"));
     }
 }
