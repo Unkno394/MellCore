@@ -1,9 +1,12 @@
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::Read,
+    io::{Read, Seek, SeekFrom, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs},
-    os::unix::fs::PermissionsExt,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     process::{Command, Output},
 };
@@ -12,6 +15,7 @@ use hf_core::{
     HighGuestOs, HighImageArchitecture, HighImageFormat, HighImageKind, HighImageSource,
     HighOsProfile,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -132,7 +136,7 @@ pub fn materialize_image(
         HighImageFormat::Qcow2 => MIN_CUSTOM_QCOW2_DOWNLOAD_FREE_BYTES,
         HighImageFormat::Iso => MIN_CUSTOM_ISO_DOWNLOAD_FREE_BYTES,
     };
-    materialize_image_with_space(source, profile, cache_dir, required_free_bytes)
+    materialize_image_with_space(source, profile, cache_dir, required_free_bytes, None)
 }
 
 pub fn materialize_approved_iso(
@@ -147,6 +151,7 @@ pub fn materialize_approved_iso(
         approved
             .expected_size_bytes
             .saturating_add(DOWNLOAD_HEADROOM_BYTES),
+        Some(approved.expected_size_bytes),
     )
 }
 
@@ -155,6 +160,7 @@ fn materialize_image_with_space(
     profile: HighOsProfile,
     cache_dir: &Path,
     required_free_bytes: u64,
+    expected_size_bytes: Option<u64>,
 ) -> Result<PathBuf, HighImageError> {
     validate_source_metadata(source, profile)?;
     fs::create_dir_all(cache_dir).map_err(|failure| {
@@ -177,61 +183,171 @@ fn materialize_image_with_space(
     };
     let digest = source.sha256.to_ascii_lowercase();
     let destination = cache_dir.join(format!("{digest}.{extension}"));
+    let partial = cache_dir.join(format!(".{digest}.{extension}.part"));
+    let metadata = cache_dir.join(format!(".{digest}.{extension}.part.json"));
+    let lock_path = cache_dir.join(format!(".{digest}.{extension}.lock"));
+    let _lock = DownloadLock::acquire(&lock_path)?;
     if destination.exists() || destination.is_symlink() {
-        verify_cached_image(source, profile, &destination)?;
+        verify_downloaded_image(source, profile, &destination, expected_size_bytes)?;
         return Ok(destination);
     }
-    ensure_free_space(cache_dir, required_free_bytes)?;
-
-    let temporary = cache_dir.join(format!(".{digest}.{}.part", Uuid::new_v4()));
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .and_then(|file| file.sync_all())
-        .map_err(|failure| {
-            error(
-                "IMAGE_CACHE_IO",
-                "download",
-                format!("cannot create temporary image file: {failure}"),
-            )
-        })?;
-    let result = (|| {
-        download_https(source, &temporary)?;
-        verify_cached_image(source, profile, &temporary)?;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).map_err(|failure| {
-            error(
-                "IMAGE_CACHE_IO",
-                "download",
-                format!("cannot protect downloaded image: {failure}"),
-            )
-        })?;
-        File::open(&temporary)
+    if partial.exists() || partial.is_symlink() {
+        match verify_downloaded_image(source, profile, &partial, expected_size_bytes) {
+            Ok(()) => {
+                publish_download(&partial, &metadata, &destination, cache_dir)?;
+                return Ok(destination);
+            }
+            Err(failure) if failure.code == "IMAGE_CACHE_UNSAFE" => return Err(failure),
+            Err(_) => {}
+        }
+    } else {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
             .and_then(|file| file.sync_all())
             .map_err(|failure| {
                 error(
                     "IMAGE_CACHE_IO",
                     "download",
-                    format!("cannot sync downloaded image: {failure}"),
+                    format!("cannot create persistent partial image: {failure}"),
                 )
             })?;
-        match fs::hard_link(&temporary, &destination) {
-            Ok(()) => {}
-            Err(failure) if failure.kind() == std::io::ErrorKind::AlreadyExists => {
-                verify_cached_image(source, profile, &destination)?;
-            }
-            Err(failure) => {
-                return Err(error(
-                    "IMAGE_CACHE_IO",
-                    "download",
-                    format!("cannot publish downloaded image: {failure}"),
-                ));
-            }
+    }
+    let partial_size = fs::metadata(&partial).map(|value| value.len()).unwrap_or(0);
+    ensure_free_space(cache_dir, required_free_bytes.saturating_sub(partial_size))?;
+    let result = (|| {
+        download_https(source, &partial)?;
+        if let Err(failure) =
+            verify_downloaded_image(source, profile, &partial, expected_size_bytes)
+        {
+            let _ = fs::remove_file(&partial);
+            let _ = fs::remove_file(&metadata);
+            return Err(failure);
         }
+        publish_download(&partial, &metadata, &destination, cache_dir)?;
         Ok(destination.clone())
     })();
-    let _ = fs::remove_file(&temporary);
     result
+}
+
+struct DownloadLock(File);
+
+impl DownloadLock {
+    fn acquire(path: &Path) -> Result<Self, HighImageError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
+            .map_err(|failure| {
+                error(
+                    "IMAGE_CACHE_LOCK_FAILED",
+                    "download",
+                    format!("cannot open image download lock: {failure}"),
+                )
+            })?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|failure| {
+            error(
+                "IMAGE_CACHE_LOCK_FAILED",
+                "download",
+                format!("cannot protect image download lock: {failure}"),
+            )
+        })?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(error(
+                "IMAGE_CACHE_LOCK_FAILED",
+                "download",
+                format!(
+                    "cannot lock image download: {}",
+                    std::io::Error::last_os_error()
+                ),
+            ));
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for DownloadLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn verify_downloaded_image(
+    source: &HighImageSource,
+    profile: HighOsProfile,
+    path: &Path,
+    expected_size_bytes: Option<u64>,
+) -> Result<(), HighImageError> {
+    if let Some(expected) = expected_size_bytes {
+        let actual = fs::metadata(path)
+            .map(|value| value.len())
+            .map_err(|failure| {
+                error(
+                    "IMAGE_CACHE_MISSING",
+                    "verification",
+                    format!("downloaded image metadata is unavailable: {failure}"),
+                )
+            })?;
+        if actual != expected {
+            return Err(error(
+                "IMAGE_SIZE_INVALID",
+                "verification",
+                format!("downloaded image has {actual} bytes; expected {expected}"),
+            ));
+        }
+    }
+    verify_cached_image(source, profile, path)
+}
+
+fn publish_download(
+    partial: &Path,
+    metadata: &Path,
+    destination: &Path,
+    cache_dir: &Path,
+) -> Result<(), HighImageError> {
+    fs::set_permissions(partial, fs::Permissions::from_mode(0o600)).map_err(|failure| {
+        error(
+            "IMAGE_CACHE_IO",
+            "download",
+            format!("cannot protect downloaded image: {failure}"),
+        )
+    })?;
+    File::open(partial)
+        .and_then(|file| file.sync_all())
+        .map_err(|failure| {
+            error(
+                "IMAGE_CACHE_IO",
+                "download",
+                format!("cannot sync downloaded image: {failure}"),
+            )
+        })?;
+    match fs::hard_link(partial, destination) {
+        Ok(()) => {}
+        Err(failure) => {
+            return Err(error(
+                "IMAGE_CACHE_IO",
+                "download",
+                format!("cannot atomically publish downloaded image: {failure}"),
+            ));
+        }
+    }
+    File::open(cache_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|failure| {
+            error(
+                "IMAGE_CACHE_IO",
+                "download",
+                format!("cannot sync image cache directory: {failure}"),
+            )
+        })?;
+    let _ = fs::remove_file(partial);
+    let _ = fs::remove_file(metadata);
+    let _ = fs::remove_file(path_with_suffix(partial, ".headers"));
+    Ok(())
 }
 
 fn ensure_free_space(path: &Path, required_bytes: u64) -> Result<(), HighImageError> {
@@ -409,9 +525,7 @@ fn download_https(source: &HighImageSource, destination: &Path) -> Result<(), Hi
         .map(|address| address.ip())
         .collect();
     let addresses = validated_download_addresses(addresses)?;
-    try_download_addresses(&addresses, |address| {
-        run_curl_download_attempt(&url, destination, host, port, address)
-    })
+    download_https_from_addresses(&url, destination, host, port, &addresses, Path::new("curl"))
 }
 
 fn validated_download_addresses(
@@ -454,19 +568,195 @@ fn try_download_addresses(
     ))
 }
 
+fn download_https_from_addresses(
+    url: &Url,
+    destination: &Path,
+    host: &str,
+    port: u16,
+    addresses: &[IpAddr],
+    curl: &Path,
+) -> Result<(), HighImageError> {
+    try_download_addresses(addresses, |address| {
+        run_curl_download_attempt(url, destination, host, port, address, curl)
+    })
+}
+
 fn run_curl_download_attempt(
     url: &Url,
     destination: &Path,
     host: &str,
     port: u16,
     address: IpAddr,
+    curl: &Path,
 ) -> Result<(), String> {
+    let metadata_path = path_with_suffix(destination, ".json");
+    let mut downloaded = file_size(destination)?;
+    if downloaded > MAX_DOWNLOAD_BYTES {
+        reset_partial_download(destination, &metadata_path)?;
+        downloaded = 0;
+    }
+    let stored = read_partial_metadata(&metadata_path).or_else(|| {
+        recover_partial_metadata_from_headers(destination).and_then(|metadata| {
+            write_partial_metadata(&metadata_path, &metadata)
+                .ok()
+                .map(|()| metadata)
+        })
+    });
+    if let Some(stored) = stored.as_ref() {
+        if downloaded > 0
+            && stored.total_size.is_some_and(|total| downloaded < total)
+            && resume_validator(stored).is_some()
+        {
+            let validator = resume_validator(stored).expect("checked above");
+            let result = execute_curl(
+                url,
+                destination,
+                host,
+                port,
+                address,
+                curl,
+                Some((downloaded, validator.clone())),
+            )?;
+            let current = file_size(destination)?;
+            if valid_resumed_response(&result.response, stored, &validator, downloaded, current) {
+                let refreshed =
+                    metadata_from_response(&result.response).unwrap_or_else(|| stored.clone());
+                write_partial_metadata(&metadata_path, &refreshed)?;
+                if result.success && current == refreshed.total_size.unwrap_or(current) {
+                    return Ok(());
+                }
+                return Err(result.diagnostic());
+            }
+
+            truncate_to(destination, downloaded)?;
+            if result.response.status != Some(200) {
+                return Err(format!(
+                    "server rejected a safe resume; {}",
+                    result.diagnostic()
+                ));
+            }
+            // A 200 response to a range request means the representation changed or the server
+            // ignored Range. Start clean; never concatenate that response with the old prefix.
+            reset_partial_download(destination, &metadata_path)?;
+        } else if downloaded > 0 {
+            reset_partial_download(destination, &metadata_path)?;
+        }
+    } else if downloaded > 0 {
+        // Without a trusted validator an old prefix cannot safely be joined to new bytes.
+        reset_partial_download(destination, &metadata_path)?;
+    }
+
+    let result = execute_curl(url, destination, host, port, address, curl, None)?;
+    let current = file_size(destination)?;
+    if current > MAX_DOWNLOAD_BYTES {
+        reset_partial_download(destination, &metadata_path)?;
+        return Err("download exceeded the configured size limit".into());
+    }
+    let response_metadata = metadata_from_response(&result.response);
+    if let Some(metadata) = response_metadata.as_ref() {
+        if current > 0 && current <= metadata.total_size.unwrap_or(MAX_DOWNLOAD_BYTES) {
+            write_partial_metadata(&metadata_path, metadata)?;
+        }
+    }
+    if !result.success {
+        return Err(result.diagnostic());
+    }
+    if result.response.status != Some(200) {
+        return Err(format!(
+            "HTTPS source returned HTTP status {}; expected 200",
+            result
+                .response
+                .status
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        ));
+    }
+    if let Some(expected) = result.response.content_length {
+        if current != expected {
+            return Err(format!(
+                "HTTPS response declared {expected} bytes but wrote {current}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PartialDownloadMetadata {
+    etag: Option<String>,
+    last_modified: Option<String>,
+    total_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentRange {
+    start: u64,
+    end: u64,
+    total: u64,
+}
+
+#[derive(Debug, Default)]
+struct HttpResponseMetadata {
+    status: Option<u16>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    content_length: Option<u64>,
+    content_range: Option<ContentRange>,
+}
+
+struct CurlAttempt {
+    success: bool,
+    status: String,
+    stderr: String,
+    response: HttpResponseMetadata,
+}
+
+impl CurlAttempt {
+    fn diagnostic(&self) -> String {
+        if self.stderr.is_empty() {
+            format!("curl exited with {}", self.status)
+        } else {
+            format!("curl exited with {}: {}", self.status, self.stderr)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResumeValidator {
+    Etag(String),
+    LastModified(String),
+}
+
+impl ResumeValidator {
+    fn value(&self) -> &str {
+        match self {
+            Self::Etag(value) | Self::LastModified(value) => value,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_curl(
+    url: &Url,
+    destination: &Path,
+    host: &str,
+    port: u16,
+    address: IpAddr,
+    curl: &Path,
+    resume: Option<(u64, ResumeValidator)>,
+) -> Result<CurlAttempt, String> {
+    if resume.is_none() {
+        truncate_to(destination, 0)?;
+    }
+    let header_path = path_with_suffix(destination, ".headers");
     OpenOptions::new()
         .write(true)
+        .create(true)
         .truncate(true)
-        .open(destination)
-        .map_err(|failure| format!("cannot reset temporary download: {failure}"))?;
-    let mut command = Command::new("curl");
+        .mode(0o600)
+        .open(&header_path)
+        .map_err(|failure| format!("cannot create HTTPS response header file: {failure}"))?;
+    let mut command = Command::new(curl);
     command.args([
         "--fail",
         "--silent",
@@ -478,6 +768,10 @@ fn run_curl_download_attempt(
         "=https",
         "--proto-redir",
         "=https",
+        "--noproxy",
+        "*",
+        "--proxy",
+        "",
         "--tlsv1.2",
         "--connect-timeout",
         "15",
@@ -489,24 +783,266 @@ fn run_curl_download_attempt(
         "60",
         "--max-filesize",
         &MAX_DOWNLOAD_BYTES.to_string(),
-        "--output",
+        "--dump-header",
     ]);
+    command.arg(&header_path);
+    command.arg("--output");
     command.arg(destination);
+    if let Some((_offset, validator)) = resume.as_ref() {
+        command.args(["--continue-at", "-", "--header"]);
+        command.arg(format!("If-Range: {}", validator.value()));
+    }
     command.args(["--resolve", &curl_resolve_entry(host, port, address)]);
     command.arg(url.as_str());
-    let output = command
-        .output()
-        .map_err(|failure| format!("could not start curl: {failure}"))?;
-    if !output.status.success() {
-        let diagnostic = String::from_utf8_lossy(&output.stderr);
-        let diagnostic: String = diagnostic.trim().chars().take(1024).collect();
-        return Err(if diagnostic.is_empty() {
-            format!("curl exited with {}", output.status)
-        } else {
-            format!("curl exited with {}: {diagnostic}", output.status)
-        });
+    for variable in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ] {
+        command.env_remove(variable);
     }
+    let output = command.output().map_err(|failure| {
+        let _ = fs::remove_file(&header_path);
+        format!("could not start curl: {failure}")
+    })?;
+    let response = read_response_headers(&header_path);
+    if output.status.success() {
+        let _ = fs::remove_file(&header_path);
+    }
+    let response = response?;
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    let diagnostic: String = diagnostic.trim().chars().take(1024).collect();
+    let diagnostic = diagnostic.replace(url.as_str(), "<image-url>");
+    Ok(CurlAttempt {
+        success: output.status.success(),
+        status: output.status.to_string(),
+        stderr: diagnostic,
+        response,
+    })
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn file_size(path: &Path) -> Result<u64, String> {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|failure| format!("cannot inspect partial download: {failure}"))
+}
+
+fn truncate_to(path: &Path, length: u64) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|failure| format!("cannot open partial download: {failure}"))?;
+    file.set_len(length)
+        .map_err(|failure| format!("cannot reset partial download: {failure}"))?;
+    file.seek(SeekFrom::Start(length))
+        .map_err(|failure| format!("cannot seek partial download: {failure}"))?;
     Ok(())
+}
+
+fn reset_partial_download(path: &Path, metadata_path: &Path) -> Result<(), String> {
+    truncate_to(path, 0)?;
+    if let Err(failure) = fs::remove_file(metadata_path) {
+        if failure.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("cannot remove obsolete resume metadata: {failure}"));
+        }
+    }
+    match fs::remove_file(path_with_suffix(path, ".headers")) {
+        Ok(()) => Ok(()),
+        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(failure) => Err(format!(
+            "cannot remove obsolete response headers: {failure}"
+        )),
+    }
+}
+
+fn recover_partial_metadata_from_headers(path: &Path) -> Option<PartialDownloadMetadata> {
+    let response = read_response_headers(&path_with_suffix(path, ".headers")).ok()?;
+    matches!(response.status, Some(200 | 206))
+        .then(|| metadata_from_response(&response))
+        .flatten()
+}
+
+fn read_partial_metadata(path: &Path) -> Option<PartialDownloadMetadata> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() || metadata.len() > 4096
+    {
+        return None;
+    }
+    let parsed: PartialDownloadMetadata = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    if parsed
+        .total_size
+        .is_some_and(|size| size == 0 || size > MAX_DOWNLOAD_BYTES)
+        || parsed
+            .etag
+            .iter()
+            .chain(parsed.last_modified.iter())
+            .any(|value| !safe_header_value(value))
+    {
+        return None;
+    }
+    Some(parsed)
+}
+
+fn write_partial_metadata(path: &Path, metadata: &PartialDownloadMetadata) -> Result<(), String> {
+    let encoded = serde_json::to_vec(metadata)
+        .map_err(|failure| format!("cannot encode resume metadata: {failure}"))?;
+    let temporary = path_with_suffix(path, &format!(".tmp-{}", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|failure| format!("cannot create resume metadata: {failure}"))?;
+        file.write_all(&encoded)
+            .map_err(|failure| format!("cannot write resume metadata: {failure}"))?;
+        file.sync_all()
+            .map_err(|failure| format!("cannot sync resume metadata: {failure}"))?;
+        fs::rename(&temporary, path)
+            .map_err(|failure| format!("cannot publish resume metadata: {failure}"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn resume_validator(metadata: &PartialDownloadMetadata) -> Option<ResumeValidator> {
+    metadata
+        .etag
+        .as_ref()
+        .filter(|etag| !etag.starts_with("W/"))
+        .cloned()
+        .map(ResumeValidator::Etag)
+        .or_else(|| {
+            metadata
+                .last_modified
+                .as_ref()
+                .cloned()
+                .map(ResumeValidator::LastModified)
+        })
+}
+
+fn metadata_from_response(response: &HttpResponseMetadata) -> Option<PartialDownloadMetadata> {
+    let total_size = response
+        .content_range
+        .map(|range| range.total)
+        .or(response.content_length);
+    if total_size.is_some_and(|size| size == 0 || size > MAX_DOWNLOAD_BYTES) {
+        return None;
+    }
+    Some(PartialDownloadMetadata {
+        etag: response.etag.clone(),
+        last_modified: response.last_modified.clone(),
+        total_size,
+    })
+}
+
+fn valid_resumed_response(
+    response: &HttpResponseMetadata,
+    stored: &PartialDownloadMetadata,
+    validator: &ResumeValidator,
+    offset: u64,
+    current: u64,
+) -> bool {
+    let Some(range) = response.content_range else {
+        return false;
+    };
+    let validator_matches = match validator {
+        ResumeValidator::Etag(value) => response.etag.as_ref() == Some(value),
+        ResumeValidator::LastModified(value) => response.last_modified.as_ref() == Some(value),
+    };
+    response.status == Some(206)
+        && validator_matches
+        && range.start == offset
+        && range.end >= range.start
+        && current > offset
+        && current <= range.end.saturating_add(1)
+        && range.total == stored.total_size.unwrap_or(range.total)
+        && range.total <= MAX_DOWNLOAD_BYTES
+        && response
+            .content_length
+            .is_none_or(|length| length == range.end - range.start + 1)
+}
+
+fn read_response_headers(path: &Path) -> Result<HttpResponseMetadata, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HttpResponseMetadata::default());
+        }
+        Err(failure) => return Err(format!("cannot inspect HTTPS response headers: {failure}")),
+    };
+    if metadata.len() > 64 * 1024 {
+        return Err("HTTPS response headers exceed the accepted limit".into());
+    }
+    parse_response_headers(
+        &fs::read_to_string(path)
+            .map_err(|failure| format!("cannot read HTTPS response headers: {failure}"))?,
+    )
+}
+
+fn parse_response_headers(headers: &str) -> Result<HttpResponseMetadata, String> {
+    let mut response = HttpResponseMetadata::default();
+    for raw_line in headers.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.starts_with("HTTP/") {
+            response = HttpResponseMetadata::default();
+            response.status = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|status| status.parse().ok());
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("etag") {
+            if !safe_header_value(value) {
+                return Err("HTTPS response contains an unsafe ETag".into());
+            }
+            response.etag = Some(value.to_owned());
+        } else if name.eq_ignore_ascii_case("last-modified") {
+            if !safe_header_value(value) {
+                return Err("HTTPS response contains an unsafe Last-Modified value".into());
+            }
+            response.last_modified = Some(value.to_owned());
+        } else if name.eq_ignore_ascii_case("content-length") {
+            response.content_length = value.parse().ok();
+        } else if name.eq_ignore_ascii_case("content-range") {
+            response.content_range = parse_content_range(value);
+        }
+    }
+    Ok(response)
+}
+
+fn safe_header_value(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 512 && !value.chars().any(|value| value.is_control())
+}
+
+fn parse_content_range(value: &str) -> Option<ContentRange> {
+    let value = value.strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let parsed = ContentRange {
+        start: start.parse().ok()?,
+        end: end.parse().ok()?,
+        total: total.parse().ok()?,
+    };
+    (parsed.start <= parsed.end && parsed.end < parsed.total).then_some(parsed)
 }
 
 fn curl_resolve_entry(host: &str, port: u16, address: IpAddr) -> String {
@@ -1024,6 +1560,287 @@ mod tests {
             curl_resolve_entry("releases.ubuntu.com", 443, addresses[2]),
             "releases.ubuntu.com:443:[2606:4700:4700::1111]"
         );
+    }
+
+    #[test]
+    fn curl_download_path_pins_one_ip_per_process_and_ignores_service_proxy() {
+        let directory = std::env::temp_dir().join(format!("hf-curl-path-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let curl = directory.join("curl");
+        let destination = directory.join("image.part");
+        fs::write(&destination, b"stale partial bytes").unwrap();
+        fs::write(
+            &curl,
+            r###"#!/bin/sh
+set -eu
+[ -z "${HTTP_PROXY+x}${HTTPS_PROXY+x}${ALL_PROXY+x}${http_proxy+x}${https_proxy+x}${all_proxy+x}" ]
+log="$(dirname "$0")/calls"
+printf '%s\n' '---' "$@" >> "$log"
+resolve= output= headers= resolve_count=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --resolve) shift; resolve=$1; resolve_count=$((resolve_count + 1)) ;;
+    --output) shift; output=$1 ;;
+    --dump-header) shift; headers=$1 ;;
+  esac
+  shift
+done
+[ "$resolve_count" -eq 1 ] && [ -n "$output" ] && [ -n "$headers" ]
+case "$resolve" in
+  *:1.1.1.1) echo 'curl: (7) simulated connection failure' >&2; exit 7 ;;
+esac
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 22\r\nETag: "fixture-v1"\r\n\r\n' > "$headers"
+printf 'small download fixture' > "$output"
+"###,
+        )
+        .unwrap();
+        fs::set_permissions(&curl, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let url = Url::parse("https://releases.ubuntu.com/test.iso").unwrap();
+        let addresses =
+            validated_download_addresses(["1.1.1.1".parse().unwrap(), "8.8.8.8".parse().unwrap()])
+                .unwrap();
+        download_https_from_addresses(
+            &url,
+            &destination,
+            "releases.ubuntu.com",
+            443,
+            &addresses,
+            &curl,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"small download fixture");
+        let calls = fs::read_to_string(directory.join("calls")).unwrap();
+        assert_eq!(calls.matches("--resolve").count(), 2);
+        assert!(calls.contains("releases.ubuntu.com:443:1.1.1.1"));
+        assert!(calls.contains("releases.ubuntu.com:443:8.8.8.8"));
+        assert!(calls.contains("--noproxy\n*\n"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn interrupted_download_resumes_after_restart_with_matching_validator() {
+        let directory = std::env::temp_dir().join(format!("hf-curl-resume-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let curl = directory.join("curl");
+        let destination = directory.join("image.part");
+        fs::write(&destination, b"").unwrap();
+        fs::write(
+            &curl,
+            r###"#!/bin/sh
+set -eu
+output= headers= resume=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) shift; output=$1 ;;
+    --dump-header) shift; headers=$1 ;;
+    --continue-at) shift; [ "$1" = - ]; resume=1 ;;
+  esac
+  shift
+done
+printf '%s\n' "$resume" >> "$(dirname "$0")/resume-calls"
+if [ "$resume" -eq 0 ] && [ ! -e "$(dirname "$0")/interrupted" ]; then
+  : > "$(dirname "$0")/interrupted"
+  printf 'HTTP/1.1 200 OK\r\nContent-Length: 10\r\nETag: "image-v1"\r\n\r\n' > "$headers"
+  printf '01234' > "$output"
+  echo 'curl: (18) simulated interrupted transfer' >&2
+  exit 18
+fi
+[ "$resume" -eq 1 ]
+printf 'HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 5-9/10\r\nETag: "image-v1"\r\n\r\n' > "$headers"
+printf '56789' >> "$output"
+"###,
+        )
+        .unwrap();
+        fs::set_permissions(&curl, fs::Permissions::from_mode(0o700)).unwrap();
+        let url = Url::parse("https://releases.ubuntu.com/test.iso").unwrap();
+        let addresses = ["1.1.1.1".parse().unwrap()];
+
+        let interrupted = download_https_from_addresses(
+            &url,
+            &destination,
+            "releases.ubuntu.com",
+            443,
+            &addresses,
+            &curl,
+        )
+        .unwrap_err();
+        assert_eq!(interrupted.code, "IMAGE_DOWNLOAD_FAILED");
+        assert_eq!(fs::read(&destination).unwrap(), b"01234");
+        let metadata = path_with_suffix(&destination, ".json");
+        assert!(metadata.is_file());
+        assert!(path_with_suffix(&destination, ".headers").is_file());
+        // Simulate a hard agent stop after curl wrote headers and body bytes but before the
+        // resume sidecar could be published. Restart recovery must reconstruct it from headers.
+        fs::remove_file(metadata).unwrap();
+
+        download_https_from_addresses(
+            &url,
+            &destination,
+            "releases.ubuntu.com",
+            443,
+            &addresses,
+            &curl,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"0123456789");
+        assert_eq!(
+            fs::read_to_string(directory.join("resume-calls")).unwrap(),
+            "0\n1\n"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ignored_range_restarts_cleanly_without_concatenating_representations() {
+        let directory = std::env::temp_dir().join(format!("hf-curl-restart-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let curl = directory.join("curl");
+        let destination = directory.join("image.part");
+        fs::write(&destination, b"old12").unwrap();
+        write_partial_metadata(
+            &path_with_suffix(&destination, ".json"),
+            &PartialDownloadMetadata {
+                etag: Some("\"old-image\"".into()),
+                last_modified: None,
+                total_size: Some(10),
+            },
+        )
+        .unwrap();
+        fs::write(
+            &curl,
+            r###"#!/bin/sh
+set -eu
+output= headers= resume=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) shift; output=$1 ;;
+    --dump-header) shift; headers=$1 ;;
+    --continue-at) shift; resume=1 ;;
+  esac
+  shift
+done
+printf '%s\n' "$resume" >> "$(dirname "$0")/resume-calls"
+printf 'HTTP/1.1 200 OK\r\nContent-Length: 11\r\nETag: "new-image"\r\n\r\n' > "$headers"
+if [ "$resume" -eq 1 ]; then
+  printf 'new-content' >> "$output"
+else
+  printf 'new-content' > "$output"
+fi
+"###,
+        )
+        .unwrap();
+        fs::set_permissions(&curl, fs::Permissions::from_mode(0o700)).unwrap();
+        let url = Url::parse("https://releases.ubuntu.com/test.iso").unwrap();
+
+        run_curl_download_attempt(
+            &url,
+            &destination,
+            "releases.ubuntu.com",
+            443,
+            "1.1.1.1".parse().unwrap(),
+            &curl,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new-content");
+        assert_eq!(
+            fs::read_to_string(directory.join("resume-calls")).unwrap(),
+            "1\n0\n"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn complete_partial_is_published_atomically_and_resume_state_is_removed() {
+        let directory = std::env::temp_dir().join(format!("hf-publish-part-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let partial = directory.join(".digest.iso.part");
+        let metadata = directory.join(".digest.iso.part.json");
+        let destination = directory.join("digest.iso");
+        fs::write(&partial, b"complete reviewed image").unwrap();
+        fs::write(&metadata, b"{}").unwrap();
+
+        publish_download(&partial, &metadata, &destination, &directory).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"complete reviewed image");
+        assert!(!partial.exists());
+        assert!(!metadata.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn download_lock_rejects_a_concurrent_writer_until_released() {
+        let directory = std::env::temp_dir().join(format!("hf-download-lock-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("image.lock");
+        let lock = DownloadLock::acquire(&path).unwrap();
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        assert_ne!(
+            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        drop(lock);
+        assert_eq!(
+            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        unsafe {
+            libc::flock(contender.as_raw_fd(), libc::LOCK_UN);
+        }
+        drop(contender);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn corrupt_completed_iso_is_rejected_by_checksum_before_iso_inspection() {
+        let directory = std::env::temp_dir().join(format!("hf-corrupt-iso-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("image.iso");
+        fs::write(&path, b"not the trusted installation media").unwrap();
+
+        let failure = verify_downloaded_image(
+            &source(HighImageFormat::Iso),
+            HighOsProfile::ubuntu_iso_ssh(),
+            &path,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, "IMAGE_INTEGRITY_MISMATCH");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resume_requires_206_matching_range_and_validator() {
+        let stored = PartialDownloadMetadata {
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+            total_size: Some(10),
+        };
+        let response = parse_response_headers(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 5-9/10\r\nETag: \"v1\"\r\n\r\n",
+        )
+        .unwrap();
+        assert!(valid_resumed_response(
+            &response,
+            &stored,
+            &ResumeValidator::Etag("\"v1\"".into()),
+            5,
+            10,
+        ));
+        assert!(!valid_resumed_response(
+            &response,
+            &stored,
+            &ResumeValidator::Etag("\"different\"".into()),
+            5,
+            10,
+        ));
     }
 
     #[test]

@@ -192,6 +192,11 @@ struct HighRuntimeManifest {
     last_error: Option<String>,
 }
 
+fn resumes_interrupted_high_download(manifest: &HighRuntimeManifest) -> bool {
+    manifest.desired_state == HighDesiredState::Running
+        && manifest.lifecycle_state == HighLifecycleState::Downloading
+}
+
 #[derive(Clone)]
 enum SharedTcpDeployment {
     Kozyavka(KozyavkaDeployment),
@@ -810,9 +815,7 @@ impl ComposeProjectStore {
                 }
                 continue;
             }
-            if manifest.desired_state == HighDesiredState::Running
-                && manifest.lifecycle_state == HighLifecycleState::Downloading
-            {
+            if resumes_interrupted_high_download(&manifest) {
                 if let Err(error) = self.deploy_high(manifest.deployment.clone(), false) {
                     tracing::error!(trap_id = %trap_id, %error, "High ISO download reconciliation failed");
                 }
@@ -3160,7 +3163,8 @@ mod tests {
         QuarantineMarker, STANDALONE_IDENTITY_FILE, compose_remove_id, default_image_for,
         dependency_auto_install_from_value, high_tool_probe_args, high_tool_works_at,
         high_vm_missing_packages, high_vm_required_tools, load_or_create_standalone_high_identity,
-        parse_platform, quarantine_result, standalone_high_command, validate_standalone_high_args,
+        parse_platform, quarantine_result, resumes_interrupted_high_download,
+        standalone_high_command, validate_standalone_high_args,
     };
     use clap::Parser;
     use hf_core::{AgentCommand, HighUbuntuDeployment, HighVmDeployment};
@@ -3491,6 +3495,40 @@ mod tests {
         deployment.image_source = None;
         let error = ComposeProjectStore::validate_high_deployment(&deployment, false).unwrap_err();
         assert!(error.to_string().contains("code=IMAGE_SOURCE_REQUIRED"));
+    }
+
+    #[test]
+    fn reconciliation_reuses_downloading_manifest_for_the_same_trap() {
+        let trap_id = Uuid::new_v4();
+        let mut manifest = HighRuntimeManifest {
+            version: 1,
+            kind: "high_ubuntu_iso_ssh".into(),
+            profile: HighOsProfile::ubuntu_iso_ssh(),
+            deployment: HighVmDeployment {
+                command_id: Uuid::new_v4(),
+                trap_id,
+                base_image: String::new(),
+                external_service_port: 0,
+                profile: HighOsProfile::ubuntu_iso_ssh(),
+                image_source: Some(hf_core::HighImageSource {
+                    url: "https://releases.ubuntu.com/test.iso".into(),
+                    sha256: "a".repeat(64),
+                    format: hf_core::HighImageFormat::Iso,
+                    architecture: hf_core::HighImageArchitecture::X86_64,
+                }),
+            },
+            desired_state: HighDesiredState::Running,
+            lifecycle_state: HighLifecycleState::Downloading,
+            last_error: None,
+        };
+
+        assert!(resumes_interrupted_high_download(&manifest));
+        assert_eq!(manifest.deployment.trap_id, trap_id);
+        manifest.lifecycle_state = HighLifecycleState::VmCreated;
+        assert!(!resumes_interrupted_high_download(&manifest));
+        manifest.lifecycle_state = HighLifecycleState::Downloading;
+        manifest.desired_state = HighDesiredState::Stopped;
+        assert!(!resumes_interrupted_high_download(&manifest));
     }
 
     #[test]
