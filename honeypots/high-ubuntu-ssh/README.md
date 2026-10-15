@@ -4,9 +4,19 @@
 Каждому экземпляру создаётся QCOW2 overlay поверх неизменяемого trusted base image;
 при пересоздании удаляется только overlay.
 
-SandboxManager запускает VM только на отдельном KVM-capable VPS. Guest не получает Docker
-socket, libvirt socket, HoneyForge credentials или management сеть. Внешний порт публикует
-host Dispatcher/NAT, guest использует isolated network.
+В обычном режиме High запускается через KVM на отдельном KVM-capable VPS. Guest не получает
+Docker socket, libvirt socket, HoneyForge credentials или management сеть. Внешний порт
+публикует host Dispatcher/NAT, guest использует isolated network.
+
+`HF_HIGH_ACCELERATION=auto` (значение по умолчанию) и `kvm` используют только KVM; автоматического
+перехода на TCG нет. В панели для профиля `high_vm` можно явно выбрать приватную лабораторию
+`private_tcg_test`: агент запускает SSH-гостя через QEMU TCG, не ставит DNAT и не публикует SSH
+наружу. Подключаться к частному адресу гостя можно с самого сервера. Телеметрия приходит в Center
+через агент. TCG не считается безопасной границей для недоверенной гостевой ОС, поэтому не
+используйте этот режим для публичной ловушки.
+
+Для автономной локальной проверки без Center также можно запустить
+`hf-agent --standalone-high --high-acceleration tcg` с отдельным `--state-dir`.
 
 Профиль: Ubuntu 24.04 cloud image, 2 vCPU, 2048 MiB RAM, 20 GiB overlay и настоящий
 OpenSSH. Reset удаляет NAT-правила экземпляра, останавливает VM, удаляет overlay и seed;
@@ -86,10 +96,13 @@ Host-side libvirt даёт только aggregate RX/TX, а не flow records и
 доверенным после получения root внутри VM: такой атакующий всё ещё может скрыть или сфабриковать
 guest-наблюдения.
 
-Host events отправляются в Kazik bounded batches со стабильным `message_id` и durable mapping на
-event IDs. Исходные строки удаляются из `high-telemetry.sqlite` только после Center `Accepted`,
-который выдаётся после append, flush и `sync_data`; потерянный ACK приводит к безопасному повтору,
-а Center дедуплицирует события по agent/event ID.
+В подключённом режиме agent создаёт ограниченные Kazik batches со стабильным `message_id` и
+durable mapping на event IDs, затем кладёт их в SQLite outbox. Center отвечает `Accepted` только
+после записи событий в свой JSONL spool и `sync_data`; лишь после этого agent удаляет source batch.
+При разрыве связи или перезапуске обе стороны повторяют один и тот же batch, а Center устраняет
+дубли по event ID. Автономный `--standalone-high` не подключён к Center и хранит события локально.
+Событие, которое не помещается в лимит Kazik, остаётся в локальной базе и отмечается warning-ом,
+чтобы оно не блокировало передачу следующих событий.
 
 ## Lifecycle и operational state
 
@@ -103,12 +116,14 @@ event IDs. Исходные строки удаляются из `high-telemetry
 
 ### Автономный локальный режим hf-agent
 
-Для отдельного KVM test host High lifecycle и telemetry можно запустить без Center и
-production-регистрации:
+Для локальной проверки High lifecycle и telemetry без Center и production-регистрации:
 
     sudo /usr/local/bin/hf-agent \
       --standalone-high \
       --state-dir /var/lib/honeyforge-standalone
+
+На хосте без KVM явно добавьте `--high-acceleration tcg`. В standalone-режиме события остаются
+локально; доставка телеметрии High в Center этим режимом не проверяется.
 
 Режим требует отдельный state dir, не читает и не создаёт production `identity.json`, не
 подключает Hysteria/Kazik и принимает только High-команды. Команды помещаются JSON-файлами в

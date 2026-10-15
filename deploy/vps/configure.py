@@ -112,6 +112,7 @@ def main():
     ))
     write(CONFIG / "agent.env", (
         f"HF_CENTER_URL=https://{DOMAIN}\nHF_STATE_DIR={STATE}\n"
+        "HF_HIGH_ACCELERATION=auto\n"
         "HF_KAZIK_HYSTERIA_SOCKS=127.0.0.1:1080\nHF_KAZIK_CENTER_UDP=127.0.0.1:44000\n"
         f"HF_TELEMETRY_PUBLIC_ENDPOINT=https://{DOMAIN}/internal/v1/telemetry/batches\n"
         f"HF_TELEMETRY_INGEST_TOKEN={config['telemetry_token']}\n"

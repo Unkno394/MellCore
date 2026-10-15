@@ -305,6 +305,11 @@ impl HighTelemetryStore {
                 PRIMARY KEY (message_id, position),
                 FOREIGN KEY (message_id) REFERENCES high_telemetry_batches(message_id)
             );
+            CREATE TABLE IF NOT EXISTS high_telemetry_delivery_errors (
+                event_id TEXT PRIMARY KEY NOT NULL,
+                reason TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL
+            );
             ",
         )?;
         ensure_last_received_column(&connection)?;
@@ -535,7 +540,14 @@ impl HighTelemetryStore {
         let candidates = {
             let mut statement = transaction.prepare(
                 "SELECT event_id, event_json FROM high_telemetry_events
-                 WHERE event_id NOT IN (SELECT event_id FROM high_telemetry_batch_events)
+                 WHERE trap_id = (
+                   SELECT trap_id FROM high_telemetry_events
+                   WHERE event_id NOT IN (SELECT event_id FROM high_telemetry_batch_events)
+                     AND event_id NOT IN (SELECT event_id FROM high_telemetry_delivery_errors)
+                   ORDER BY received_at_unix_ms, rowid LIMIT 1
+                 )
+                   AND event_id NOT IN (SELECT event_id FROM high_telemetry_batch_events)
+                   AND event_id NOT IN (SELECT event_id FROM high_telemetry_delivery_errors)
                  ORDER BY received_at_unix_ms, rowid LIMIT ?1",
             )?;
             statement
@@ -552,9 +564,17 @@ impl HighTelemetryStore {
                 break;
             }
             if selected.is_empty() && used_bytes.saturating_add(additional) > maximum_json_bytes {
-                return Err(HighTelemetryError::InvalidEvent(
-                    "one persisted event exceeds Kazik batch byte limit".into(),
-                ));
+                let reason = format!(
+                    "normalized event exceeds the {maximum_json_bytes}-byte Center batch budget"
+                );
+                transaction.execute(
+                    "INSERT OR IGNORE INTO high_telemetry_delivery_errors
+                     (event_id, reason, created_at_unix_ms) VALUES (?1, ?2, ?3)",
+                    params![event_id, reason, created_at_unix_ms],
+                )?;
+                tracing::warn!(%event_id, maximum_json_bytes,
+                    "High event retained locally and excluded from Center batches because it cannot fit in Kazik");
+                continue;
             }
             let event = serde_json::from_slice::<TrapEvent>(&bytes)
                 .map_err(|error| HighTelemetryError::CorruptStore(error.to_string()))?;

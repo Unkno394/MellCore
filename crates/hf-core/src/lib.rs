@@ -164,9 +164,19 @@ pub struct KozyavkaDeployment {
     pub container_port: u16,
     pub banner: String,
     #[serde(default)]
+    pub auth_mode: String,
+    #[serde(default)]
+    pub credentials: Vec<LowSshCredential>,
+    #[serde(default)]
     pub resources: ContainerResourceLimits,
     /// External direct listener is 0.0.0.0; Dispatcher members are loopback-only.
     pub publish_address: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LowSshCredential {
+    pub username: String,
+    pub password: String,
 }
 
 /// Exact deployment data for the Middle-interaction SSH trap. The agent fills its own agent ID
@@ -967,6 +977,16 @@ pub enum HighGuestConnection {
     Rdp { guest_port: u16 },
 }
 
+/// Controls whether a High VM is a public KVM trap or an isolated TCG lab instance.
+/// TCG mode has no host-published service port and is selected explicitly per trap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HighVmRuntimeMode {
+    #[default]
+    PublicKvm,
+    PrivateTcgTest,
+}
+
 /// A typed OS profile carried across the control plane and persisted by the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1083,6 +1103,8 @@ pub struct HighVmDeployment {
     pub profile: HighOsProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_source: Option<HighImageSource>,
+    #[serde(default)]
+    pub runtime_mode: HighVmRuntimeMode,
 }
 
 impl From<HighUbuntuDeployment> for HighVmDeployment {
@@ -1094,6 +1116,7 @@ impl From<HighUbuntuDeployment> for HighVmDeployment {
             external_service_port: value.external_ssh_port,
             profile: HighOsProfile::ubuntu_ssh(),
             image_source: None,
+            runtime_mode: HighVmRuntimeMode::PublicKvm,
         }
     }
 }
@@ -1383,6 +1406,7 @@ mod tests {
                 format: HighImageFormat::Qcow2,
                 architecture: HighImageArchitecture::X86_64,
             }),
+            runtime_mode: HighVmRuntimeMode::PublicKvm,
         };
         let encoded = serde_json::to_vec(&deployment).unwrap();
         let decoded: HighVmDeployment = serde_json::from_slice(&encoded).unwrap();

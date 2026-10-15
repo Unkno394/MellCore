@@ -56,6 +56,14 @@ struct LowEvent {
     client_ip: IpAddr,
     client_port: u16,
     trap_port: u16,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    accepted: Option<bool>,
+    #[serde(default)]
+    command: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -279,8 +287,8 @@ fn collect_low(
             destination_port: Some(event.trap_port),
             protocol: "tcp".into(),
             service_type: "ssh".into(),
-            payload: serde_json::json!({"source":"honeyforge-low"}),
-            metadata: serde_json::json!({"source":"docker-stdout","schema_version":1}),
+            payload: serde_json::json!({"username":event.username,"password":event.password,"accepted":event.accepted,"command":event.command.as_deref().unwrap_or("").split_whitespace().next().unwrap_or(""),"input":event.command}),
+            metadata: serde_json::json!({"source":"honeyforge-low","transport":"docker-stdout","schema_version":1,"evidence_domain":"simulated"}),
         });
     }
     let count = queue_events(events, identity, outbox)?;

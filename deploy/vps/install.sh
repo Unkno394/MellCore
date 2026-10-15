@@ -263,5 +263,5 @@ python3 "$repo/deploy/vps/verify-and-seed.py"
 touch /etc/honeyforge/mellcore-installed
 echo 'Компоненты запущены и проверены. Панель: https://yourpasswordforemail.ru/'
 echo 'Данные входа: /root/mellcore-access.txt (cat /root/mellcore-access.txt)'
-if [[ ! -c /dev/kvm ]]; then echo 'High Ubuntu VM недоступна на этом VPS: отсутствует /dev/kvm.'; fi
+if [[ ! -c /dev/kvm ]]; then echo 'Публичные High VM требуют /dev/kvm; для локальной проверки используйте standalone TCG test mode.'; fi
 echo 'SMTP и полноценная связь backend CRUD с агентом пока не реализованы в этом контуре.'

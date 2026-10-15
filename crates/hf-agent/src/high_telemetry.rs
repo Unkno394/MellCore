@@ -53,7 +53,10 @@ pub fn queue_pending_for_center(
 
 /// Apply a semantic Center ACK to the High source queue. Unknown message IDs are intentionally
 /// ignored because Low/Middle/heartbeat envelopes share the same Kazik outbox.
-pub fn acknowledge_center_batch(state_dir: &Path, message_id: Uuid) -> anyhow::Result<bool> {
+pub fn acknowledge_center_batch_from_state_dir(
+    state_dir: &Path,
+    message_id: Uuid,
+) -> anyhow::Result<bool> {
     let path = state_dir.join("high-telemetry.sqlite");
     if !path.is_file() {
         return Ok(false);
@@ -149,7 +152,7 @@ pub fn start(
     agent_id: Uuid,
     max_pending_events: usize,
     operational_interval: Duration,
-) -> anyhow::Result<JoinHandle<()>> {
+) -> anyhow::Result<(SharedHighTelemetryStore, JoinHandle<()>)> {
     if operational_interval < Duration::from_secs(5) {
         anyhow::bail!("High operational polling interval must be at least five seconds");
     }
@@ -163,7 +166,8 @@ pub fn start(
         state_dir.join("high-telemetry.sqlite"),
         max_pending_events,
     )?));
-    Ok(tokio::spawn(async move {
+    let task_store = store.clone();
+    let task = tokio::spawn(async move {
         let operational_store = store.clone();
         tokio::join!(
             discover_channels(high_root, agent_id, store),
@@ -174,7 +178,19 @@ pub fn start(
                 operational_interval
             )
         );
-    }))
+    });
+    Ok((task_store, task))
+}
+
+pub fn acknowledge_center_batch(
+    store: &SharedHighTelemetryStore,
+    message_id: Uuid,
+) -> anyhow::Result<()> {
+    store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("High telemetry store mutex poisoned"))?
+        .acknowledge_durable_kazik_batch(message_id)?;
+    Ok(())
 }
 
 async fn run_operational_monitor(
@@ -667,11 +683,11 @@ mod tests {
             outbox.ready_to_send(10).unwrap()[0].envelope.message_id,
             message_id
         );
-        assert!(acknowledge_center_batch(&root, message_id).unwrap());
+        assert!(acknowledge_center_batch_from_state_dir(&root, message_id).unwrap());
         let source = HighTelemetryStore::open(root.join("high-telemetry.sqlite"), 10).unwrap();
         assert_eq!(source.pending_count().unwrap(), 0);
         drop(source);
-        assert!(!acknowledge_center_batch(&root, message_id).unwrap());
+        assert!(!acknowledge_center_batch_from_state_dir(&root, message_id).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 }

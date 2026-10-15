@@ -20,8 +20,16 @@ SHA-256, rejects chained base images, checks the QCOW2 format and runs `qemu-img
 The prepared image must include VirtIO storage/network/serial drivers, QEMU Guest Agent, RDP, and
 Cloudbase-Init configured for the OpenStack ConfigDrive service with `inject_user_password=true`.
 Cloudbase-Init receives a unique instance UUID, hostname, `hfadmin` account and password through a
-`config-2` ISO. The adapter discovers the isolated DHCP lease and waits for RDP on 3389, but creates
-no DNAT or forwarding exception; RDP is reachable only from the KVM host.
+`config-2` ISO. The agent publishes the selected public TCP port to guest RDP/3389 using the shared
+High firewall chains. The guest remains on the isolated libvirt network: inbound forwarding permits
+only that RDP flow, while guest access to the host and unrelated forwarding remain denied. SSH
+Dispatcher sharing is not used for RDP.
+
+The first image build requires KVM, HashiCorp Packer, the Windows image tools, at least 5 GiB of
+available memory and 55 GiB of free disk. An administrator must register the Windows Evaluation
+media and trusted checksums before deployment. The archive installs the builder alongside the agent;
+it does not invent source URLs, checksums or license approval. Existing approved prepared images can
+be used without Packer.
 
 The ISO/Unattend path validates that index 2 is a supported Windows Server 2022 evaluation image,
 waits for installed-system RDP, ejects all installation media, cold-boots the disk and requires RDP

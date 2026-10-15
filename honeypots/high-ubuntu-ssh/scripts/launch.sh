@@ -51,7 +51,14 @@ if command -v setfacl >/dev/null 2>&1; then
   setfacl -m "u:$libvirt_user:rwx" "$instance_dir"
 fi
 
+high_virt_type=${HF_HIGH_VIRT_TYPE:-kvm}
+case "$high_virt_type" in
+  kvm|qemu) ;;
+  *) echo "invalid High libvirt domain type: $high_virt_type" >&2; exit 1 ;;
+esac
+
 virt-install \
+  --virt-type "$high_virt_type" \
   --name "$vm_name" \
   --memory 2048 \
   --vcpus 2 \
@@ -67,6 +74,8 @@ virt-install \
 
 # The host firewall/NAT adapter must publish ssh_port to this VM only after it receives an IP.
 # Keeping it outside the guest ensures the guest cannot alter host exposure.
-printf '%s\n' "$ssh_port" > "$instance_dir/external-ssh-port"
+if [ "$high_virt_type" = kvm ]; then
+  printf '%s\n' "$ssh_port" > "$instance_dir/external-ssh-port"
+fi
 cleanup_needed=0
 trap - EXIT INT TERM

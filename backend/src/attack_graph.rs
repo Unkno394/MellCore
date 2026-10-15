@@ -45,7 +45,7 @@ fn normalize(event: &IncomingEvent, trusted_center: bool) -> Action {
         && event.service_type == "host_monitor"
         && event.protocol == "local"
         && matches!(event.payload["trap_tier"].as_str(), Some("low" | "middle"));
-    let simulated = source == "pritvoryashka";
+    let simulated = matches!(source, "pritvoryashka" | "honeyforge-low");
     let domain = if kernel {
         "host_observer"
     } else if simulated {
@@ -457,6 +457,19 @@ mod tests {
         );
         assert!(!fake.confirmed);
         assert_eq!(fake.kind, "event.other");
+    }
+
+    #[test]
+    fn low_shell_activity_is_simulated_evidence() {
+        let mut command = event(
+            "command.executed",
+            json!({"command":"whoami","input":"whoami","exit_status":0}),
+        );
+        command.metadata = json!({"source":"honeyforge-low","evidence_domain":"simulated"});
+        let normalized = normalize(&command, true);
+        assert_eq!(normalized.kind, "process.command");
+        assert_eq!(normalized.domain, "simulated");
+        assert!(!normalized.confirmed);
     }
     #[test]
     fn actual_resource_paths_and_domains_are_preserved() {
