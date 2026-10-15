@@ -29,6 +29,38 @@ run_step() {
   "$@" || fail_install "$current_step" "command failed"
 }
 
+run_bounded() {
+  error_code=$1
+  seconds=$2
+  detail=$3
+  shift 3
+  if timeout "$seconds" "$@"; then
+    return 0
+  else
+    status=$?
+  fi
+  if [ "$status" -eq 124 ]; then
+    fail_install "$error_code" "$detail timed out after ${seconds}s"
+  fi
+  fail_install "$error_code" "$detail failed with exit status $status"
+}
+
+stop_live_unit() {
+  unit=$1
+  if timeout 5 systemctl is-active --quiet "$unit"; then
+    run_bounded ARCH_OFFLINE_SERVICE_STOP_FAILED 20 "stopping $unit" systemctl stop "$unit"
+  else
+    status=$?
+    [ "$status" -ne 124 ] || fail_install ARCH_OFFLINE_SERVICE_STOP_FAILED "checking $unit timed out after 5s"
+  fi
+  if timeout 5 systemctl is-active --quiet "$unit"; then
+    fail_install ARCH_OFFLINE_SERVICE_STOP_FAILED "$unit remained active"
+  else
+    status=$?
+    [ "$status" -ne 124 ] || fail_install ARCH_OFFLINE_SERVICE_STOP_FAILED "checking stopped $unit timed out after 5s"
+  fi
+}
+
 finish_or_report() {
   status=$?
   trap - EXIT
@@ -47,9 +79,38 @@ trap 'current_step=ARCHINSTALL_INTERRUPTED; exit 1' HUP INT TERM
 
 [ -b "$disk" ] || fail_install ARCH_TARGET_DISK_MISSING "target disk /dev/vda is absent"
 for command in archinstall pacman wipefs parted partprobe udevadm mkfs.ext4 mount \
-  umount mountpoint blkid arch-chroot base64 install sync awk grep sed tail python3 pacman-key; do
+  umount mountpoint blkid arch-chroot base64 install sync awk grep sed tail python3 pacman-key \
+  systemctl timeout; do
   command -v "$command" >/dev/null || fail_install INSTALL_MEDIA_COMPONENT_MISSING "$command"
 done
+
+# The live environment is intentionally isolated. Stop any service inherited
+# from an older cached ISO before touching the keyring; the remastered v4 ISO
+# also masks the network-dependent units before boot.
+for unit in systemd-time-wait-sync.service systemd-timesyncd.service \
+  reflector.service reflector.timer archlinux-keyring-wkd-sync.service \
+  archlinux-keyring-wkd-sync.timer pacman-init.service; do
+  stop_live_unit "$unit"
+done
+timedatectl set-ntp false >/dev/null 2>&1 || true
+
+[ -s /usr/share/pacman/keyrings/archlinux.gpg ] ||
+  fail_install ARCH_PACMAN_KEYRING_SOURCE_MISSING "bundled Arch keyring is absent"
+run_bounded ARCH_PACMAN_KEYRING_INIT_FAILED 120 "pacman keyring initialization" \
+  pacman-key --init
+run_bounded ARCH_PACMAN_KEYRING_POPULATE_FAILED 120 "populating bundled Arch keyring" \
+  pacman-key --populate archlinux
+if key_list=$(timeout 30 pacman-key --list-keys 2>&1); then
+  :
+else
+  status=$?
+  [ "$status" -ne 124 ] || fail_install ARCH_PACMAN_KEYRING_NOT_READY "keyring readiness check timed out after 30s"
+  fail_install ARCH_PACMAN_KEYRING_NOT_READY "keyring readiness check failed with exit status $status"
+fi
+printf '%s\n' "$key_list" | grep -Eq '^pub[[:space:]]' ||
+  fail_install ARCH_PACMAN_KEYRING_NOT_READY "populated keyring contains no public keys"
+[ -s /etc/pacman.d/gnupg/trustdb.gpg ] ||
+  fail_install ARCH_PACMAN_KEYRING_NOT_READY "pacman trust database is absent"
 
 archinstall_version=$(archinstall --version 2>&1 | sed -n 's/.*\(3\.0\.[0-9][0-9]*\).*/\1/p' | head -n 1)
 case "$archinstall_version" in
@@ -186,11 +247,27 @@ while IFS= read -r package_file; do
   done
   [ -n "$package_path" ] || fail_install ARCH_REPO_PACKAGE_MISSING "$package_file"
   [ -s "$package_path.sig" ] || fail_install ARCH_REPO_PACKAGE_SIGNATURE_MISSING "$package_file"
-  pacman-key --verify "$package_path.sig" "$package_path" >/dev/null 2>&1 ||
+  signature_log=/tmp/hf-package-signature.log
+  if timeout 30 pacman-key --verify "$package_path.sig" "$package_path" > "$signature_log" 2>&1; then
+    signature_status=0
+  else
+    signature_status=$?
+  fi
+  if grep -Eiq 'key has expired|expired key|key[^[:alnum:]]+expired|signature has expired|\[expired\]|EXPKEYSIG|KEYEXPIRED' "$signature_log"; then
+    rm -f "$signature_log"
+    fail_install ARCH_REPO_PACKAGE_SIGNING_KEY_EXPIRED "$package_file"
+  fi
+  if [ "$signature_status" -eq 124 ]; then
+    rm -f "$signature_log"
+    fail_install ARCH_REPO_PACKAGE_SIGNATURE_TIMEOUT "$package_file"
+  fi
+  if [ "$signature_status" -ne 0 ]; then
+    rm -f "$signature_log"
     fail_install ARCH_REPO_PACKAGE_SIGNATURE_INVALID "$package_file"
+  fi
+  rm -f "$signature_log"
 done < "$package_list"
 
-timedatectl set-ntp false >/dev/null 2>&1 || true
 if mountpoint -q /mnt; then
   run_step ARCH_PREVIOUS_ROOT_UNMOUNT_FAILED umount -R /mnt
 fi

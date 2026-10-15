@@ -141,7 +141,22 @@ class CustomIsoRecipeTests(unittest.TestCase):
         self.assertIn("ARCH_REPO_METADATA_INVALID", guest)
         self.assertIn("ARCH_REPO_PACKAGE_SIGNATURE_MISSING", guest)
         self.assertIn("ARCH_REPO_PACKAGE_SIGNATURE_INVALID", guest)
-        self.assertIn('pacman-key --verify "$package_path.sig" "$package_path"', guest)
+        self.assertIn("ARCH_REPO_PACKAGE_SIGNING_KEY_EXPIRED", guest)
+        self.assertIn("ARCH_REPO_PACKAGE_SIGNATURE_TIMEOUT", guest)
+        self.assertIn('timeout 30 pacman-key --verify "$package_path.sig" "$package_path"', guest)
+        self.assertIn("pacman-key --init", guest)
+        self.assertIn("pacman-key --populate archlinux", guest)
+        self.assertIn("ARCH_PACMAN_KEYRING_NOT_READY", guest)
+        self.assertIn("\\[expired\\]", guest)
+        self.assertIn("systemd-time-wait-sync.service", guest)
+        self.assertIn("reflector.service", guest)
+        self.assertNotIn("SigLevel = Never", guest)
+        self.assertNotIn("date -s", guest)
+        self.assertLess(guest.index("pacman-key --populate archlinux"), guest.index("pacman -Sy --noconfirm"))
+        self.assertLess(
+            guest.index("ARCH_REPO_PACKAGE_SIGNING_KEY_EXPIRED"),
+            guest.index('if [ "$signature_status" -ne 0 ]'),
+        )
         self.assertNotIn("core.db.sig", guest)
         self.assertNotIn("extra.db.sig", guest)
         self.assertIn('"sudo": true', guest)
@@ -508,6 +523,12 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 "[ ! -e \"$source/etc_1\" ] || exit 20\n"
                 "grep -F -- '--autologin root --keep-baud 115200,57600,38400,9600' \"$dropin\" >/dev/null || exit 20\n"
                 "[ \"$(readlink \"$link\")\" = /usr/lib/systemd/system/serial-getty@.service ] || exit 21\n"
+                "offline=\"$source/etc/systemd/system\"\n"
+                "grep -Fx 'After=' \"$offline/pacman-init.service.d/honeyforge-offline.conf\" >/dev/null || exit 22\n"
+                "grep -Fx 'After=etc-pacman.d-gnupg.mount' \"$offline/pacman-init.service.d/honeyforge-offline.conf\" >/dev/null || exit 23\n"
+                "for unit in systemd-time-wait-sync.service systemd-timesyncd.service reflector.service reflector.timer archlinux-keyring-wkd-sync.service archlinux-keyring-wkd-sync.timer; do\n"
+                "  [ -L \"$offline/$unit\" ] && [ \"$(readlink \"$offline/$unit\")\" = /dev/null ] || exit 24\n"
+                "done\n"
                 "rm -rf \"$FAKE_REPACK_CAPTURE\"\n"
                 "mkdir -p \"$FAKE_REPACK_CAPTURE\"\n"
                 "cp -a \"$source/.\" \"$FAKE_REPACK_CAPTURE/\"\n"
@@ -608,9 +629,22 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 "/usr/lib/original-target",
             )
             self.assertFalse((repack_capture / "etc_1").exists())
+            systemd_root = repack_capture / "etc/systemd/system"
+            offline_override = systemd_root / "pacman-init.service.d/honeyforge-offline.conf"
+            self.assertIn("After=etc-pacman.d-gnupg.mount", offline_override.read_text())
+            for unit in (
+                "systemd-time-wait-sync.service",
+                "systemd-timesyncd.service",
+                "reflector.service",
+                "reflector.timer",
+                "archlinux-keyring-wkd-sync.service",
+                "archlinux-keyring-wkd-sync.timer",
+            ):
+                self.assertTrue((systemd_root / unit).is_symlink())
+                self.assertEqual(os.readlink(systemd_root / unit), "/dev/null")
             self.assertEqual(
                 (instance / "unattended-arch.version").read_text().strip(),
-                "arch-serial-getty-v3",
+                "arch-offline-init-v4",
             )
             self.assertEqual(hashlib.sha256(base.read_bytes()).hexdigest(), base_digest)
 

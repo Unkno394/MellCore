@@ -8,7 +8,7 @@ validate_instance_id "$instance_id"
 case "$flavor" in ubuntu|debian|arch) ;; *) echo "unsupported unattended ISO flavor: $flavor" >&2; exit 1 ;; esac
 for command in xorriso openssl python3; do command -v "$command" >/dev/null; done
 [ -r "$base_iso" ]
-arch_recipe_revision=arch-serial-getty-v3
+arch_recipe_revision=arch-offline-init-v4
 if [ "$flavor" = arch ]; then
   for command in mksquashfs unsquashfs sha512sum; do
     command -v "$command" >/dev/null || {
@@ -273,8 +273,29 @@ EOF
   serial_link="$serial_wants/serial-getty@ttyS0.service"
   rm -f "$serial_link"
   ln -s /usr/lib/systemd/system/serial-getty@.service "$serial_link"
+
+  # The live image has no routed egress by design. Prevent services which wait
+  # for Internet time or mirrors from delaying multi-user.target, and detach
+  # pacman-init from time-sync.target so the bundled keyring can be populated
+  # entirely from /usr/share/pacman/keyrings.
+  systemd_root="$serial_root/etc/systemd/system"
+  mkdir -p "$systemd_root"
+  offline_units='systemd-time-wait-sync.service systemd-timesyncd.service reflector.service reflector.timer archlinux-keyring-wkd-sync.service archlinux-keyring-wkd-sync.timer'
+  for unit in $offline_units; do
+    rm -f "$systemd_root/$unit"
+    ln -s /dev/null "$systemd_root/$unit"
+  done
+  pacman_init_dropin="$systemd_root/pacman-init.service.d/honeyforge-offline.conf"
+  mkdir -p "$(dirname "$pacman_init_dropin")"
+  cat > "$pacman_init_dropin" <<'EOF'
+[Unit]
+After=
+After=etc-pacman.d-gnupg.mount
+Wants=
+EOF
   chmod 0755 "$(dirname "$serial_dropin")" "$serial_wants"
-  chmod 0644 "$serial_dropin"
+  chmod 0755 "$(dirname "$pacman_init_dropin")"
+  chmod 0644 "$serial_dropin" "$pacman_init_dropin"
   mksquashfs "$serial_root" "$rebuilt_airootfs" -noappend -no-progress -no-recovery -processors 1 -mem 256M >/dev/null || {
     echo 'HF_HIGH_ERROR code=ARCH_LIVE_ROOTFS_PREPARATION_FAILED stage=installation: could not rebuild the per-instance Arch live root' >&2; exit 1;
   }
@@ -282,8 +303,15 @@ EOF
   mv "$rebuilt_airootfs" "$airootfs"
   unsquashfs -no-progress -d "$serial_verify" "$airootfs" \
     etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf \
-    etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service >/dev/null || {
-    echo 'HF_HIGH_ERROR code=ARCH_SERIAL_GETTY_VERIFY_FAILED stage=installation: serial-getty files are absent from the prepared Arch live root' >&2; exit 1;
+    etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service \
+    etc/systemd/system/pacman-init.service.d/honeyforge-offline.conf \
+    etc/systemd/system/systemd-time-wait-sync.service \
+    etc/systemd/system/systemd-timesyncd.service \
+    etc/systemd/system/reflector.service \
+    etc/systemd/system/reflector.timer \
+    etc/systemd/system/archlinux-keyring-wkd-sync.service \
+    etc/systemd/system/archlinux-keyring-wkd-sync.timer >/dev/null || {
+    echo 'HF_HIGH_ERROR code=ARCH_LIVE_ROOTFS_VERIFY_FAILED stage=installation: prepared Arch live root lacks required serial or offline initialization files' >&2; exit 1;
   }
   grep -Fx '[Service]' "$serial_verify/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf" >/dev/null &&
   grep -Fx 'ExecStart=' "$serial_verify/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf" >/dev/null &&
@@ -295,6 +323,18 @@ EOF
   [ "$(readlink "$serial_verify/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service")" = /usr/lib/systemd/system/serial-getty@.service ] || {
     echo 'HF_HIGH_ERROR code=ARCH_SERIAL_GETTY_VERIFY_FAILED stage=installation: serial-getty activation link is invalid' >&2; exit 1;
   }
+  grep -Fx 'After=' "$serial_verify/etc/systemd/system/pacman-init.service.d/honeyforge-offline.conf" >/dev/null &&
+  grep -Fx 'After=etc-pacman.d-gnupg.mount' "$serial_verify/etc/systemd/system/pacman-init.service.d/honeyforge-offline.conf" >/dev/null &&
+  grep -Fx 'Wants=' "$serial_verify/etc/systemd/system/pacman-init.service.d/honeyforge-offline.conf" >/dev/null || {
+    echo 'HF_HIGH_ERROR code=ARCH_OFFLINE_INIT_VERIFY_FAILED stage=installation: pacman-init offline override is invalid' >&2; exit 1;
+  }
+  for unit in $offline_units; do
+    [ -L "$serial_verify/etc/systemd/system/$unit" ] &&
+    [ "$(readlink "$serial_verify/etc/systemd/system/$unit")" = /dev/null ] || {
+      echo "HF_HIGH_ERROR code=ARCH_OFFLINE_INIT_VERIFY_FAILED stage=installation: $unit is not masked in the live image" >&2
+      exit 1
+    }
+  done
   unsquashfs -no-progress -l "$airootfs" > "$serial_listing" || {
     echo 'HF_HIGH_ERROR code=ARCH_SERIAL_GETTY_VERIFY_FAILED stage=installation: could not list the rebuilt Arch live root' >&2; exit 1;
   }
