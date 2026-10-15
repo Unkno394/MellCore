@@ -60,56 +60,91 @@ set root_prompt [format {(^|\r\n|\n|\r)(?:%s)*[ \t]*(?:root@archiso[^\r\n#]{0,16
 log_user 0
 match_max 262144
 spawn virsh console $vm_name --force
+
+# Do not send input until virsh confirms that the console attachment exists.
+# Otherwise the initial carriage return can be lost while virsh is still opening
+# the PTY, leaving an already waiting shell silent until the full boot timeout.
+set timeout [expr {$boot_timeout < 15 ? $boot_timeout : 15}]
+expect {
+    -re {(?i)Connected to domain[^\r\n]*} {
+        record_console $log_fd $expect_out(buffer)
+    }
+    timeout {
+        record_console $log_fd $expect_out(buffer)
+        fail_install $log_fd ARCH_SERIAL_CONNECT_TIMEOUT "virsh did not confirm the Arch console attachment; sanitized log: $diagnostic_log" 4
+    }
+    eof {
+        record_console $log_fd $expect_out(buffer)
+        fail_install $log_fd ARCH_SERIAL_CONSOLE_CLOSED "Arch serial console closed before attachment; sanitized log: $diagnostic_log" 4
+    }
+}
+
 # virsh does not replay bytes that the guest emitted before this attachment. A
-# carriage return is harmless at boot and makes an already waiting getty or shell
-# emit a fresh prompt, which is essential for restart/reconciliation.
+# carriage return is harmless and makes an already waiting getty or shell emit a
+# fresh prompt. Repeat it at a short bounded interval until the overall boot
+# deadline, which also makes restart/reconciliation recover a lost first request.
 send -- "\r"
 
 # A separate, deliberately short timeout prevents the full installation timeout
 # from hiding a serial boot/login failure.
-set timeout $boot_timeout
 set login_attempts 0
 set empty_password_attempted 0
-expect {
-    -re {(?i)archiso[[:space:]]+login:} {
-        record_console $log_fd $expect_out(buffer)
-        incr login_attempts
-        if {$login_attempts > 3} {
-            fail_install $log_fd ARCH_SERIAL_LOGIN_FAILED "ArchISO repeatedly returned to its login prompt; sanitized log: $diagnostic_log" 3
-        }
-        send -- "root\r"
-        exp_continue -continue_timer
-    }
-    -re {(?i)password:} {
-        record_console $log_fd $expect_out(buffer)
-        if {$empty_password_attempted} {
-            fail_install $log_fd ARCH_SERIAL_LOGIN_FAILED "ArchISO rejected the live root login; sanitized log: $diagnostic_log" 3
-        }
-        set empty_password_attempted 1
-        send -- "\r"
-        exp_continue -continue_timer
-    }
-    -re $root_prompt {
-        record_console $log_fd $expect_out(buffer)
-    }
-    -re {\r\n|\n|\r} {
-        record_console $log_fd $expect_out(buffer)
-        exp_continue -continue_timer
-    }
-    timeout {
-        record_console $log_fd $expect_out(buffer)
+set prompt_retry_seconds 5
+set root_deadline [expr {[clock milliseconds] + ($boot_timeout * 1000)}]
+while {1} {
+    set remaining_ms [expr {$root_deadline - [clock milliseconds]}]
+    if {$remaining_ms <= 0} {
         fail_install $log_fd ARCH_SERIAL_ROOT_TIMEOUT "ArchISO serial console did not reach a root shell within ${boot_timeout}s; sanitized log: $diagnostic_log" 3
     }
-    eof {
-        record_console $log_fd $expect_out(buffer)
-        fail_install $log_fd ARCH_SERIAL_CONSOLE_CLOSED "ArchISO serial console closed before login; sanitized log: $diagnostic_log" 4
+    set timeout [expr {($remaining_ms + 999) / 1000}]
+    if {$timeout > $prompt_retry_seconds} { set timeout $prompt_retry_seconds }
+    set root_seen 0
+    expect {
+        -re {(?i)archiso[[:space:]]+login:} {
+            record_console $log_fd $expect_out(buffer)
+            incr login_attempts
+            if {$login_attempts > 3} {
+                fail_install $log_fd ARCH_SERIAL_LOGIN_FAILED "ArchISO repeatedly returned to its login prompt; sanitized log: $diagnostic_log" 3
+            }
+            send -- "root\r"
+            exp_continue -continue_timer
+        }
+        -re {(?i)password:} {
+            record_console $log_fd $expect_out(buffer)
+            if {$empty_password_attempted} {
+                fail_install $log_fd ARCH_SERIAL_LOGIN_FAILED "ArchISO rejected the live root login; sanitized log: $diagnostic_log" 3
+            }
+            set empty_password_attempted 1
+            send -- "\r"
+            exp_continue -continue_timer
+        }
+        -re $root_prompt {
+            record_console $log_fd $expect_out(buffer)
+            set root_seen 1
+        }
+        -re {\r\n|\n|\r} {
+            record_console $log_fd $expect_out(buffer)
+            exp_continue -continue_timer
+        }
+        timeout {
+            record_console $log_fd $expect_out(buffer)
+            if {[clock milliseconds] >= $root_deadline} {
+                fail_install $log_fd ARCH_SERIAL_ROOT_TIMEOUT "ArchISO serial console did not reach a root shell within ${boot_timeout}s; sanitized log: $diagnostic_log" 3
+            }
+            send -- "\r"
+        }
+        eof {
+            record_console $log_fd $expect_out(buffer)
+            fail_install $log_fd ARCH_SERIAL_CONSOLE_CLOSED "ArchISO serial console closed before login; sanitized log: $diagnostic_log" 4
+        }
     }
+    if {$root_seen} { break }
 }
 
 # Disable terminal echo before reading or transmitting the installer. The payload
 # path is used instead of a command-line payload so process listings cannot expose
 # the generated password hash or guest sensor sources.
-send -- "stty -echo; printf 'HF_SERIAL_READY\\n'\r"
+send -- "stty -echo && printf 'HF_%s_READY\\n' SERIAL\r"
 set timeout 15
 expect {
     -re {HF_SERIAL_READY} { record_console $log_fd $expect_out(buffer) }

@@ -336,14 +336,18 @@ class CustomIsoRecipeTests(unittest.TestCase):
             executable(
                 fake_bin / "virsh",
                 "#!/usr/bin/env python3\n"
-                "import sys\n"
+                "import select, sys\n"
                 "def emit(value):\n"
                 "    sys.stdout.write(value); sys.stdout.flush()\n"
                 "ansi_prompt = '\\x1b[?2004h\\x1b[1;31m#\\x1b[0m '\n"
+                "if select.select([sys.stdin], [], [], 0.25)[0]: raise SystemExit(9)\n"
                 "emit('Connected to domain fixture-vm\\r\\n')\n"
                 "if sys.stdin.readline().strip(): raise SystemExit(10)\n"
+                "if sys.stdin.readline().strip(): raise SystemExit(15)\n"
                 "emit(ansi_prompt)\n"
-                "if not sys.stdin.readline().startswith('stty -echo'): raise SystemExit(11)\n"
+                "setup = sys.stdin.readline()\n"
+                "if not setup.startswith('stty -echo'): raise SystemExit(11)\n"
+                "if 'HF_SERIAL_READY' in setup or 'HF_%s_READY' not in setup: raise SystemExit(16)\n"
                 "emit('HF_SERIAL_READY\\r\\n# ')\n"
                 "if not sys.stdin.readline().startswith('rm -f '): raise SystemExit(12)\n"
                 "emit(ansi_prompt)\n"
@@ -377,11 +381,11 @@ class CustomIsoRecipeTests(unittest.TestCase):
                     os.environ,
                     PATH=f"{fake_bin}:{os.environ['PATH']}",
                     HF_HIGH_INSTALL_TIMEOUT_SECONDS="10",
-                    HF_HIGH_ARCH_BOOT_TIMEOUT_SECONDS="3",
+                    HF_HIGH_ARCH_BOOT_TIMEOUT_SECONDS="8",
                 ),
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=20,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             diagnostic = console_log.read_text(encoding="utf-8")
@@ -402,6 +406,8 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 fake_bin / "virsh",
                 "#!/usr/bin/env python3\n"
                 "import sys, time\n"
+                "sys.stdout.write('Connected to domain fixture-vm\\r\\n'); sys.stdout.flush()\n"
+                "if sys.stdin.readline().strip(): raise SystemExit(10)\n"
                 "sys.stdout.write('Booting ArchISO: module #7\\r\\n# kernel diagnostic continues\\r\\n'); sys.stdout.flush()\n"
                 "time.sleep(10)\n",
             )
