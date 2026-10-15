@@ -186,13 +186,49 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 "    exit 0 ;;\n"
                 "  /arch/boot/x86_64/vmlinuz-linux|/arch/boot/x86_64/initramfs-linux.img|/EFI/BOOT/BOOTx64.EFI)\n"
                 "    mkdir -p \"$(dirname \"$extract\")\"; : > \"$extract\"; exit 0 ;;\n"
+                "  /arch/x86_64/airootfs.sfs)\n"
+                "    printf '%s' 'fixture squashfs' > \"$extract\"; exit 0 ;;\n"
                 "  /boot/grub/*) exit 9 ;;\n"
                 "esac\n"
-                "[ -n \"$out\" ] && { : > \"$out\"; exit 0; }\n"
+                "[ -n \"$out\" ] && { printf '%s' 'prepared ISO' > \"$out\"; exit 0; }\n"
                 "exit 2\n",
+            )
+            serial_capture = root / "serial-autologin.conf"
+            executable(
+                fake_bin / "mksquashfs",
+                "#!/bin/sh\n"
+                "overlay=$1; image=$2\n"
+                "dropin=\"$overlay/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf\"\n"
+                "link=\"$overlay/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service\"\n"
+                "grep -F -- '--autologin root --keep-baud 115200,57600,38400,9600' \"$dropin\" >/dev/null || exit 20\n"
+                "[ \"$(readlink \"$link\")\" = /usr/lib/systemd/system/serial-getty@.service ] || exit 21\n"
+                "cp \"$dropin\" \"$FAKE_SERIAL_CAPTURE\"\n"
+                "printf '%s' 'prepared squashfs' >> \"$image\"\n",
+            )
+            executable(
+                fake_bin / "unsquashfs",
+                "#!/bin/sh\n"
+                "dest=\n"
+                "while [ \"$#\" -gt 0 ]; do [ \"$1\" = -d ] && { shift; dest=$1; }; shift; done\n"
+                "dropin=\"$dest/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf\"\n"
+                "mkdir -p \"$(dirname \"$dropin\")\" \"$dest/etc/systemd/system/getty.target.wants\"\n"
+                "cp \"$FAKE_SERIAL_CAPTURE\" \"$dropin\"\n"
+                "ln -s /usr/lib/systemd/system/serial-getty@.service \"$dest/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service\"\n",
+            )
+            executable(
+                fake_bin / "sha512sum",
+                "#!/bin/sh\nprintf '%0128d  %s\\n' 0 \"$1\"\n",
             )
             base = root / "archlinux-2025.08.01-x86_64.iso"
             base.write_bytes(b"verified Arch ISO fixture")
+            base_digest = hashlib.sha256(base.read_bytes()).hexdigest()
+            environment = dict(
+                os.environ,
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                HF_HIGH_ROOT=str(root / "high"),
+                FAKE_XORRISO_LOG=str(xorriso_log),
+                FAKE_SERIAL_CAPTURE=str(serial_capture),
+            )
             subprocess.run(
                 [
                     "sh",
@@ -202,12 +238,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
                     "arch",
                 ],
                 check=True,
-                env=dict(
-                    os.environ,
-                    PATH=f"{fake_bin}:{os.environ['PATH']}",
-                    HF_HIGH_ROOT=str(root / "high"),
-                    FAKE_XORRISO_LOG=str(xorriso_log),
-                ),
+                env=environment,
                 capture_output=True,
                 text=True,
             )
@@ -226,9 +257,35 @@ class CustomIsoRecipeTests(unittest.TestCase):
             calls = xorriso_log.read_text()
             self.assertIn("-extract /boot/syslinux", calls)
             self.assertIn("-extract /EFI/BOOT/BOOTx64.EFI", calls)
+            self.assertIn("-extract /arch/x86_64/airootfs.sfs", calls)
+            self.assertIn("-map", calls)
+            self.assertIn("/arch/x86_64/airootfs.sfs", calls)
+            self.assertIn("/arch/x86_64/airootfs.sha512", calls)
             self.assertIn("-boot_image any replay", calls)
             self.assertNotIn("/boot/grub", calls)
             self.assertTrue((instance / "unattended.iso").is_file())
+            self.assertIn("--autologin root", serial_capture.read_text())
+            self.assertEqual(
+                (instance / "unattended-arch.version").read_text().strip(),
+                "arch-serial-getty-v1",
+            )
+            self.assertEqual(hashlib.sha256(base.read_bytes()).hexdigest(), base_digest)
+
+            calls_before_retry = xorriso_log.read_text()
+            subprocess.run(
+                [
+                    "sh",
+                    str(RECIPE / "scripts" / "prepare-unattended-iso.sh"),
+                    str(base),
+                    INSTANCE_ID,
+                    "arch",
+                ],
+                check=True,
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(xorriso_log.read_text(), calls_before_retry)
 
     @unittest.skipUnless(shutil.which("expect"), "expect is required for Arch console tests")
     def test_arch_console_accepts_ansi_prompt_and_hides_payload(self):
@@ -242,11 +299,9 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 "import sys\n"
                 "def emit(value):\n"
                 "    sys.stdout.write(value); sys.stdout.flush()\n"
-                "emit('Arch Linux boot\\r\\narchiso login: \\x1b[?2004h')\n"
-                "line = sys.stdin.readline()\n"
-                "while not line.strip(): line = sys.stdin.readline()\n"
-                "if line.strip() != 'root': raise SystemExit(10)\n"
-                "emit('\\r\\nroot@archiso ~ # \\x1b[?2004h')\n"
+                "emit('Connected to domain fixture-vm\\r\\n')\n"
+                "if sys.stdin.readline().strip(): raise SystemExit(10)\n"
+                "emit('root@archiso ~ # \\x1b[?2004h')\n"
                 "if not sys.stdin.readline().startswith('stty -echo'): raise SystemExit(11)\n"
                 "emit('HF_SERIAL_READY\\r\\nroot@archiso ~ # \\x1b[?2004h')\n"
                 "if not sys.stdin.readline().startswith('rm -f '): raise SystemExit(12)\n"
@@ -289,7 +344,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             diagnostic = console_log.read_text(encoding="utf-8")
-            self.assertIn("archiso login:", diagnostic)
+            self.assertIn("Connected to domain", diagnostic)
             self.assertIn("root@archiso", diagnostic)
             self.assertIn("<redacted-payload>", diagnostic)
             self.assertNotIn(payload_value, diagnostic)

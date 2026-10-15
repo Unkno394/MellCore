@@ -8,6 +8,20 @@ validate_instance_id "$instance_id"
 case "$flavor" in ubuntu|debian|arch) ;; *) echo "unsupported unattended ISO flavor: $flavor" >&2; exit 1 ;; esac
 for command in xorriso openssl python3; do command -v "$command" >/dev/null; done
 [ -r "$base_iso" ]
+arch_recipe_revision=arch-serial-getty-v1
+if [ "$flavor" = arch ]; then
+  for command in mksquashfs unsquashfs sha512sum; do
+    command -v "$command" >/dev/null || {
+      echo "HF_HIGH_ERROR code=DEPENDENCY_MISSING stage=dependencies: Arch ISO preparation requires $command" >&2
+      exit 1
+    }
+  done
+  if [ -s "$instance_dir/unattended.iso" ] &&
+     [ -f "$instance_dir/unattended-arch.version" ] &&
+     grep -Fx "$arch_recipe_revision" "$instance_dir/unattended-arch.version" >/dev/null; then
+    exit 0
+  fi
+fi
 mkdir -p "$instance_dir/iso-payload/nocloud" "$instance_dir/iso-payload/honeyforge"
 rm -f "$instance_dir/unattended.iso.tmp"
 password_file="$instance_dir/ssh-password"
@@ -148,7 +162,12 @@ elif [ "$flavor" = arch ]; then
   # Official Arch installation media boots in BIOS mode from /boot/syslinux. It does not
   # provide the Ubuntu/Debian-style /boot/grub/grub.cfg that older recipes assumed.
   syslinux_dir="$instance_dir/boot-syslinux"
-  rm -rf "$syslinux_dir" "$instance_dir/arch-media-probe"
+  airootfs="$instance_dir/airootfs.sfs"
+  airootfs_sha="$instance_dir/airootfs.sha512"
+  serial_overlay="$instance_dir/arch-serial-overlay"
+  serial_verify="$instance_dir/arch-serial-verify"
+  rm -rf "$syslinux_dir" "$instance_dir/arch-media-probe" "$serial_overlay" "$serial_verify"
+  rm -f "$airootfs" "$airootfs_sha"
   xorriso -osirrox on -indev "$base_iso" -extract /boot/syslinux "$syslinux_dir" >/dev/null 2>&1 || {
     echo 'Arch media lacks /boot/syslinux required for BIOS serial installation' >&2; exit 1;
   }
@@ -159,6 +178,10 @@ elif [ "$flavor" = arch ]; then
       echo "Arch media lacks required boot artefact $media_path" >&2; exit 1;
     }
   done
+  xorriso -osirrox on -indev "$base_iso" -extract /arch/x86_64/airootfs.sfs "$airootfs" >/dev/null 2>&1 || {
+    echo 'HF_HIGH_ERROR code=ARCH_LIVE_ROOTFS_MISSING stage=installation: Arch media lacks /arch/x86_64/airootfs.sfs' >&2; exit 1;
+  }
+  chmod 0600 "$airootfs"
   python3 - "$syslinux_dir" <<'PY'
 import pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
@@ -210,9 +233,56 @@ main.write_text(
     encoding="utf-8",
 )
 PY
-  rm -rf "$instance_dir/arch-media-probe"
+
+  # console=ttyS0 makes systemd-getty-generator instantiate serial-getty, but the
+  # stock monthly ArchISO only configures root autologin for tty1. Append the
+  # corresponding serial-getty drop-in to a per-instance copy of airootfs.sfs.
+  # mksquashfs appends the tiny overlay to the existing filesystem and therefore
+  # does not unpack or alter the verified base ISO.
+  serial_dropin="$serial_overlay/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf"
+  serial_wants="$serial_overlay/etc/systemd/system/getty.target.wants"
+  mkdir -p "$(dirname "$serial_dropin")" "$serial_wants"
+  cat > "$serial_dropin" <<'EOF'
+[Service]
+ExecStart=
+ExecStart=-/usr/bin/agetty --noreset --noclear --autologin root --keep-baud 115200,57600,38400,9600 - ${TERM}
+EOF
+  ln -s /usr/lib/systemd/system/serial-getty@.service "$serial_wants/serial-getty@ttyS0.service"
+  find "$serial_overlay" -type d -exec chmod 0755 {} +
+  chmod 0644 "$serial_dropin"
+  mksquashfs "$serial_overlay" "$airootfs" -no-progress -no-recovery -processors 1 -mem 256M >/dev/null || {
+    echo 'HF_HIGH_ERROR code=ARCH_LIVE_ROOTFS_PREPARATION_FAILED stage=installation: could not add serial-getty autologin to the per-instance Arch live root' >&2; exit 1;
+  }
+  unsquashfs -no-progress -d "$serial_verify" "$airootfs" \
+    etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf \
+    etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service >/dev/null || {
+    echo 'HF_HIGH_ERROR code=ARCH_SERIAL_GETTY_VERIFY_FAILED stage=installation: serial-getty files are absent from the prepared Arch live root' >&2; exit 1;
+  }
+  grep -F -- '--autologin root --keep-baud 115200,57600,38400,9600' \
+    "$serial_verify/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf" >/dev/null || {
+    echo 'HF_HIGH_ERROR code=ARCH_SERIAL_GETTY_VERIFY_FAILED stage=installation: serial root autologin override is invalid' >&2; exit 1;
+  }
+  [ "$(readlink "$serial_verify/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service")" = /usr/lib/systemd/system/serial-getty@.service ] || {
+    echo 'HF_HIGH_ERROR code=ARCH_SERIAL_GETTY_VERIFY_FAILED stage=installation: serial-getty activation link is invalid' >&2; exit 1;
+  }
+  (cd "$instance_dir" && sha512sum airootfs.sfs > airootfs.sha512)
+  serial_entry="$syslinux_dir/archiso_sys-linux.cfg"
+  [ -f "$serial_entry" ] && grep -F 'console=ttyS0,115200n8' "$serial_entry" >/dev/null || {
+    echo 'HF_HIGH_ERROR code=ARCH_SYSLINUX_SERIAL_INVALID stage=installation: the selected ArchISO Syslinux entry was not patched for ttyS0' >&2; exit 1;
+  }
   xorriso -indev "$base_iso" -outdev "$instance_dir/unattended.iso.tmp" -boot_image any replay \
-    -map "$syslinux_dir" /boot/syslinux -commit >/dev/null 2>&1
+    -map "$syslinux_dir/archiso_sys.cfg" /boot/syslinux/archiso_sys.cfg \
+    -map "$serial_entry" /boot/syslinux/archiso_sys-linux.cfg \
+    -map "$airootfs" /arch/x86_64/airootfs.sfs \
+    -map "$airootfs_sha" /arch/x86_64/airootfs.sha512 \
+    -commit >/dev/null 2>&1
+  rm -rf "$instance_dir/arch-media-probe" "$serial_overlay" "$serial_verify"
+  rm -f "$airootfs" "$airootfs_sha"
 fi
 mv "$instance_dir/unattended.iso.tmp" "$instance_dir/unattended.iso"
 chmod 0600 "$password_file" "$instance_dir/unattended.iso"
+if [ "$flavor" = arch ]; then
+  printf '%s\n' "$arch_recipe_revision" > "$instance_dir/unattended-arch.version.tmp"
+  chmod 0600 "$instance_dir/unattended-arch.version.tmp"
+  mv "$instance_dir/unattended-arch.version.tmp" "$instance_dir/unattended-arch.version"
+fi

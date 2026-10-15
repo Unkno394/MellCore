@@ -2710,7 +2710,14 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
         required_tools.push("wimlib-imagex");
     }
     if profile == HighOsProfile::arch_linux_iso_ssh() {
-        required_tools.extend(["expect", "virt-cat", "timeout"]);
+        required_tools.extend([
+            "expect",
+            "virt-cat",
+            "timeout",
+            "mksquashfs",
+            "unsquashfs",
+            "sha512sum",
+        ]);
     }
     if profile == HighOsProfile::ubuntu_iso_ssh() {
         required_tools.extend(["virt-cat", "timeout"]);
@@ -2739,7 +2746,7 @@ fn high_vm_package_for_tool(platform: Platform, tool: &str) -> Option<&'static s
             "iptables" => Some("iptables"),
             "ss" => Some("iproute2"),
             "openssl" => Some("openssl"),
-            "sha256sum" | "base64" | "timeout" => Some("coreutils"),
+            "sha256sum" | "sha512sum" | "base64" | "timeout" => Some("coreutils"),
             "python3" => Some("python3"),
             "curl" => Some("curl"),
             "cloud-localds" => Some("cloud-image-utils"),
@@ -2749,6 +2756,7 @@ fn high_vm_package_for_tool(platform: Platform, tool: &str) -> Option<&'static s
             }
             "wimlib-imagex" => Some("wimtools"),
             "expect" => Some("expect"),
+            "mksquashfs" | "unsquashfs" => Some("squashfs-tools"),
             "setfacl" => Some("acl"),
             "packer" => Some("packer"),
             _ => None,
@@ -2762,7 +2770,7 @@ fn high_vm_package_for_tool(platform: Platform, tool: &str) -> Option<&'static s
             "iptables" => Some("iptables-nft"),
             "ss" => Some("iproute"),
             "openssl" => Some("openssl"),
-            "sha256sum" | "base64" | "timeout" => Some("coreutils"),
+            "sha256sum" | "sha512sum" | "base64" | "timeout" => Some("coreutils"),
             "python3" => Some("python3"),
             "curl" => Some("curl"),
             "cloud-localds" => Some("cloud-utils"),
@@ -2770,6 +2778,7 @@ fn high_vm_package_for_tool(platform: Platform, tool: &str) -> Option<&'static s
             "virt-inspector" | "virt-customize" | "virt-cat" | "virt-ls" => Some("guestfs-tools"),
             "wimlib-imagex" => Some("wimlib"),
             "expect" => Some("expect"),
+            "mksquashfs" | "unsquashfs" => Some("squashfs-tools"),
             "setfacl" => Some("acl"),
             "packer" => Some("packer"),
             _ => None,
@@ -2782,7 +2791,7 @@ fn high_vm_package_for_tool(platform: Platform, tool: &str) -> Option<&'static s
             "iptables" => Some("iptables-nft"),
             "ss" => Some("iproute2"),
             "openssl" => Some("openssl"),
-            "sha256sum" | "base64" | "timeout" => Some("coreutils"),
+            "sha256sum" | "sha512sum" | "base64" | "timeout" => Some("coreutils"),
             "python3" => Some("python"),
             "curl" => Some("curl"),
             "cloud-localds" => Some("cloud-image-utils"),
@@ -2790,6 +2799,7 @@ fn high_vm_package_for_tool(platform: Platform, tool: &str) -> Option<&'static s
             "virt-inspector" | "virt-customize" | "virt-cat" | "virt-ls" => Some("libguestfs"),
             "wimlib-imagex" => Some("wimlib"),
             "expect" => Some("expect"),
+            "mksquashfs" | "unsquashfs" => Some("squashfs-tools"),
             "setfacl" => Some("acl"),
             "packer" => Some("packer"),
             _ => None,
@@ -2836,6 +2846,7 @@ fn high_vm_missing_packages(
 fn high_tool_probe_args(program: &str) -> &'static [&'static str] {
     match program {
         "expect" => &["-v"],
+        "mksquashfs" | "unsquashfs" => &["-version"],
         "openssl" => &["version"],
         "ss" => &["-V"],
         _ => &["--version"],
@@ -3286,8 +3297,9 @@ mod tests {
         HighDesiredState, HighLifecycleState, HighOsProfile, HighRuntimeManifest, Platform,
         QuarantineMarker, STANDALONE_IDENTITY_FILE, compose_remove_id, default_image_for,
         dependency_auto_install_from_value, high_tool_probe_args, high_tool_works_at,
-        high_vm_missing_packages, high_vm_required_tools, load_or_create_standalone_high_identity,
-        parse_platform, quarantine_result, resumes_interrupted_high_download,
+        high_vm_missing_packages, high_vm_package_for_tool, high_vm_required_tools,
+        load_or_create_standalone_high_identity, parse_platform, quarantine_result,
+        resumes_interrupted_high_download,
         approved_iso_for_deployment, holds_failed_high_for_explicit_retry,
         standalone_high_command, validate_standalone_high_args,
     };
@@ -3478,6 +3490,13 @@ mod tests {
         assert!(arch_iso.contains(&"expect"));
         assert!(arch_iso.contains(&"virt-cat"));
         assert!(arch_iso.contains(&"timeout"));
+        assert!(arch_iso.contains(&"mksquashfs"));
+        assert!(arch_iso.contains(&"unsquashfs"));
+        assert!(arch_iso.contains(&"sha512sum"));
+        assert_eq!(
+            high_vm_package_for_tool(Platform::Debian, "mksquashfs"),
+            Some("squashfs-tools")
+        );
 
         let custom_iso = high_vm_required_tools(HighOsProfile::custom_linux_iso_ssh(), true);
         assert!(!custom_iso.contains(&"expect"));
@@ -3491,6 +3510,8 @@ mod tests {
     fn expect_probe_uses_supported_version_flag() {
         assert_eq!(high_tool_probe_args("expect"), &["-v"]);
         assert_ne!(high_tool_probe_args("expect"), &["--version"]);
+        assert_eq!(high_tool_probe_args("mksquashfs"), &["-version"]);
+        assert_eq!(high_tool_probe_args("unsquashfs"), &["-version"]);
 
         let directory = std::env::temp_dir().join(format!("hf-expect-probe-{}", Uuid::new_v4()));
         fs::create_dir(&directory).unwrap();
