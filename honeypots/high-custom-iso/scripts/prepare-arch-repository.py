@@ -27,6 +27,7 @@ from urllib.parse import quote
 
 SNAPSHOT = "2025/08/01"
 SNAPSHOT_ID = "2025-08-01"
+CACHE_FORMAT_VERSION = 2
 ARCH = "x86_64"
 SOURCE_ROOT = f"https://archive.archlinux.org/repos/{SNAPSHOT}"
 REPOSITORIES = ("core", "extra")
@@ -93,7 +94,13 @@ def atomic_text(path: Path, content: str) -> None:
     os.replace(temporary, path)
 
 
-def download(url: str, destination: Path, maximum: int, expected_sha256: str | None) -> None:
+def download(
+    url: str,
+    destination: Path,
+    maximum: int,
+    expected_sha256: str | None,
+    failure_code: str = "ARCH_REPO_DOWNLOAD_FAILED",
+) -> None:
     ensure_safe_regular(destination)
     checksum_path = destination.with_suffix(destination.suffix + ".sha256")
     ensure_safe_regular(checksum_path)
@@ -136,10 +143,10 @@ def download(url: str, destination: Path, maximum: int, expected_sha256: str | N
     if result.returncode:
         partial.unlink(missing_ok=True)
         detail = result.stderr.strip().splitlines()[-1:] or [f"curl exit {result.returncode}"]
-        raise RepositoryError("ARCH_REPO_DOWNLOAD_FAILED", detail[0][:400])
+        raise RepositoryError(failure_code, detail[0][:400])
     if not partial.is_file() or partial.stat().st_size == 0 or partial.stat().st_size > maximum:
         partial.unlink(missing_ok=True)
-        raise RepositoryError("ARCH_REPO_DOWNLOAD_INVALID", f"invalid size for {destination.name}")
+        raise RepositoryError(failure_code, f"invalid size for {destination.name}")
     actual = sha256_file(partial)
     if expected_sha256 and actual != expected_sha256:
         partial.unlink(missing_ok=True)
@@ -147,6 +154,29 @@ def download(url: str, destination: Path, maximum: int, expected_sha256: str | N
     os.chmod(partial, 0o600)
     os.replace(partial, destination)
     atomic_text(checksum_path, f"{actual}  {destination.name}\n")
+
+
+def repository_manifest(databases: dict[str, Path], packages: list[Package]) -> dict[str, object]:
+    return {
+        "format_version": CACHE_FORMAT_VERSION,
+        "snapshot": SNAPSHOT_ID,
+        "source": SOURCE_ROOT,
+        "architecture": ARCH,
+        "database_signatures_required": False,
+        "databases": {
+            repository: sha256_file(database)
+            for repository, database in sorted(databases.items())
+        },
+        "packages": [
+            {
+                "repository": item.repository,
+                "name": item.name,
+                "filename": item.filename,
+                "sha256": item.sha256,
+            }
+            for item in packages
+        ],
+    }
 
 
 def fields_from_desc(content: str) -> dict[str, list[str]]:
@@ -278,9 +308,7 @@ def validate_cached_iso(iso_path: Path, checksum_path: Path) -> bool:
     )
     required = {
         "/core/os/x86_64/core.db",
-        "/core/os/x86_64/core.db.sig",
         "/extra/os/x86_64/extra.db",
-        "/extra/os/x86_64/extra.db.sig",
         "/HF-ARCH-REPO.json",
     }
     listing = {line.strip() for line in result.stdout.splitlines()}
@@ -300,7 +328,9 @@ def build_repository(cache_dir: Path) -> Path:
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        iso_path = cache_dir / f"archlinux-{SNAPSHOT_ID}-offline-repo.iso"
+        # v2 deliberately uses a new filename: previously published repository ISOs
+        # remain immutable while the database-signature policy changes.
+        iso_path = cache_dir / f"archlinux-{SNAPSHOT_ID}-offline-repo-v{CACHE_FORMAT_VERSION}.iso"
         checksum_path = iso_path.with_suffix(iso_path.suffix + ".sha256")
         if validate_cached_iso(iso_path, checksum_path):
             return iso_path
@@ -309,7 +339,6 @@ def build_repository(cache_dir: Path) -> Path:
         source_cache.mkdir(mode=0o700, exist_ok=True)
         os.chmod(source_cache, 0o700)
         databases: dict[str, Path] = {}
-        database_signatures: dict[str, Path] = {}
         all_packages: list[Package] = []
         for repository in REPOSITORIES:
             database = source_cache / f"{repository}.db"
@@ -319,15 +348,7 @@ def build_repository(cache_dir: Path) -> Path:
                 MAX_DATABASE_BYTES,
                 None,
             )
-            database_signature = source_cache / f"{repository}.db.sig"
-            download(
-                f"{SOURCE_ROOT}/{repository}/os/{ARCH}/{repository}.db.sig",
-                database_signature,
-                1024 * 1024,
-                None,
-            )
             databases[repository] = database
-            database_signatures[repository] = database_signature
             all_packages.extend(parse_database(repository, database))
 
         packages = resolve_packages(all_packages)
@@ -347,7 +368,13 @@ def build_repository(cache_dir: Path) -> Path:
                 f"{SOURCE_ROOT}/{package.repository}/os/{ARCH}/{quote(package.filename, safe='@._+:-')}"
             )
             download(package_url, package_path, MAX_PACKAGE_BYTES, package.sha256)
-            download(package_url + ".sig", package_path.with_suffix(package_path.suffix + ".sig"), 1024 * 1024, None)
+            download(
+                package_url + ".sig",
+                package_path.with_suffix(package_path.suffix + ".sig"),
+                1024 * 1024,
+                None,
+                "ARCH_REPO_PACKAGE_SIGNATURE_MISSING",
+            )
 
         staging = Path(tempfile.mkdtemp(prefix=".arch-repo-stage-", dir=cache_dir))
         temporary_iso = cache_dir / f".{iso_path.name}.{os.getpid()}.tmp"
@@ -356,26 +383,12 @@ def build_repository(cache_dir: Path) -> Path:
                 target = staging / repository / "os" / ARCH
                 target.mkdir(parents=True)
                 os.link(database, target / f"{repository}.db")
-                os.link(database_signatures[repository], target / f"{repository}.db.sig")
             for package in packages:
                 target = staging / package.repository / "os" / ARCH
                 os.link(source_cache / package.filename, target / package.filename)
                 signature = source_cache / f"{package.filename}.sig"
                 os.link(signature, target / signature.name)
-            manifest = {
-                "snapshot": SNAPSHOT_ID,
-                "source": SOURCE_ROOT,
-                "architecture": ARCH,
-                "packages": [
-                    {
-                        "repository": item.repository,
-                        "name": item.name,
-                        "filename": item.filename,
-                        "sha256": item.sha256,
-                    }
-                    for item in packages
-                ],
-            }
+            manifest = repository_manifest(databases, packages)
             (staging / "HF-ARCH-REPO.json").write_text(
                 json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
                 encoding="utf-8",

@@ -133,7 +133,14 @@ class CustomIsoRecipeTests(unittest.TestCase):
         for option in ("--offline", "--skip-version-check", "--skip-ntp", "--skip-wkd", "--dry-run"):
             self.assertIn(option, guest)
         self.assertIn("ARCHINSTALL_CONFIG_INVALID", guest)
-        self.assertIn("SigLevel = Required DatabaseRequired", guest)
+        self.assertIn("SigLevel = Required DatabaseOptional", guest)
+        self.assertIn("LocalFileSigLevel = Required", guest)
+        self.assertIn("ARCH_REPO_METADATA_INVALID", guest)
+        self.assertIn("ARCH_REPO_PACKAGE_SIGNATURE_MISSING", guest)
+        self.assertIn("ARCH_REPO_PACKAGE_SIGNATURE_INVALID", guest)
+        self.assertIn('pacman-key --verify "$package_path.sig" "$package_path"', guest)
+        self.assertNotIn("core.db.sig", guest)
+        self.assertNotIn("extra.db.sig", guest)
         self.assertIn('"sudo": true', guest)
         self.assertIn("ARCH_USER_PRIVILEGE_REMOVE_FAILED", guest)
         self.assertIn("usermod -G systemd-journal analyst", guest)
@@ -172,6 +179,38 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 repository.parse_database("core", database)
             self.assertEqual(caught.exception.code, "ARCH_REPO_DATABASE_INVALID")
 
+    def test_arch_repository_manifest_pins_database_content_without_requiring_db_signatures(self):
+        repository = load_arch_repository_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            core = root / "core.db"
+            extra = root / "extra.db"
+            core.write_bytes(b"core metadata")
+            extra.write_bytes(b"extra metadata")
+            manifest = repository.repository_manifest({"core": core, "extra": extra}, [])
+            self.assertEqual(manifest["format_version"], 2)
+            self.assertFalse(manifest["database_signatures_required"])
+            self.assertEqual(manifest["databases"]["core"], hashlib.sha256(b"core metadata").hexdigest())
+            self.assertEqual(manifest["databases"]["extra"], hashlib.sha256(b"extra metadata").hexdigest())
+
+    def test_arch_package_signature_download_has_specific_diagnostic(self):
+        repository = load_arch_repository_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            executable(fake_bin / "curl", "#!/bin/sh\nexit 22\n")
+            with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}:{os.environ['PATH']}"}):
+                with self.assertRaises(repository.RepositoryError) as caught:
+                    repository.download(
+                        "https://archive.archlinux.org/missing.pkg.tar.zst.sig",
+                        root / "missing.pkg.tar.zst.sig",
+                        1024,
+                        None,
+                        "ARCH_REPO_PACKAGE_SIGNATURE_MISSING",
+                    )
+            self.assertEqual(caught.exception.code, "ARCH_REPO_PACKAGE_SIGNATURE_MISSING")
+
     def test_arch_repository_build_is_atomic_and_reuses_verified_iso(self):
         repository = load_arch_repository_module()
         with tempfile.TemporaryDirectory() as directory:
@@ -208,8 +247,6 @@ class CustomIsoRecipeTests(unittest.TestCase):
 
             write_database("core", [("root", "root-1-x86_64.pkg.tar.zst", ("leaf",))])
             write_database("extra", [("leaf", "leaf-1-x86_64.pkg.tar.zst", ())])
-            (downloads / "core.db.sig").write_bytes(b"core database signature")
-            (downloads / "extra.db.sig").write_bytes(b"extra database signature")
             executable(
                 fake_bin / "curl",
                 "#!/bin/sh\n"
@@ -220,14 +257,14 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 "done\n"
                 "url=$1\n"
                 "name=${url##*/}\n"
-                "printf 'call\\n' >> \"$FAKE_CURL_CALLS\"\n"
+                "printf '%s\\n' \"$url\" >> \"$FAKE_CURL_CALLS\"\n"
                 "cp \"$FAKE_DOWNLOADS/$name\" \"$output\"\n",
             )
             executable(
                 fake_bin / "xorriso",
                 "#!/bin/sh\n"
                 "if [ \"$1\" = -indev ]; then\n"
-                "  printf '%s\\n' /core/os/x86_64/core.db /core/os/x86_64/core.db.sig /extra/os/x86_64/extra.db /extra/os/x86_64/extra.db.sig /HF-ARCH-REPO.json\n"
+                "  printf '%s\\n' /core/os/x86_64/core.db /extra/os/x86_64/extra.db /HF-ARCH-REPO.json\n"
                 "  exit 0\n"
                 "fi\n"
                 "output=\n"
@@ -247,12 +284,14 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 repository, "ROOT_PACKAGES", ("root",)
             ):
                 first = repository.build_repository(root / "cache")
-                first_calls = calls.read_text().count("call")
+                first_calls = len(calls.read_text().splitlines())
                 second = repository.build_repository(root / "cache")
             self.assertEqual(first, second)
             self.assertTrue(first.is_file())
             self.assertTrue(first.with_suffix(first.suffix + ".sha256").is_file())
-            self.assertEqual(calls.read_text().count("call"), first_calls)
+            self.assertEqual(len(calls.read_text().splitlines()), first_calls)
+            self.assertNotIn(".db.sig", calls.read_text())
+            self.assertIn("offline-repo-v2.iso", first.name)
 
     def test_unattended_media_is_generated_per_instance(self):
         grub_by_flavor = {

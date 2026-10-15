@@ -39,7 +39,7 @@ trap 'current_step=ARCHINSTALL_INTERRUPTED; exit 1' HUP INT TERM
 
 [ -b "$disk" ] || fail_install ARCH_TARGET_DISK_MISSING "target disk /dev/vda is absent"
 for command in archinstall pacman wipefs parted partprobe udevadm mkfs.ext4 mount \
-  umount mountpoint blkid arch-chroot base64 install sync awk grep sed tail; do
+  umount mountpoint blkid arch-chroot base64 install sync awk grep sed tail python3 pacman-key; do
   command -v "$command" >/dev/null || fail_install INSTALL_MEDIA_COMPONENT_MISSING "$command"
 done
 
@@ -60,17 +60,93 @@ repo_device=$(blkid -L HF_ARCH_REPO 2>/dev/null || true)
 [ -n "$repo_device" ] && [ -b "$repo_device" ] ||
   fail_install ARCH_REPO_MEDIA_MISSING "read-only HF_ARCH_REPO media is absent"
 run_step ARCH_REPO_MOUNT_FAILED mount -o ro,nosuid,nodev,noexec "$repo_device" "$repo_mount"
-for database in core/os/x86_64/core.db core/os/x86_64/core.db.sig \
-  extra/os/x86_64/extra.db extra/os/x86_64/extra.db.sig HF-ARCH-REPO.json; do
+for database in core/os/x86_64/core.db extra/os/x86_64/extra.db HF-ARCH-REPO.json; do
   [ -s "$repo_mount/$database" ] || fail_install ARCH_REPO_MEDIA_INVALID "$database is absent"
 done
+
+metadata_error=
+if ! metadata_error=$(python3 - "$repo_mount" <<'PY'
+import hashlib, json, pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+safe = re.compile(r"^[A-Za-z0-9@._+:-]+$")
+
+def fail(code, detail):
+    print(f"{code}:{detail}")
+    raise SystemExit(1)
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+try:
+    manifest = json.loads((root / "HF-ARCH-REPO.json").read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    fail("ARCH_REPO_METADATA_INVALID", "manifest cannot be decoded")
+if manifest.get("format_version") != 2 or manifest.get("snapshot") != "2025-08-01":
+    fail("ARCH_REPO_METADATA_INVALID", "unexpected repository format or snapshot")
+if manifest.get("source") != "https://archive.archlinux.org/repos/2025/08/01":
+    fail("ARCH_REPO_METADATA_INVALID", "unexpected repository source")
+if manifest.get("architecture") != "x86_64" or manifest.get("database_signatures_required") is not False:
+    fail("ARCH_REPO_METADATA_INVALID", "unexpected repository architecture or signature policy")
+databases = manifest.get("databases")
+if not isinstance(databases, dict) or set(databases) != {"core", "extra"}:
+    fail("ARCH_REPO_METADATA_INVALID", "database digest set is incomplete")
+for repository, expected in databases.items():
+    path = root / repository / "os" / "x86_64" / f"{repository}.db"
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        fail("ARCH_REPO_METADATA_INVALID", f"invalid {repository} database digest")
+    try:
+        actual = sha256_file(path)
+    except OSError:
+        fail("ARCH_REPO_METADATA_INVALID", f"cannot read {repository}.db")
+    if actual != expected:
+        fail("ARCH_REPO_METADATA_INVALID", f"{repository}.db checksum mismatch")
+packages = manifest.get("packages")
+if not isinstance(packages, list) or not packages:
+    fail("ARCH_REPO_METADATA_INVALID", "package manifest is empty")
+for item in packages:
+    if not isinstance(item, dict):
+        fail("ARCH_REPO_METADATA_INVALID", "invalid package record")
+    repository = item.get("repository")
+    filename = item.get("filename")
+    expected = item.get("sha256")
+    if repository not in {"core", "extra"} or not isinstance(filename, str) or not safe.fullmatch(filename):
+        fail("ARCH_REPO_METADATA_INVALID", "unsafe package record")
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        fail("ARCH_REPO_METADATA_INVALID", f"invalid digest for {filename}")
+    package = root / repository / "os" / "x86_64" / filename
+    signature = package.with_name(package.name + ".sig")
+    if not signature.is_file() or signature.stat().st_size == 0:
+        fail("ARCH_REPO_PACKAGE_SIGNATURE_MISSING", filename)
+    try:
+        actual = sha256_file(package)
+    except OSError:
+        fail("ARCH_REPO_PACKAGE_MISSING", filename)
+    if actual != expected:
+        fail("ARCH_REPO_PACKAGE_CHECKSUM_MISMATCH", filename)
+PY
+); then
+  case "$metadata_error" in
+    ARCH_REPO_PACKAGE_SIGNATURE_MISSING:*)
+      fail_install ARCH_REPO_PACKAGE_SIGNATURE_MISSING "${metadata_error#*:}" ;;
+    ARCH_REPO_PACKAGE_MISSING:*)
+      fail_install ARCH_REPO_PACKAGE_MISSING "${metadata_error#*:}" ;;
+    ARCH_REPO_PACKAGE_CHECKSUM_MISMATCH:*)
+      fail_install ARCH_REPO_PACKAGE_CHECKSUM_MISMATCH "${metadata_error#*:}" ;;
+    *) fail_install ARCH_REPO_METADATA_INVALID "${metadata_error#*:}" ;;
+  esac
+fi
 
 cat > /etc/pacman.conf <<EOF
 [options]
 Architecture = auto
 CheckSpace
-SigLevel = Required DatabaseRequired
-LocalFileSigLevel = Optional
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Required
 ParallelDownloads = 1
 
 [core]
@@ -92,15 +168,18 @@ while IFS= read -r package_file; do
   case "$package_file" in
     ''|*/*|*..*) fail_install ARCH_REPO_MEDIA_INVALID "unsafe package filename" ;;
   esac
-  found=false
+  package_path=
   for repository in core extra; do
-    if [ -s "$repo_mount/$repository/os/x86_64/$package_file" ] &&
-       [ -s "$repo_mount/$repository/os/x86_64/$package_file.sig" ]; then
-      found=true
+    candidate="$repo_mount/$repository/os/x86_64/$package_file"
+    if [ -s "$candidate" ]; then
+      package_path=$candidate
       break
     fi
   done
-  [ "$found" = true ] || fail_install ARCH_REPO_PACKAGE_MISSING "$package_file"
+  [ -n "$package_path" ] || fail_install ARCH_REPO_PACKAGE_MISSING "$package_file"
+  [ -s "$package_path.sig" ] || fail_install ARCH_REPO_PACKAGE_SIGNATURE_MISSING "$package_file"
+  pacman-key --verify "$package_path.sig" "$package_path" >/dev/null 2>&1 ||
+    fail_install ARCH_REPO_PACKAGE_SIGNATURE_INVALID "$package_file"
 done < "$package_list"
 
 timedatectl set-ntp false >/dev/null 2>&1 || true
