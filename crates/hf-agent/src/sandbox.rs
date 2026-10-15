@@ -260,6 +260,8 @@ const LINUX_ISO_SCRIPTS: HighLifecycleScripts = HighLifecycleScripts {
         "install-arch.sh",
         "arch-console.exp",
         "arch-guest-install.sh",
+        "archinstall-guest-install.sh",
+        "prepare-arch-repository.py",
         "finalize-linux-install.sh",
         "create-network.sh",
         "firewall-common.sh",
@@ -592,10 +594,20 @@ impl LibvirtSandboxManager {
         }
     }
 
-    /// A failed Ubuntu ISO deployment may be resumed only after proving that Setup completed.
+    /// A failed ISO deployment may be resumed only after proving that Setup completed.
     /// Running guests are inspected through QGA; stopped guests are inspected offline so the
     /// existing disk can be finalized without starting the installer again.
     pub fn can_resume_failed_installation(&self, vm: &HighVm) -> bool {
+        if vm.profile == HighOsProfile::arch_linux_iso_ssh() {
+            // install-arch.sh publishes this marker only after verifying the guest marker,
+            // kernel, initramfs and BIOS GRUB files and ejecting every installer CD-ROM.
+            if self.installed_marker_ready(vm) {
+                return true;
+            }
+            return self.domain_state(vm.instance_id).is_ok_and(|state| {
+                state == HighDomainState::Stopped && self.offline_installed_marker_ready(vm)
+            });
+        }
         if vm.profile != HighOsProfile::ubuntu_iso_ssh() {
             return false;
         }
@@ -634,9 +646,28 @@ impl LibvirtSandboxManager {
     /// Continue only the post-install path. This deliberately bypasses launch-iso.sh so a
     /// proven installed disk cannot be sent through unattended-media preparation again.
     pub fn resume_failed_installation(&self, vm: &HighVm) -> anyhow::Result<()> {
+        if vm.profile == HighOsProfile::arch_linux_iso_ssh() {
+            anyhow::ensure!(
+                self.installed_marker_ready(vm)
+                    || (self.domain_state(vm.instance_id)? == HighDomainState::Stopped
+                        && self.offline_installed_marker_ready(vm)),
+                "failed Arch installation has no completed guest installation marker"
+            );
+            if !self.installed_marker_ready(vm) {
+                let instance_id = vm.instance_id.to_string();
+                self.run(vm.profile, "install-arch.sh", &[&instance_id])
+                    .map_err(|failure| {
+                        lifecycle_error("INSTALLATION_FAILED", "installation", failure)
+                    })?;
+            }
+            if self.domain_state(vm.instance_id)? == HighDomainState::Stopped {
+                self.virsh(&["start", &format!("hf-high-{}", vm.instance_id)])?;
+            }
+            return self.prepare_access_and_wait(vm);
+        }
         anyhow::ensure!(
             vm.profile == HighOsProfile::ubuntu_iso_ssh(),
-            "failed-install recovery is supported only for the Ubuntu ISO profile"
+            "failed-install recovery is supported only for Ubuntu and verified Arch ISO profiles"
         );
         let instance_id = vm.instance_id.to_string();
         self.run(
@@ -709,6 +740,26 @@ impl LibvirtSandboxManager {
             .args(["qemu-agent-command", &name, r#"{"execute":"guest-ping"}"#])
             .output()
             .is_ok_and(|output| output.status.success())
+    }
+
+    fn offline_installed_marker_ready(&self, vm: &HighVm) -> bool {
+        let disk = self
+            .high_root
+            .join(vm.instance_id.to_string())
+            .join("disk.qcow2");
+        Command::new("timeout")
+            .arg("120")
+            .arg("virt-cat")
+            .arg("-a")
+            .arg(disk)
+            .arg("/etc/honeyforge-installed")
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .any(|line| line.trim() == "installed")
+            })
     }
 
     pub fn is_running(&self, instance_id: Uuid) -> anyhow::Result<bool> {
@@ -855,9 +906,14 @@ impl LibvirtSandboxManager {
             return false;
         };
         let (guest_port, require_ssh_banner) = match vm.profile.connection {
-            HighGuestConnection::Ssh { guest_port } => {
-                (guest_port, vm.profile == HighOsProfile::ubuntu_iso_ssh())
-            }
+            HighGuestConnection::Ssh { guest_port } => (
+                guest_port,
+                matches!(
+                    vm.profile,
+                    profile if profile == HighOsProfile::ubuntu_iso_ssh()
+                        || profile == HighOsProfile::arch_linux_iso_ssh()
+                ),
+            ),
             HighGuestConnection::Rdp { guest_port } => (guest_port, false),
         };
         let Ok(mut stream) =
@@ -1188,7 +1244,7 @@ fn requires_installed_disk_marker(profile: HighOsProfile) -> bool {
 }
 
 fn preserve_installation_on_readiness_failure(profile: HighOsProfile) -> bool {
-    profile == HighOsProfile::ubuntu_iso_ssh()
+    profile == HighOsProfile::ubuntu_iso_ssh() || profile == HighOsProfile::arch_linux_iso_ssh()
 }
 
 fn required_telemetry_unit(profile: HighOsProfile) -> Option<&'static str> {
@@ -1504,6 +1560,9 @@ mod tests {
         assert!(!requires_installed_disk_marker(HighOsProfile::ubuntu_ssh()));
         assert!(preserve_installation_on_readiness_failure(
             HighOsProfile::ubuntu_iso_ssh()
+        ));
+        assert!(preserve_installation_on_readiness_failure(
+            HighOsProfile::arch_linux_iso_ssh()
         ));
         assert!(!preserve_installation_on_readiness_failure(
             HighOsProfile::ubuntu_ssh()

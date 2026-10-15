@@ -89,6 +89,7 @@ send -- "\r"
 # from hiding a serial boot/login failure.
 set login_attempts 0
 set empty_password_attempted 0
+set completed_before_prompt 0
 set prompt_retry_seconds 5
 set root_deadline [expr {[clock milliseconds] + ($boot_timeout * 1000)}]
 while {1} {
@@ -100,6 +101,29 @@ while {1} {
     if {$timeout > $prompt_retry_seconds} { set timeout $prompt_retry_seconds }
     set root_seen 0
     expect {
+        -re {HF_INSTALL_COMPLETE} {
+            # Reconciliation can attach while the detached installer is still
+            # running. In that case there is deliberately no interactive prompt;
+            # accept only its explicit completion sentinel.
+            record_console $log_fd $expect_out(buffer)
+            set completed_before_prompt 1
+            set root_seen 1
+        }
+        -re {HF_INSTALL_FAILED:([A-Z0-9_]+):([^\r\n]*)} {
+            record_console $log_fd $expect_out(buffer)
+            set failure_code $expect_out(1,string)
+            set failure_detail $expect_out(2,string)
+            close $log_fd
+            puts stderr "HF_HIGH_ERROR code=$failure_code stage=installation: $failure_detail; sanitized log: $diagnostic_log"
+            exit 5
+        }
+        -re {HF_INSTALL_FAILED:[^\r\n]*} {
+            record_console $log_fd $expect_out(buffer)
+            set failure $expect_out(0,string)
+            close $log_fd
+            puts stderr "HF_HIGH_ERROR code=ARCH_GUEST_INSTALL_FAILED stage=installation: $failure; sanitized log: $diagnostic_log"
+            exit 5
+        }
         -re {(?i)archiso[[:space:]]+login:} {
             record_console $log_fd $expect_out(buffer)
             incr login_attempts
@@ -139,6 +163,10 @@ while {1} {
         }
     }
     if {$root_seen} { break }
+}
+if {$completed_before_prompt} {
+    close $log_fd
+    exit 0
 }
 
 # Disable terminal echo before reading or transmitting the installer. The payload
@@ -195,6 +223,14 @@ set timeout $install_timeout
 expect {
     -re {HF_INSTALL_COMPLETE} {
         record_console $log_fd $expect_out(buffer)
+    }
+    -re {HF_INSTALL_FAILED:([A-Z0-9_]+):([^\r\n]*)} {
+        record_console $log_fd $expect_out(buffer)
+        set failure_code $expect_out(1,string)
+        set failure_detail $expect_out(2,string)
+        close $log_fd
+        puts stderr "HF_HIGH_ERROR code=$failure_code stage=installation: $failure_detail; sanitized log: $diagnostic_log"
+        exit 5
     }
     -re {HF_INSTALL_FAILED:[^\r\n]*} {
         record_console $log_fd $expect_out(buffer)

@@ -1,16 +1,30 @@
 import base64
 import hashlib
+import importlib.util
+import io
 import os
 import pathlib
 import shutil
 import stat
 import subprocess
+import sys
+import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 
 RECIPE = pathlib.Path(__file__).resolve().parents[1]
 INSTANCE_ID = "11111111-2222-4333-8444-555555555555"
+
+
+def load_arch_repository_module():
+    path = RECIPE / "scripts" / "prepare-arch-repository.py"
+    spec = importlib.util.spec_from_file_location("hf_prepare_arch_repository", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def executable(path, body):
@@ -57,6 +71,39 @@ class CustomIsoRecipeTests(unittest.TestCase):
         self.assertIn("timedatectl set-ntp false", guest)
         self.assertIn("INSTALL_MEDIA_COMPONENT_MISSING", guest)
         self.assertIn("cp -a", guest)
+        self.assertIn("mklabel msdos", guest)
+        self.assertIn("ARCH_PARTITION_VERIFY_FAILED", guest)
+        self.assertIn("/usr/lib/modules/*/vmlinuz", guest)
+        self.assertIn("install -Dm0644 \"$kernel_source\" /mnt/boot/vmlinuz-linux", guest)
+        self.assertIn("PRESETS=('default')", guest)
+        self.assertNotIn("PRESETS=('archiso')", guest)
+        self.assertIn("ARCH_INITRAMFS_BUILD_FAILED", guest)
+        self.assertIn("ARCH_INITRAMFS_VERIFY_FAILED", guest)
+        self.assertIn("ARCH_GRUB_INSTALL_FAILED", guest)
+        self.assertIn("ARCH_GRUB_CONFIG_FAILED", guest)
+        self.assertIn("grep -F \"$root_uuid\"", guest)
+        self.assertIn("/boot/grub/i386-pc/core.img", guest)
+        self.assertIn("ARCH_POWER_OFF_REQUEST_FAILED", guest)
+        self.assertLess(
+            guest.index("ARCH_INITRAMFS_BUILD_FAILED"),
+            guest.index("printf '%s\\n' installed > /mnt/etc/honeyforge-installed"),
+        )
+        self.assertLess(
+            guest.index("ARCH_GRUB_VERIFY_FAILED"),
+            guest.index("printf '%s\\n' installed > /mnt/etc/honeyforge-installed"),
+        )
+        self.assertIn("code=ARCH_POWER_OFF_TIMEOUT", arch)
+        self.assertIn("code=ARCH_INSTALL_MARKER_MISSING", arch)
+        self.assertIn("code=ARCH_BOOT_ARTIFACT_MISSING", arch)
+
+        console = (RECIPE / "scripts" / "arch-console.exp").read_text()
+        self.assertIn("HF_INSTALL_FAILED:([A-Z0-9_]+)", console)
+        self.assertIn("code=$failure_code stage=installation", console)
+        self.assertIn("completed_before_prompt", console)
+        self.assertLess(
+            console.index("-re {HF_INSTALL_COMPLETE}"),
+            console.index("-re {(?i)archiso[[:space:]]+login:}"),
+        )
 
     def test_installation_is_restartable_and_bounded(self):
         launch = (RECIPE / "scripts" / "launch-iso.sh").read_text()
@@ -68,6 +115,144 @@ class CustomIsoRecipeTests(unittest.TestCase):
         self.assertIn("arch-guest-install.b64", arch)
         self.assertIn("install-started", arch)
         self.assertIn("INSTALL_MEDIA_EJECT_FAILED", arch)
+
+    def test_archinstall_uses_read_only_offline_repository_and_keeps_legacy_fallback(self):
+        launch = (RECIPE / "scripts" / "launch-iso.sh").read_text()
+        install = (RECIPE / "scripts" / "install-arch.sh").read_text()
+        guest = (RECIPE / "scripts" / "archinstall-guest-install.sh").read_text()
+        self.assertIn("prepare-arch-repository.py", launch)
+        self.assertIn("device=cdrom,readonly=on", launch)
+        self.assertIn("HF_HIGH_ARCH_INSTALL_METHOD:-archinstall", launch)
+        self.assertIn("arch_install_method=legacy", launch)
+        self.assertNotIn("python3 -m http.server", launch)
+        self.assertIn('archinstall) guest_installer="$script_dir/archinstall-guest-install.sh"', install)
+        self.assertIn('legacy) guest_installer="$script_dir/arch-guest-install.sh"', install)
+        self.assertIn("HF_ARCH_REPO", guest)
+        self.assertIn("Server = file://$repo_mount/\\$repo/os/\\$arch", guest)
+        self.assertIn("3.0.8|3.0.9", guest)
+        for option in ("--offline", "--skip-version-check", "--skip-ntp", "--skip-wkd", "--dry-run"):
+            self.assertIn(option, guest)
+        self.assertIn("ARCHINSTALL_CONFIG_INVALID", guest)
+        self.assertIn("SigLevel = Required DatabaseRequired", guest)
+        self.assertIn('"sudo": true', guest)
+        self.assertIn("ARCH_USER_PRIVILEGE_REMOVE_FAILED", guest)
+        self.assertIn("usermod -G systemd-journal analyst", guest)
+        self.assertLess(
+            guest.index("ARCH_BOOT_ARTIFACT_MISSING"),
+            guest.index("printf '%s\\n' installed > /mnt/etc/honeyforge-installed"),
+        )
+
+    def test_arch_repository_catalog_is_fixed_and_resolves_transitive_providers(self):
+        repository = load_arch_repository_module()
+        self.assertEqual(repository.SOURCE_ROOT, "https://archive.archlinux.org/repos/2025/08/01")
+        self.assertEqual(repository.ARCH, "x86_64")
+        digest = "a" * 64
+        packages = [
+            repository.Package("core", "root", "root.pkg.tar.zst", digest, 1, ("virtual>=1",), ()),
+            repository.Package("core", "provider-a", "provider-a.pkg.tar.zst", digest, 1, ("leaf",), ("virtual=1",)),
+            repository.Package("extra", "provider-b", "provider-b.pkg.tar.zst", digest, 1, (), ("virtual=1",)),
+            repository.Package("core", "leaf", "leaf.pkg.tar.zst", digest, 1, (), ()),
+        ]
+        resolved = repository.resolve_packages(packages, ("root",))
+        self.assertEqual(
+            {package.name for package in resolved},
+            {"root", "provider-a", "provider-b", "leaf"},
+        )
+
+    def test_arch_repository_database_parser_rejects_missing_checksums(self):
+        repository = load_arch_repository_module()
+        with tempfile.TemporaryDirectory() as directory:
+            database = pathlib.Path(directory) / "core.db"
+            description = b"%NAME%\nbase\n\n%FILENAME%\nbase.pkg.tar.zst\n\n%CSIZE%\n10\n"
+            with tarfile.open(database, "w:gz") as archive:
+                info = tarfile.TarInfo("base-1/desc")
+                info.size = len(description)
+                archive.addfile(info, io.BytesIO(description))
+            with self.assertRaises(repository.RepositoryError) as caught:
+                repository.parse_database("core", database)
+            self.assertEqual(caught.exception.code, "ARCH_REPO_DATABASE_INVALID")
+
+    def test_arch_repository_build_is_atomic_and_reuses_verified_iso(self):
+        repository = load_arch_repository_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            downloads = root / "downloads"
+            downloads.mkdir()
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            calls = root / "curl-calls"
+
+            package_files = {
+                "root-1-x86_64.pkg.tar.zst": b"root package",
+                "leaf-1-x86_64.pkg.tar.zst": b"leaf package",
+            }
+            for filename, content in package_files.items():
+                (downloads / filename).write_bytes(content)
+                (downloads / f"{filename}.sig").write_bytes(b"detached signature")
+
+            def write_database(name, descriptions):
+                path = downloads / f"{name}.db"
+                with tarfile.open(path, "w:gz") as archive:
+                    for package_name, filename, dependencies in descriptions:
+                        digest = hashlib.sha256((downloads / filename).read_bytes()).hexdigest()
+                        description = (
+                            f"%NAME%\n{package_name}\n\n%FILENAME%\n{filename}\n\n"
+                            f"%SHA256SUM%\n{digest}\n\n%CSIZE%\n{(downloads / filename).stat().st_size}\n\n"
+                        )
+                        if dependencies:
+                            description += "%DEPENDS%\n" + "\n".join(dependencies) + "\n\n"
+                        payload = description.encode()
+                        info = tarfile.TarInfo(f"{package_name}-1/desc")
+                        info.size = len(payload)
+                        archive.addfile(info, io.BytesIO(payload))
+
+            write_database("core", [("root", "root-1-x86_64.pkg.tar.zst", ("leaf",))])
+            write_database("extra", [("leaf", "leaf-1-x86_64.pkg.tar.zst", ())])
+            (downloads / "core.db.sig").write_bytes(b"core database signature")
+            (downloads / "extra.db.sig").write_bytes(b"extra database signature")
+            executable(
+                fake_bin / "curl",
+                "#!/bin/sh\n"
+                "output=\n"
+                "while [ \"$#\" -gt 1 ]; do\n"
+                "  [ \"$1\" = --output ] && { shift; output=$1; }\n"
+                "  shift\n"
+                "done\n"
+                "url=$1\n"
+                "name=${url##*/}\n"
+                "printf 'call\\n' >> \"$FAKE_CURL_CALLS\"\n"
+                "cp \"$FAKE_DOWNLOADS/$name\" \"$output\"\n",
+            )
+            executable(
+                fake_bin / "xorriso",
+                "#!/bin/sh\n"
+                "if [ \"$1\" = -indev ]; then\n"
+                "  printf '%s\\n' /core/os/x86_64/core.db /core/os/x86_64/core.db.sig /extra/os/x86_64/extra.db /extra/os/x86_64/extra.db.sig /HF-ARCH-REPO.json\n"
+                "  exit 0\n"
+                "fi\n"
+                "output=\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  [ \"$1\" = -o ] && { shift; output=$1; }\n"
+                "  shift\n"
+                "done\n"
+                "printf 'verified repository iso' > \"$output\"\n",
+            )
+            environment = dict(
+                os.environ,
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                FAKE_DOWNLOADS=str(downloads),
+                FAKE_CURL_CALLS=str(calls),
+            )
+            with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+                repository, "ROOT_PACKAGES", ("root",)
+            ):
+                first = repository.build_repository(root / "cache")
+                first_calls = calls.read_text().count("call")
+                second = repository.build_repository(root / "cache")
+            self.assertEqual(first, second)
+            self.assertTrue(first.is_file())
+            self.assertTrue(first.with_suffix(first.suffix + ".sha256").is_file())
+            self.assertEqual(calls.read_text().count("call"), first_calls)
 
     def test_unattended_media_is_generated_per_instance(self):
         grub_by_flavor = {
@@ -395,6 +580,46 @@ class CustomIsoRecipeTests(unittest.TestCase):
             self.assertNotIn(payload_value, diagnostic)
             self.assertNotIn(payload_value[:768], diagnostic)
             self.assertEqual(stat.S_IMODE(console_log.stat().st_mode), 0o600)
+
+    @unittest.skipUnless(shutil.which("expect"), "expect is required for Arch console tests")
+    def test_arch_console_reconnect_accepts_running_installer_completion_without_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            executable(
+                fake_bin / "virsh",
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "sys.stdout.write('Connected to domain fixture-vm\\r\\n'); sys.stdout.flush()\n"
+                "sys.stdin.readline()\n"
+                "sys.stdout.write('archinstall resumed\\r\\nHF_INSTALL_COMPLETE\\r\\n'); sys.stdout.flush()\n",
+            )
+            payload = root / "payload.b64"
+            payload.write_text("Zml4dHVyZQ==", encoding="ascii")
+            console_log = root / "console.log"
+            console_log.write_text("", encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    shutil.which("expect"),
+                    str(RECIPE / "scripts" / "arch-console.exp"),
+                    "fixture-vm",
+                    str(payload),
+                    str(console_log),
+                ],
+                check=False,
+                env=dict(
+                    os.environ,
+                    PATH=f"{fake_bin}:{os.environ['PATH']}",
+                    HF_HIGH_INSTALL_TIMEOUT_SECONDS="10",
+                    HF_HIGH_ARCH_BOOT_TIMEOUT_SECONDS="5",
+                ),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("HF_INSTALL_COMPLETE", console_log.read_text(encoding="utf-8"))
 
     @unittest.skipUnless(shutil.which("expect"), "expect is required for Arch console tests")
     def test_arch_console_root_wait_has_diagnostic_timeout(self):

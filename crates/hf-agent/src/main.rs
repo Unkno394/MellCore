@@ -912,7 +912,7 @@ impl ComposeProjectStore {
                 }
                 tracing::info!(
                     trap_id = %trap_id,
-                    "resuming finalization of an installed Ubuntu High VM"
+                    "resuming finalization of a verified installed High VM"
                 );
                 if let Err(error) = self.transition_high_lifecycle(
                     &mut manifest,

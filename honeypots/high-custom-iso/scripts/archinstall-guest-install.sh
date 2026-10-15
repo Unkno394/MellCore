@@ -1,0 +1,269 @@
+#!/bin/sh
+set -eu
+LC_ALL=C
+export LC_ALL
+
+disk=/dev/vda
+root_partition=${disk}1
+repo_mount=/run/hf-arch-repo
+current_step=ARCHINSTALL_INITIALIZATION
+failure_reported=false
+
+fail_install() {
+  current_step=$1
+  failure_reported=true
+  echo "HF_INSTALL_FAILED:$1:$2" >&2
+  exit 1
+}
+
+run_step() {
+  current_step=$1
+  shift
+  "$@" || fail_install "$current_step" "command failed"
+}
+
+finish_or_report() {
+  status=$?
+  trap - EXIT
+  rm -f /run/hf-installing || true
+  mountpoint -q /mnt && umount -R /mnt >/dev/null 2>&1 || true
+  mountpoint -q "$repo_mount" && umount "$repo_mount" >/dev/null 2>&1 || true
+  if [ "$status" -ne 0 ] && [ "$failure_reported" = false ]; then
+    echo "HF_INSTALL_FAILED:$current_step:unexpected command failure" >&2
+  fi
+  exit "$status"
+}
+
+trap finish_or_report EXIT
+trap 'current_step=ARCHINSTALL_INTERRUPTED; exit 1' HUP INT TERM
+
+[ -b "$disk" ] || fail_install ARCH_TARGET_DISK_MISSING "target disk /dev/vda is absent"
+for command in archinstall pacman wipefs parted partprobe udevadm mkfs.ext4 mount \
+  umount mountpoint blkid arch-chroot base64 install sync awk grep sed tail; do
+  command -v "$command" >/dev/null || fail_install INSTALL_MEDIA_COMPONENT_MISSING "$command"
+done
+
+archinstall_version=$(archinstall --version 2>&1 | sed -n 's/.*\(3\.0\.[0-9][0-9]*\).*/\1/p' | head -n 1)
+case "$archinstall_version" in
+  3.0.8|3.0.9) : ;;
+  *) fail_install ARCHINSTALL_VERSION_UNSUPPORTED "expected ArchISO archinstall 3.0.8 or 3.0.9, found ${archinstall_version:-unknown}" ;;
+esac
+archinstall_help=$(archinstall --advanced --help 2>&1) ||
+  fail_install ARCHINSTALL_CLI_UNSUPPORTED "archinstall --advanced --help failed"
+for option in --config --creds --silent --offline --skip-version-check --skip-ntp --skip-wkd --dry-run; do
+  printf '%s\n' "$archinstall_help" | grep -F -- "$option" >/dev/null ||
+    fail_install ARCHINSTALL_CLI_UNSUPPORTED "archinstall $archinstall_version lacks $option"
+done
+
+install -d -m 0755 "$repo_mount"
+repo_device=$(blkid -L HF_ARCH_REPO 2>/dev/null || true)
+[ -n "$repo_device" ] && [ -b "$repo_device" ] ||
+  fail_install ARCH_REPO_MEDIA_MISSING "read-only HF_ARCH_REPO media is absent"
+run_step ARCH_REPO_MOUNT_FAILED mount -o ro,nosuid,nodev,noexec "$repo_device" "$repo_mount"
+for database in core/os/x86_64/core.db core/os/x86_64/core.db.sig \
+  extra/os/x86_64/extra.db extra/os/x86_64/extra.db.sig HF-ARCH-REPO.json; do
+  [ -s "$repo_mount/$database" ] || fail_install ARCH_REPO_MEDIA_INVALID "$database is absent"
+done
+
+cat > /etc/pacman.conf <<EOF
+[options]
+Architecture = auto
+CheckSpace
+SigLevel = Required DatabaseRequired
+LocalFileSigLevel = Optional
+ParallelDownloads = 1
+
+[core]
+Server = file://$repo_mount/\$repo/os/\$arch
+
+[extra]
+Server = file://$repo_mount/\$repo/os/\$arch
+EOF
+run_step ARCH_REPO_DATABASE_SYNC_FAILED pacman -Sy --noconfirm
+
+# Resolve exactly what archinstall 3.0.x and the HoneyForge post-install need.
+# This does not install into the live image and therefore does not consume cowspace.
+package_roots='base base-devel linux linux-firmware mkinitcpio grub openssh qemu-guest-agent audit python amd-ucode intel-ucode'
+package_list=/tmp/hf-arch-package-list
+pacman -Sp --print-format '%f' $package_roots > "$package_list" ||
+  fail_install ARCH_REPO_DEPENDENCY_CHECK_FAILED "pacman could not resolve the offline package set"
+[ -s "$package_list" ] || fail_install ARCH_REPO_DEPENDENCY_CHECK_FAILED "pacman returned an empty package set"
+while IFS= read -r package_file; do
+  case "$package_file" in
+    ''|*/*|*..*) fail_install ARCH_REPO_MEDIA_INVALID "unsafe package filename" ;;
+  esac
+  found=false
+  for repository in core extra; do
+    if [ -s "$repo_mount/$repository/os/x86_64/$package_file" ] &&
+       [ -s "$repo_mount/$repository/os/x86_64/$package_file.sig" ]; then
+      found=true
+      break
+    fi
+  done
+  [ "$found" = true ] || fail_install ARCH_REPO_PACKAGE_MISSING "$package_file"
+done < "$package_list"
+
+timedatectl set-ntp false >/dev/null 2>&1 || true
+if mountpoint -q /mnt; then
+  run_step ARCH_PREVIOUS_ROOT_UNMOUNT_FAILED umount -R /mnt
+fi
+run_step ARCH_DISK_WIPE_FAILED wipefs -a "$disk"
+run_step ARCH_PARTITION_TABLE_FAILED parted -s "$disk" mklabel msdos
+run_step ARCH_ROOT_PARTITION_FAILED parted -s "$disk" mkpart primary ext4 1MiB 100%
+run_step ARCH_BOOT_FLAG_FAILED parted -s "$disk" set 1 boot on
+run_step ARCH_PARTITION_RESCAN_FAILED partprobe "$disk"
+run_step ARCH_PARTITION_SETTLE_FAILED udevadm settle
+[ -b "$root_partition" ] || fail_install ARCH_ROOT_PARTITION_MISSING "$root_partition was not created"
+
+partition_table=/tmp/hf-arch-partitions
+parted -s -m "$disk" unit s print > "$partition_table" ||
+  fail_install ARCH_PARTITION_VERIFY_FAILED "could not inspect the target partition table"
+awk -F: 'NR == 2 { if ($6 != "msdos") exit 1; table = 1 }
+  $1 == "1" { start = $2; sub(/s$/, "", start); if (start < 2048 || $5 != "ext4" || $7 !~ /(^|,)boot[,;]?$/) exit 1; root = 1 }
+  END { exit !(table && root) }' "$partition_table" ||
+  fail_install ARCH_PARTITION_VERIFY_FAILED "expected an msdos table and bootable ext4 partition 1 after the BIOS embedding gap"
+run_step ARCH_ROOT_FILESYSTEM_FAILED mkfs.ext4 -F -L arch-root "$root_partition"
+run_step ARCH_ROOT_MOUNT_FAILED mount "$root_partition" /mnt
+
+config=/tmp/hf-archinstall-config.json
+credentials=/tmp/hf-archinstall-credentials.json
+cat > "$config" <<EOF
+{
+  "app_config": null,
+  "archinstall-language": "English",
+  "auth_config": {},
+  "audio_config": null,
+  "bootloader": "Grub",
+  "custom_commands": [],
+  "disk_config": {"config_type": "pre_mounted_config", "mountpoint": "/mnt"},
+  "hostname": "@@HOSTNAME@@",
+  "kernels": ["linux"],
+  "locale_config": {"kb_layout": "us", "sys_enc": "UTF-8", "sys_lang": "en_US.UTF-8"},
+  "mirror_config": null,
+  "network_config": {"type": "iso"},
+  "ntp": false,
+  "packages": ["grub", "openssh", "qemu-guest-agent", "audit", "python"],
+  "parallel_downloads": 0,
+  "profile_config": {"gfx_driver": null, "greeter": null, "profile": {}},
+  "script": "guided",
+  "services": ["systemd-networkd", "systemd-resolved", "sshd", "qemu-guest-agent", "auditd"],
+  "swap": false,
+  "timezone": "UTC",
+  "version": "$archinstall_version"
+}
+EOF
+cat > "$credentials" <<'EOF'
+{
+  "root_enc_password": null,
+  "users": [
+    {"enc_password": "@@ANALYST_PASSWORD_HASH@@", "groups": ["systemd-journal"], "sudo": true, "username": "analyst"}
+  ]
+}
+EOF
+chmod 0600 "$config" "$credentials"
+
+archinstall_log=/var/log/honeyforge-archinstall.log
+if ! archinstall --advanced --config "$config" --creds "$credentials" --silent \
+  --offline --skip-version-check --skip-ntp --skip-wkd --dry-run > "$archinstall_log" 2>&1; then
+  tail -n 40 "$archinstall_log" |
+    sed -E 's/\$[0-9A-Za-z]+\$[^"[:space:]]+/<redacted-password-hash>/g' >&2 || true
+  fail_install ARCHINSTALL_CONFIG_INVALID "archinstall $archinstall_version rejected the generated configuration"
+fi
+current_step=ARCHINSTALL_EXECUTION_FAILED
+if ! archinstall --advanced --config "$config" --creds "$credentials" --silent \
+  --offline --skip-version-check --skip-ntp --skip-wkd > "$archinstall_log" 2>&1; then
+  tail -n 40 "$archinstall_log" |
+    sed -E 's/\$[0-9A-Za-z]+\$[^"[:space:]]+/<redacted-password-hash>/g' >&2 || true
+  fail_install ARCHINSTALL_EXECUTION_FAILED "archinstall $archinstall_version failed; see sanitized serial log"
+fi
+
+[ -f /mnt/etc/os-release ] || fail_install ARCHINSTALL_TARGET_INVALID "/mnt is not an installed system"
+grep -Eq '^ID=arch$|^ID="arch"$' /mnt/etc/os-release ||
+  fail_install ARCHINSTALL_TARGET_INVALID "installed os-release is not Arch Linux"
+root_uuid=$(blkid -s UUID -o value "$root_partition") ||
+  fail_install ARCH_ROOT_UUID_FAILED "could not read root filesystem UUID"
+grep -F "UUID=$root_uuid" /mnt/etc/fstab >/dev/null ||
+  fail_install ARCH_FSTAB_VERIFY_FAILED "fstab does not reference the root filesystem UUID"
+
+run_step ARCH_POST_CONFIG_DIRECTORY_FAILED install -d -m 0755 \
+  /mnt/etc/systemd/network /mnt/etc/ssh/sshd_config.d /mnt/etc/audit/rules.d \
+  /mnt/usr/local/lib/honeyforge /mnt/srv/operations/backups
+cat > /mnt/etc/systemd/network/05-honeyforge-high.network <<'EOF'
+[Match]
+Name=en* eth*
+[Network]
+DHCP=yes
+IPv6AcceptRA=no
+LinkLocalAddressing=no
+EOF
+cat > /mnt/etc/ssh/sshd_config.d/90-honeyforge.conf <<'EOF'
+PasswordAuthentication yes
+PermitRootLogin no
+X11Forwarding no
+EOF
+printf '%s' '@@SENSOR_B64@@' | base64 -d > /mnt/usr/local/lib/honeyforge/high-telemetry-sensor ||
+  fail_install ARCH_TELEMETRY_CONFIG_FAILED "could not install telemetry sensor"
+printf '%s' '@@AUDIT_SENSOR_B64@@' | base64 -d > /mnt/usr/local/lib/honeyforge/high_telemetry_audit.py ||
+  fail_install ARCH_TELEMETRY_CONFIG_FAILED "could not install audit sensor"
+printf '%s' '@@SERVICE_B64@@' | base64 -d > /mnt/etc/systemd/system/high-telemetry.service ||
+  fail_install ARCH_TELEMETRY_CONFIG_FAILED "could not install telemetry service"
+printf '%s' '@@AUDIT_RULES_B64@@' | base64 -d > /mnt/etc/audit/rules.d/90-honeyforge.rules ||
+  fail_install ARCH_TELEMETRY_CONFIG_FAILED "could not install audit rules"
+run_step ARCH_TELEMETRY_CONFIG_FAILED chmod 0755 /mnt/usr/local/lib/honeyforge/high-telemetry-sensor
+# archinstall requires either a root password or a declared sudo user for an
+# unattended configuration. Satisfy that validation during installation, then
+# remove the temporary privilege before the target is ever booted.
+run_step ARCH_USER_PRIVILEGE_REMOVE_FAILED arch-chroot /mnt usermod -G systemd-journal analyst
+run_step ARCH_USER_PRIVILEGE_REMOVE_FAILED rm -f /mnt/etc/sudoers.d/00_archinstall
+if arch-chroot /mnt id -nG analyst | grep -Eq '(^|[[:space:]])wheel([[:space:]]|$)'; then
+  fail_install ARCH_USER_PRIVILEGE_REMOVE_FAILED "analyst retained the wheel group"
+fi
+run_step ARCH_ROOT_LOCK_FAILED arch-chroot /mnt passwd -l root
+run_step ARCH_SERVICE_ENABLE_FAILED arch-chroot /mnt systemctl enable \
+  systemd-networkd systemd-resolved sshd qemu-guest-agent auditd high-telemetry.service
+run_step ARCH_TELEMETRY_PYTHON_VERIFY_FAILED arch-chroot /mnt python3 -m py_compile \
+  /usr/local/lib/honeyforge/high_telemetry_audit.py
+
+# Do not leave the ephemeral file:// repository configured on the installed system.
+cat > /mnt/etc/pacman.d/mirrorlist <<'EOF'
+Server = https://archive.archlinux.org/repos/2025/08/01/$repo/os/$arch
+EOF
+
+cat > /mnt/etc/default/grub <<'EOF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=1
+GRUB_DISTRIBUTOR="Arch"
+GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200n8"
+GRUB_CMDLINE_LINUX=""
+GRUB_PRELOAD_MODULES="part_gpt part_msdos"
+GRUB_TERMINAL_INPUT="console serial"
+GRUB_TERMINAL_OUTPUT="console serial"
+GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200 --word=8 --parity=no --stop=1"
+EOF
+run_step ARCH_GRUB_CONFIG_FAILED arch-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
+
+for boot_file in /mnt/boot/vmlinuz-linux /mnt/boot/initramfs-linux.img \
+  /mnt/boot/grub/i386-pc/core.img /mnt/boot/grub/grub.cfg; do
+  [ -s "$boot_file" ] || fail_install ARCH_BOOT_ARTIFACT_MISSING "$boot_file"
+done
+for program in sshd qemu-ga python3; do
+  arch-chroot /mnt sh -c "command -v '$program'" >/dev/null ||
+    fail_install ARCH_INSTALLED_COMPONENT_MISSING "$program"
+done
+grep -F '/vmlinuz-linux' /mnt/boot/grub/grub.cfg >/dev/null ||
+  fail_install ARCH_GRUB_VERIFY_FAILED "GRUB does not reference the installed kernel"
+grep -F "$root_uuid" /mnt/boot/grub/grub.cfg >/dev/null ||
+  fail_install ARCH_GRUB_VERIFY_FAILED "GRUB does not reference the root filesystem UUID"
+
+printf '%s\n' installed > /mnt/etc/honeyforge-installed ||
+  fail_install ARCH_INSTALL_MARKER_WRITE_FAILED "could not write installation marker"
+run_step ARCH_DISK_SYNC_FAILED sync
+run_step ARCH_ROOT_UNMOUNT_FAILED umount /mnt
+run_step ARCH_REPO_UNMOUNT_FAILED umount "$repo_mount"
+
+current_step=ARCH_POWER_OFF_REQUEST_FAILED
+systemctl --no-block poweroff || fail_install ARCH_POWER_OFF_REQUEST_FAILED "systemd rejected poweroff"
+rm -f /run/hf-installing
+trap - EXIT HUP INT TERM
+echo HF_INSTALL_COMPLETE
+exit 0

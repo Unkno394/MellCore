@@ -23,6 +23,13 @@ if [ -r "$password_file" ]; then analyst_password=$(cat "$password_file"); else 
 password_hash=$(printf '%s' "$analyst_password" | openssl passwd -6 -stdin)
 hostname="hf-$(printf '%s' "$instance_id" | tr -d '-' | cut -c1-24)"
 shared_guest_dir="$script_dir/../../high-ubuntu-ssh/guest"
+install_method=legacy
+[ ! -r "$instance_dir/arch-install-method" ] || install_method=$(cat "$instance_dir/arch-install-method")
+case "$install_method" in
+  archinstall) guest_installer="$script_dir/archinstall-guest-install.sh" ;;
+  legacy) guest_installer="$script_dir/arch-guest-install.sh" ;;
+  *) echo 'HF_HIGH_ERROR code=ARCH_INSTALL_METHOD_INVALID stage=configuration: expected archinstall or legacy' >&2; exit 1 ;;
+esac
 python3 - "$shared_guest_dir/high_telemetry_sensor.py" "$shared_guest_dir/high_telemetry_audit.py" <<'PY'
 import pathlib, sys
 for filename in sys.argv[1:]: compile(pathlib.Path(filename).read_bytes(), filename, "exec")
@@ -35,7 +42,7 @@ umask 077
 sed -e "s|@@HOSTNAME@@|$hostname|g" -e "s|@@ANALYST_PASSWORD_HASH@@|$password_hash|g" \
   -e "s|@@AUDIT_SENSOR_B64@@|$audit_sensor_b64|g" -e "s|@@SERVICE_B64@@|$service_b64|g" \
   -e "s|@@AUDIT_RULES_B64@@|$audit_rules_b64|g" -e "s|@@SENSOR_B64@@|$sensor_b64|g" \
-  "$script_dir/arch-guest-install.sh" > "$instance_dir/arch-guest-install.sh"
+  "$guest_installer" > "$instance_dir/arch-guest-install.sh"
 chmod 0600 "$instance_dir/arch-guest-install.sh"
 grep -q '@@[A-Z0-9_][A-Z0-9_]*@@' "$instance_dir/arch-guest-install.sh" && { echo 'unresolved Arch installer marker' >&2; exit 1; }
 payload_file="$instance_dir/arch-guest-install.b64"
@@ -57,18 +64,34 @@ if [ "$already_installed" = false ]; then
     timeout "$command_timeout" expect "$script_dir/arch-console.exp" "$vm_name" "$payload_file" "$console_log"
 fi
 attempt=1; while [ "$attempt" -le 90 ]; do virsh domstate "$vm_name" 2>/dev/null | grep -Eqi 'shut|off' && break; sleep 2; attempt=$((attempt + 1)); done
-virsh domstate "$vm_name" 2>/dev/null | grep -Eqi 'shut|off' || { echo 'installed Arch did not power off' >&2; exit 1; }
-virt-cat -a "$instance_dir/disk.qcow2" /etc/honeyforge-installed | grep -Fx installed >/dev/null || { echo 'Arch installation marker is absent from target disk' >&2; exit 1; }
+virsh domstate "$vm_name" 2>/dev/null | grep -Eqi 'shut|off' || {
+  echo 'HF_HIGH_ERROR code=ARCH_POWER_OFF_TIMEOUT stage=installation: guest accepted the installer completion sequence but did not power off within 180 seconds; inspect the sanitized serial log' >&2
+  exit 1
+}
+timeout 120 virt-cat -a "$instance_dir/disk.qcow2" /etc/honeyforge-installed 2>/dev/null | grep -Fx installed >/dev/null || {
+  echo 'HF_HIGH_ERROR code=ARCH_INSTALL_MARKER_MISSING stage=installation: powered-off target disk lacks the verified installation marker' >&2
+  exit 1
+}
+for boot_file in /boot/vmlinuz-linux /boot/initramfs-linux.img /boot/grub/i386-pc/core.img /boot/grub/grub.cfg; do
+  timeout 120 virt-cat -a "$instance_dir/disk.qcow2" "$boot_file" >/dev/null 2>&1 || {
+    echo "HF_HIGH_ERROR code=ARCH_BOOT_ARTIFACT_MISSING stage=installation: powered-off target disk lacks $boot_file" >&2
+    exit 1
+  }
+done
 record_phase REBOOTING
-cdrom_target=$(virsh domblklist "$vm_name" --details | awk '$2 == "cdrom" { print $3; exit }')
-cdrom_source=$(virsh domblklist "$vm_name" --details | awk '$2 == "cdrom" && $4 != "-" { print $4; exit }')
-if [ -n "$cdrom_source" ]; then
-  [ -n "$cdrom_target" ] || { echo 'HF_HIGH_ERROR code=INSTALL_MEDIA_DEVICE_MISSING stage=reboot: installer CD-ROM device is absent' >&2; exit 1; }
+cdrom_targets=$(virsh domblklist "$vm_name" --details | awk '$2 == "cdrom" { print $3 }')
+for cdrom_target in $cdrom_targets; do
+  cdrom_source=$(virsh domblklist "$vm_name" --details | awk -v target="$cdrom_target" '$2 == "cdrom" && $3 == target && $4 != "-" { print $4; exit }')
+  [ -n "$cdrom_source" ] || continue
   if ! virsh change-media "$vm_name" "$cdrom_target" --eject --config >/dev/null; then
-    cdrom_source=$(virsh domblklist "$vm_name" --details | awk '$2 == "cdrom" && $4 != "-" { print $4; exit }')
-    [ -z "$cdrom_source" ] || { echo 'HF_HIGH_ERROR code=INSTALL_MEDIA_EJECT_FAILED stage=reboot: libvirt failed to eject Arch installation media' >&2; exit 1; }
+    cdrom_source=$(virsh domblklist "$vm_name" --details | awk -v target="$cdrom_target" '$2 == "cdrom" && $3 == target && $4 != "-" { print $4; exit }')
+    [ -z "$cdrom_source" ] || { echo "HF_HIGH_ERROR code=INSTALL_MEDIA_EJECT_FAILED stage=reboot: libvirt failed to eject Arch media from $cdrom_target" >&2; exit 1; }
   fi
-fi
+done
+virsh domblklist "$vm_name" --details | awk '$2 == "cdrom" && $4 != "-" { found=1 } END { exit found }' || {
+  echo 'HF_HIGH_ERROR code=INSTALL_MEDIA_EJECT_FAILED stage=reboot: one or more Arch installation media remain attached' >&2
+  exit 1
+}
 umask 077; : > "$instance_dir/installed-disk-verified"
 rm -f "$instance_dir/install-started" "$instance_dir/arch-guest-install.sh" "$payload_file"
 trap - EXIT HUP INT TERM
