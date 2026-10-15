@@ -2539,6 +2539,8 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
         "virsh",
         "virt-install",
         "qemu-img",
+        "qemu-system-x86_64",
+        "dnsmasq",
         "iptables",
         "ss",
         "openssl",
@@ -2593,175 +2595,276 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
     required_tools
 }
 
+fn high_vm_package_for_tool(platform: Platform, tool: &str) -> Option<&'static str> {
+    match platform {
+        Platform::Debian => match tool {
+            "virsh" => Some("libvirt-clients"),
+            "virt-install" => Some("virtinst"),
+            "qemu-img" => Some("qemu-utils"),
+            "qemu-system-x86_64" => Some("qemu-system-x86"),
+            "dnsmasq" => Some("dnsmasq-base"),
+            "iptables" => Some("iptables"),
+            "ss" => Some("iproute2"),
+            "openssl" => Some("openssl"),
+            "sha256sum" | "base64" => Some("coreutils"),
+            "python3" => Some("python3"),
+            "curl" => Some("curl"),
+            "cloud-localds" => Some("cloud-image-utils"),
+            "xorriso" => Some("xorriso"),
+            "virt-inspector" | "virt-customize" | "virt-cat" | "virt-ls" => {
+                Some("libguestfs-tools")
+            }
+            "wimlib-imagex" => Some("wimtools"),
+            "expect" => Some("expect"),
+            "setfacl" => Some("acl"),
+            "packer" => Some("packer"),
+            _ => None,
+        },
+        Platform::Fedora | Platform::Rhel => match tool {
+            "virsh" => Some("libvirt-client"),
+            "virt-install" => Some("virt-install"),
+            "qemu-img" => Some("qemu-img"),
+            "qemu-system-x86_64" => Some("qemu-kvm"),
+            "dnsmasq" => Some("dnsmasq"),
+            "iptables" => Some("iptables-nft"),
+            "ss" => Some("iproute"),
+            "openssl" => Some("openssl"),
+            "sha256sum" | "base64" => Some("coreutils"),
+            "python3" => Some("python3"),
+            "curl" => Some("curl"),
+            "cloud-localds" => Some("cloud-utils"),
+            "xorriso" => Some("xorriso"),
+            "virt-inspector" | "virt-customize" | "virt-cat" | "virt-ls" => Some("guestfs-tools"),
+            "wimlib-imagex" => Some("wimlib"),
+            "expect" => Some("expect"),
+            "setfacl" => Some("acl"),
+            "packer" => Some("packer"),
+            _ => None,
+        },
+        Platform::Arch => match tool {
+            "virsh" => Some("libvirt"),
+            "virt-install" => Some("virt-install"),
+            "qemu-img" | "qemu-system-x86_64" => Some("qemu-desktop"),
+            "dnsmasq" => Some("dnsmasq"),
+            "iptables" => Some("iptables-nft"),
+            "ss" => Some("iproute2"),
+            "openssl" => Some("openssl"),
+            "sha256sum" | "base64" => Some("coreutils"),
+            "python3" => Some("python"),
+            "curl" => Some("curl"),
+            "cloud-localds" => Some("cloud-image-utils"),
+            "xorriso" => Some("libisoburn"),
+            "virt-inspector" | "virt-customize" | "virt-cat" | "virt-ls" => Some("libguestfs"),
+            "wimlib-imagex" => Some("wimlib"),
+            "expect" => Some("expect"),
+            "setfacl" => Some("acl"),
+            "packer" => Some("packer"),
+            _ => None,
+        },
+        Platform::Alpine => None,
+    }
+}
+
+fn high_vm_missing_packages(
+    platform: Platform,
+    missing_tools: &[&str],
+    libvirt_unavailable: bool,
+) -> anyhow::Result<Vec<&'static str>> {
+    if platform == Platform::Alpine {
+        anyhow::bail!(
+            "HF_HIGH_ERROR code=HOST_PLATFORM_UNSUPPORTED stage=dependencies: High VM runtime is not supported on Alpine yet"
+        );
+    }
+    let mut packages = Vec::new();
+    for tool in missing_tools {
+        let package = high_vm_package_for_tool(platform, tool).ok_or_else(|| {
+            anyhow::anyhow!(
+                "HF_HIGH_ERROR code=DEPENDENCY_PACKAGE_UNKNOWN stage=dependencies: no package mapping for required tool {tool} on {platform:?}"
+            )
+        })?;
+        if !packages.contains(&package) {
+            packages.push(package);
+        }
+    }
+    if libvirt_unavailable {
+        let daemon = match platform {
+            Platform::Debian => "libvirt-daemon-system",
+            Platform::Fedora | Platform::Rhel => "libvirt-daemon-kvm",
+            Platform::Arch => "libvirt",
+            Platform::Alpine => unreachable!(),
+        };
+        if !packages.contains(&daemon) {
+            packages.push(daemon);
+        }
+    }
+    Ok(packages)
+}
+
+fn high_tool_works(program: &str) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn libvirt_system_works() -> bool {
+    Command::new("virsh")
+        .args(["--connect", "qemu:///system", "uri"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn dependency_auto_install_allowed() -> anyhow::Result<bool> {
+    match std::env::var("HF_HIGH_AUTO_INSTALL_DEPENDENCIES") {
+        Err(std::env::VarError::NotPresent) => dependency_auto_install_from_value(None),
+        Err(error) => Err(error.into()),
+        Ok(value) => dependency_auto_install_from_value(Some(&value)),
+    }
+}
+
+fn dependency_auto_install_from_value(value: Option<&str>) -> anyhow::Result<bool> {
+    match value {
+        None => Ok(true),
+        Some(value)
+            if matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ) =>
+        {
+            Ok(true)
+        }
+        Some(value)
+            if matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ) =>
+        {
+            Ok(false)
+        }
+        Some(value) => anyhow::bail!(
+            "HF_HIGH_ERROR code=DEPENDENCY_CONFIG_INVALID stage=dependencies: HF_HIGH_AUTO_INSTALL_DEPENDENCIES must be true or false, got {value}"
+        ),
+    }
+}
+
+fn running_as_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout == b"0\n")
+}
+
+fn start_libvirt(platform: Platform) -> bool {
+    let units: &[&str] = match platform {
+        Platform::Debian => &["libvirtd.service", "virtqemud.socket"],
+        Platform::Fedora | Platform::Rhel | Platform::Arch => {
+            &["virtqemud.socket", "libvirtd.service"]
+        }
+        Platform::Alpine => &[],
+    };
+    units.iter().any(|unit| {
+        Command::new("systemctl")
+            .args(["enable", "--now", unit])
+            .status()
+            .is_ok_and(|status| status.success())
+            && libvirt_system_works()
+    })
+}
+
+fn install_high_vm_packages(platform: Platform, packages: &[&str]) -> anyhow::Result<()> {
+    if packages.is_empty() {
+        return Ok(());
+    }
+    let result = match platform {
+        Platform::Debian => run_program("apt-get", &["update"]).and_then(|_| {
+            let mut args = vec!["install", "-y", "--no-install-recommends"];
+            args.extend_from_slice(packages);
+            run_program("apt-get", &args)
+        }),
+        Platform::Fedora | Platform::Rhel => {
+            let mut args = vec!["install", "-y"];
+            args.extend_from_slice(packages);
+            run_program("dnf", &args)
+        }
+        Platform::Arch => {
+            let mut args = vec!["-S", "--needed", "--noconfirm"];
+            args.extend_from_slice(packages);
+            run_program("pacman", &args)
+        }
+        Platform::Alpine => unreachable!(),
+    };
+    result.map_err(|error| {
+        anyhow::anyhow!(
+            "HF_HIGH_ERROR code=DEPENDENCY_INSTALL_FAILED stage=dependencies: could not install {} using the host package manager: {error}",
+            packages.join(", ")
+        )
+    })
+}
+
 /// Install only the host tools needed by the selected adapter.  In particular, existing Ubuntu
 /// deployments do not acquire Windows ISO tooling as a side effect.
 fn ensure_high_vm_runtime(
     profile: HighOsProfile,
     image_source: Option<&hf_core::HighImageSource>,
 ) -> anyhow::Result<()> {
-    let custom_image = image_source.is_some();
-    let required_tools = high_vm_required_tools(profile, custom_image);
-    let tools_ready = required_tools
-        .iter()
-        .all(|program| Command::new(program).arg("--version").output().is_ok());
-    if !tools_ready {
-        match detect_platform()? {
-            Platform::Debian => {
-                run_program("apt-get", &["update"])?;
-                let mut packages = vec![
-                    "install",
-                    "-y",
-                    "qemu-kvm",
-                    "libvirt-daemon-system",
-                    "libvirt-clients",
-                    "virtinst",
-                    "iptables",
-                    "iproute2",
-                    "curl",
-                    "openssl",
-                    "coreutils",
-                    "python3",
-                ];
-                match profile.image_preparation {
-                    hf_core::HighImagePreparation::CloudInitSeed => {
-                        packages.push("cloud-image-utils")
-                    }
-                    hf_core::HighImagePreparation::UnattendedInstall => packages.push("xorriso"),
-                    hf_core::HighImagePreparation::Sysprep => packages.push("xorriso"),
-                    hf_core::HighImagePreparation::OfflineGuestPreparation => {}
-                    hf_core::HighImagePreparation::BestEffortInstall => packages.push("xorriso"),
-                }
-                if (custom_image
-                    || profile == HighOsProfile::arch_linux_ssh()
-                    || profile == HighOsProfile::debian_ssh())
-                    && !packages.contains(&"libguestfs-tools")
-                {
-                    packages.push("libguestfs-tools");
-                }
-                if profile == HighOsProfile::windows_rdp() {
-                    packages.extend(["qemu-system-x86", "libguestfs-tools", "wimtools"]);
-                } else if required_tools.contains(&"wimlib-imagex") {
-                    packages.push("wimtools");
-                }
-                if custom_image {
-                    if !packages.contains(&"xorriso") {
-                        packages.push("xorriso");
-                    }
-                }
-                if required_tools.contains(&"expect") {
-                    packages.push("expect");
-                }
-                if required_tools.contains(&"setfacl") {
-                    packages.push("acl");
-                }
-                if required_tools.contains(&"wimlib-imagex") {
-                    packages.push("wimlib-utils");
-                }
-                run_program("apt-get", &packages)?;
-                run_program("systemctl", &["enable", "--now", "libvirtd"])?;
-            }
-            Platform::Fedora | Platform::Rhel => {
-                let mut packages = vec![
-                    "install",
-                    "-y",
-                    "qemu-kvm",
-                    "libvirt",
-                    "virt-install",
-                    "iptables-nft",
-                    "iproute",
-                    "curl",
-                    "openssl",
-                    "coreutils",
-                    "python3",
-                ];
-                match profile.image_preparation {
-                    hf_core::HighImagePreparation::CloudInitSeed => packages.push("cloud-utils"),
-                    hf_core::HighImagePreparation::UnattendedInstall => packages.push("xorriso"),
-                    hf_core::HighImagePreparation::Sysprep => packages.push("xorriso"),
-                    hf_core::HighImagePreparation::OfflineGuestPreparation => {}
-                    hf_core::HighImagePreparation::BestEffortInstall => packages.push("xorriso"),
-                }
-                if custom_image {
-                    packages.push("libguestfs-tools-c");
-                }
-                if profile == HighOsProfile::arch_linux_ssh()
-                    || profile == HighOsProfile::debian_ssh()
-                {
-                    packages.push("guestfs-tools");
-                }
-                if custom_image {
-                    if !packages.contains(&"xorriso") {
-                        packages.push("xorriso");
-                    }
-                }
-                if required_tools.contains(&"expect") {
-                    packages.push("expect");
-                }
-                if required_tools.contains(&"setfacl") {
-                    packages.push("acl");
-                }
-                if required_tools.contains(&"wimlib-imagex") {
-                    packages.push("wimlib");
-                }
-                run_program("dnf", &packages)?;
-                run_program("systemctl", &["enable", "--now", "libvirtd"])?;
-            }
-            Platform::Arch => {
-                let mut packages = vec![
-                    "-Sy",
-                    "--noconfirm",
-                    "qemu-desktop",
-                    "libvirt",
-                    "virt-install",
-                    "iptables-nft",
-                    "iproute2",
-                    "curl",
-                    "openssl",
-                    "coreutils",
-                    "python",
-                ];
-                match profile.image_preparation {
-                    hf_core::HighImagePreparation::CloudInitSeed => {
-                        packages.push("cloud-image-utils")
-                    }
-                    hf_core::HighImagePreparation::UnattendedInstall => packages.push("libisoburn"),
-                    hf_core::HighImagePreparation::Sysprep => packages.push("libisoburn"),
-                    hf_core::HighImagePreparation::OfflineGuestPreparation => {}
-                    hf_core::HighImagePreparation::BestEffortInstall => packages.push("libisoburn"),
-                }
-                if custom_image
-                    || profile == HighOsProfile::arch_linux_ssh()
-                    || profile == HighOsProfile::debian_ssh()
-                {
-                    packages.push("libguestfs");
-                }
-                if custom_image {
-                    if !packages.contains(&"libisoburn") {
-                        packages.push("libisoburn");
-                    }
-                }
-                if required_tools.contains(&"expect") {
-                    packages.push("expect");
-                }
-                if required_tools.contains(&"setfacl") {
-                    packages.push("acl");
-                }
-                run_program("pacman", &packages)?;
-                run_program("systemctl", &["enable", "--now", "libvirtd"])?;
-            }
-            Platform::Alpine => anyhow::bail!("High VM runtime is not supported on Alpine yet"),
-        }
-    }
-    anyhow::ensure!(
-        required_tools
-            .iter()
-            .all(|program| Command::new(program).arg("--version").output().is_ok()),
-        "High VM runtime installation did not provide every required tool"
-    );
     anyhow::ensure!(
         Path::new("/dev/kvm").exists(),
-        "KVM is unavailable; this VPS/provider does not permit High VM traps"
+        "HF_HIGH_ERROR code=KVM_UNAVAILABLE stage=dependencies: /dev/kvm is absent; this host or provider does not expose hardware virtualization"
     );
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "HF_HIGH_ERROR code=KVM_PERMISSION_DENIED stage=dependencies: hf-agent cannot open /dev/kvm: {error}"
+            )
+        })?;
+    let custom_image = image_source.is_some();
+    let required_tools = high_vm_required_tools(profile, custom_image);
+    let mut missing_tools: Vec<_> = required_tools
+        .iter()
+        .copied()
+        .filter(|program| !high_tool_works(program))
+        .collect();
+    let mut libvirt_ready =
+        missing_tools.iter().all(|tool| *tool != "virsh") && libvirt_system_works();
+    if missing_tools.is_empty() && libvirt_ready {
+        tracing::info!("KVM/QEMU/libvirt and High VM dependencies are ready");
+    } else {
+        let platform = detect_platform()?;
+        anyhow::ensure!(
+            dependency_auto_install_allowed()?,
+            "HF_HIGH_ERROR code=DEPENDENCIES_MISSING stage=dependencies: automatic installation is disabled; missing tools: {}; libvirt qemu:///system ready: {libvirt_ready}",
+            missing_tools.join(", ")
+        );
+        anyhow::ensure!(
+            running_as_root(),
+            "HF_HIGH_ERROR code=DEPENDENCY_PERMISSION_DENIED stage=dependencies: root privileges are required to install High VM dependencies or start libvirt"
+        );
+        if !libvirt_ready && !missing_tools.contains(&"virsh") {
+            libvirt_ready = start_libvirt(platform);
+        }
+        let packages = high_vm_missing_packages(platform, &missing_tools, !libvirt_ready)?;
+        install_high_vm_packages(platform, &packages)?;
+        if !libvirt_ready {
+            libvirt_ready = start_libvirt(platform);
+        }
+        missing_tools = required_tools
+            .iter()
+            .copied()
+            .filter(|program| !high_tool_works(program))
+            .collect();
+        anyhow::ensure!(
+            missing_tools.is_empty(),
+            "HF_HIGH_ERROR code=DEPENDENCY_VERIFY_FAILED stage=dependencies: package installation completed but required tools are unavailable or broken: {}",
+            missing_tools.join(", ")
+        );
+        anyhow::ensure!(
+            libvirt_ready && libvirt_system_works(),
+            "HF_HIGH_ERROR code=LIBVIRT_UNAVAILABLE stage=dependencies: libvirt cannot connect to qemu:///system after dependency preparation"
+        );
+    }
     host_inventory::validate_high_vm_host(
         profile,
         image_source,
@@ -3036,8 +3139,9 @@ mod tests {
         Args, ComposeProjectStore, DispatcherConfig, DispatcherListener, DispatcherTarget,
         HighDesiredState, HighLifecycleState, HighOsProfile, HighRuntimeManifest, Platform,
         QuarantineMarker, STANDALONE_IDENTITY_FILE, compose_remove_id, default_image_for,
-        high_vm_required_tools, load_or_create_standalone_high_identity, parse_platform,
-        quarantine_result, standalone_high_command, validate_standalone_high_args,
+        dependency_auto_install_from_value, high_vm_missing_packages, high_vm_required_tools,
+        load_or_create_standalone_high_identity, parse_platform, quarantine_result,
+        standalone_high_command, validate_standalone_high_args,
     };
     use clap::Parser;
     use hf_core::{AgentCommand, HighUbuntuDeployment, HighVmDeployment};
@@ -3185,6 +3289,8 @@ mod tests {
         let ubuntu = high_vm_required_tools(HighOsProfile::ubuntu_ssh(), false);
         assert!(ubuntu.contains(&"cloud-localds"));
         assert!(ubuntu.contains(&"python3"));
+        assert!(ubuntu.contains(&"qemu-system-x86_64"));
+        assert!(ubuntu.contains(&"dnsmasq"));
         assert!(!ubuntu.contains(&"xorriso"));
         assert!(!ubuntu.contains(&"setfacl"));
 
@@ -3217,6 +3323,60 @@ mod tests {
 
         let windows_iso = high_vm_required_tools(HighOsProfile::windows_rdp_legacy_iso(), true);
         assert!(windows_iso.contains(&"wimlib-imagex"));
+    }
+
+    #[test]
+    fn high_runtime_installs_only_packages_for_missing_components() {
+        let debian = high_vm_missing_packages(
+            Platform::Debian,
+            &["qemu-system-x86_64", "curl", "virt-cat", "virt-inspector"],
+            true,
+        )
+        .unwrap();
+        assert!(debian.contains(&"qemu-system-x86"));
+        assert!(!debian.contains(&"qemu-kvm"));
+        assert!(debian.contains(&"curl"));
+        assert!(debian.contains(&"libvirt-daemon-system"));
+        assert_eq!(
+            debian
+                .iter()
+                .filter(|package| **package == "libguestfs-tools")
+                .count(),
+            1
+        );
+
+        assert_eq!(
+            high_vm_missing_packages(Platform::Debian, &["curl"], false).unwrap(),
+            vec!["curl"]
+        );
+        assert_eq!(
+            high_vm_missing_packages(Platform::Fedora, &["qemu-system-x86_64"], false).unwrap(),
+            vec!["qemu-kvm"]
+        );
+        assert_eq!(
+            high_vm_missing_packages(Platform::Arch, &["qemu-img", "qemu-system-x86_64"], false)
+                .unwrap(),
+            vec!["qemu-desktop"]
+        );
+        assert!(
+            high_vm_missing_packages(Platform::Alpine, &["virsh"], true)
+                .unwrap_err()
+                .to_string()
+                .contains("code=HOST_PLATFORM_UNSUPPORTED")
+        );
+    }
+
+    #[test]
+    fn high_dependency_auto_install_is_explicitly_configurable() {
+        assert!(dependency_auto_install_from_value(None).unwrap());
+        assert!(dependency_auto_install_from_value(Some("true")).unwrap());
+        assert!(!dependency_auto_install_from_value(Some("off")).unwrap());
+        assert!(
+            dependency_auto_install_from_value(Some("sometimes"))
+                .unwrap_err()
+                .to_string()
+                .contains("code=DEPENDENCY_CONFIG_INVALID")
+        );
     }
 
     #[test]
