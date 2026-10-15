@@ -143,6 +143,8 @@ class CustomIsoRecipeTests(unittest.TestCase):
         self.assertIn("ARCH_REPO_PACKAGE_SIGNATURE_INVALID", guest)
         self.assertIn("ARCH_REPO_PACKAGE_SIGNING_KEY_EXPIRED", guest)
         self.assertIn("ARCH_REPO_PACKAGE_SIGNATURE_TIMEOUT", guest)
+        self.assertIn("ARCH_REPO_KEYRING_INSTALL_FAILED", guest)
+        self.assertIn("archlinux-keyring 20260909-1", guest)
         self.assertIn('timeout 30 pacman-key --verify "$package_path.sig" "$package_path"', guest)
         self.assertIn("pacman-key --init", guest)
         self.assertIn("pacman-key --populate archlinux", guest)
@@ -151,10 +153,15 @@ class CustomIsoRecipeTests(unittest.TestCase):
         self.assertIn("systemd-time-wait-sync.service", guest)
         self.assertIn("reflector.service", guest)
         self.assertNotIn("SigLevel = Never", guest)
+        self.assertNotIn("TrustAll", guest)
         self.assertNotIn("date -s", guest)
         self.assertLess(guest.index("pacman-key --populate archlinux"), guest.index("pacman -Sy --noconfirm"))
         self.assertLess(
-            guest.index("ARCH_REPO_PACKAGE_SIGNING_KEY_EXPIRED"),
+            guest.index("installing approved Arch keyring"),
+            guest.index("pacman -Sy --noconfirm"),
+        )
+        self.assertLess(
+            guest.index("if grep -Eiq 'key has expired"),
             guest.index('if [ "$signature_status" -ne 0 ]'),
         )
         self.assertNotIn("core.db.sig", guest)
@@ -169,8 +176,17 @@ class CustomIsoRecipeTests(unittest.TestCase):
 
     def test_arch_repository_catalog_is_fixed_and_resolves_transitive_providers(self):
         repository = load_arch_repository_module()
-        self.assertEqual(repository.SOURCE_ROOT, "https://archive.archlinux.org/repos/2025/08/01")
+        self.assertEqual(repository.SOURCE_ROOT, "https://archive.archlinux.org/repos/2026/09/10")
         self.assertEqual(repository.ARCH, "x86_64")
+        self.assertEqual(repository.KEYRING_VERSION, "20260909-1")
+        self.assertEqual(
+            repository.KEYRING_PACKAGE_SHA256,
+            "6a8ea16f51d3b305c18322d5884ca959f12c32a3f186873090fdc18465605293",
+        )
+        self.assertEqual(
+            repository.KEYRING_SIGNATURE_SHA256,
+            "5942acd5b5e27a45051c447b8054696465872e834af1a5bd3cb85e2881cf6cf8",
+        )
         digest = "a" * 64
         packages = [
             repository.Package("core", "root", "root.pkg.tar.zst", digest, 1, ("virtual>=1",), ()),
@@ -206,8 +222,9 @@ class CustomIsoRecipeTests(unittest.TestCase):
             core.write_bytes(b"core metadata")
             extra.write_bytes(b"extra metadata")
             manifest = repository.repository_manifest({"core": core, "extra": extra}, [])
-            self.assertEqual(manifest["format_version"], 2)
+            self.assertEqual(manifest["format_version"], 3)
             self.assertFalse(manifest["database_signatures_required"])
+            self.assertEqual(manifest["bootstrap_keyring"]["version"], "20260909-1")
             self.assertEqual(manifest["databases"]["core"], hashlib.sha256(b"core metadata").hexdigest())
             self.assertEqual(manifest["databases"]["extra"], hashlib.sha256(b"extra metadata").hexdigest())
 
@@ -238,6 +255,9 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 target = staging / name / "os" / "x86_64"
                 target.mkdir(parents=True)
                 (target / f"{name}.db").write_bytes(f"{name} database fixture".encode())
+            keyring = staging / "core" / "os" / "x86_64" / repository.KEYRING_FILENAME
+            keyring.write_bytes(b"keyring fixture")
+            keyring.with_name(keyring.name + ".sig").write_bytes(b"signature fixture")
             (staging / "HF-ARCH-REPO.json").write_text("{}\n", encoding="utf-8")
             image = root / "repository.iso"
             completed = subprocess.run(
@@ -304,6 +324,75 @@ class CustomIsoRecipeTests(unittest.TestCase):
                     )
             self.assertEqual(caught.exception.code, "ARCH_REPO_PACKAGE_SIGNATURE_MISSING")
 
+    def test_arch_signature_status_rejects_expired_revoked_and_untrusted_keys(self):
+        repository = load_arch_repository_module()
+        fingerprint = "A" * 40
+        self.assertEqual(
+            repository.parse_revoked_fingerprints(f"{fingerprint}\n{'B' * 40}:4:\ninvalid\n"),
+            {fingerprint, "B" * 40},
+        )
+        valid = f"[GNUPG:] VALIDSIG {fingerprint} 2026 0 4 0 1 10 00 {fingerprint}\n"
+        self.assertIsNone(
+            repository.signature_status_error(valid + "[GNUPG:] TRUST_FULLY 0 pgp\n", set())
+        )
+        self.assertEqual(
+            repository.signature_status_error(
+                valid + "[GNUPG:] EXPKEYSIG DEADBEEF signer\n[GNUPG:] TRUST_FULLY 0 pgp\n",
+                set(),
+            ),
+            "EXPKEYSIG",
+        )
+        self.assertEqual(
+            repository.signature_status_error(valid + "[GNUPG:] TRUST_FULLY 0 pgp\n", {fingerprint}),
+            "REVOKED_FINGERPRINT",
+        )
+        self.assertEqual(repository.signature_status_error(valid, set()), "SIGNER_NOT_TRUSTED")
+
+    def test_arch_signature_preflight_checks_every_package(self):
+        repository = load_arch_repository_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            keyring = root / repository.KEYRING_FILENAME
+            keyring.write_bytes(b"keyring fixture")
+            packages = []
+            for name in ("one", "two"):
+                filename = f"{name}-1-x86_64.pkg.tar.zst"
+                (root / filename).write_bytes(name.encode())
+                (root / f"{filename}.sig").write_bytes(b"signature")
+                packages.append(repository.Package("core", name, filename, "a" * 64, 1, (), ()))
+
+            def extract(_package, member, destination):
+                if member.endswith("archlinux-revoked"):
+                    destination.write_text("", encoding="ascii")
+                elif member.endswith("archlinux-trusted"):
+                    destination.write_text(f"{'B' * 40}:4:\n", encoding="ascii")
+                else:
+                    destination.write_bytes(b"public keys")
+
+            fingerprint = "A" * 40
+
+            def run(command, **_kwargs):
+                if "--verify" in command:
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout=(
+                            f"[GNUPG:] VALIDSIG {fingerprint} 2026 0 4 0 1 10 00 {fingerprint}\n"
+                            "[GNUPG:] TRUST_FULLY 0 pgp\n"
+                        ),
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+            with mock.patch.object(
+                repository, "KEYRING_PACKAGE_SHA256", hashlib.sha256(b"keyring fixture").hexdigest()
+            ), mock.patch.object(repository, "extract_keyring_file", side_effect=extract), mock.patch.object(
+                repository.subprocess, "run", side_effect=run
+            ) as run_mock:
+                repository.preflight_package_signatures(root, packages)
+            verified = [call for call in run_mock.call_args_list if "--verify" in call.args[0]]
+            self.assertEqual(len(verified), 2)
+
     def test_arch_repository_build_is_atomic_and_reuses_verified_iso(self):
         repository = load_arch_repository_module()
         with tempfile.TemporaryDirectory() as directory:
@@ -317,6 +406,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
             package_files = {
                 "root-1-x86_64.pkg.tar.zst": b"root package",
                 "leaf-1-x86_64.pkg.tar.zst": b"leaf package",
+                repository.KEYRING_FILENAME: b"keyring package",
             }
             for filename, content in package_files.items():
                 (downloads / filename).write_bytes(content)
@@ -338,7 +428,13 @@ class CustomIsoRecipeTests(unittest.TestCase):
                         info.size = len(payload)
                         archive.addfile(info, io.BytesIO(payload))
 
-            write_database("core", [("root", "root-1-x86_64.pkg.tar.zst", ("leaf",))])
+            write_database(
+                "core",
+                [
+                    ("root", "root-1-x86_64.pkg.tar.zst", ("leaf", "archlinux-keyring")),
+                    ("archlinux-keyring", repository.KEYRING_FILENAME, ()),
+                ],
+            )
             write_database("extra", [("leaf", "leaf-1-x86_64.pkg.tar.zst", ())])
             executable(
                 fake_bin / "curl",
@@ -358,7 +454,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 "#!/bin/sh\n"
                 "case \" $* \" in\n"
                 "*' -indev '*)\n"
-                "  printf '%s\\n' /core/os/x86_64/core.db /extra/os/x86_64/extra.db /HF-ARCH-REPO.json\n"
+                "  printf '%s\\n' /core/os/x86_64/core.db /extra/os/x86_64/extra.db /HF-ARCH-REPO.json \"/core/os/x86_64/$FAKE_KEYRING\" \"/core/os/x86_64/$FAKE_KEYRING.sig\"\n"
                 "  exit 0 ;;\n"
                 "esac\n"
                 "output=\n"
@@ -373,10 +469,19 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 PATH=f"{fake_bin}:{os.environ['PATH']}",
                 FAKE_DOWNLOADS=str(downloads),
                 FAKE_CURL_CALLS=str(calls),
+                FAKE_KEYRING=repository.KEYRING_FILENAME,
             )
             with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
                 repository, "ROOT_PACKAGES", ("root",)
-            ):
+            ), mock.patch.object(
+                repository,
+                "KEYRING_PACKAGE_SHA256",
+                hashlib.sha256(package_files[repository.KEYRING_FILENAME]).hexdigest(),
+            ), mock.patch.object(
+                repository,
+                "KEYRING_SIGNATURE_SHA256",
+                hashlib.sha256(b"detached signature").hexdigest(),
+            ), mock.patch.object(repository, "preflight_package_signatures") as preflight:
                 first = repository.build_repository(root / "cache")
                 first_calls = len(calls.read_text().splitlines())
                 second = repository.build_repository(root / "cache")
@@ -384,8 +489,9 @@ class CustomIsoRecipeTests(unittest.TestCase):
             self.assertTrue(first.is_file())
             self.assertTrue(first.with_suffix(first.suffix + ".sha256").is_file())
             self.assertEqual(len(calls.read_text().splitlines()), first_calls)
+            self.assertEqual(preflight.call_count, 2)
             self.assertNotIn(".db.sig", calls.read_text())
-            self.assertIn("offline-repo-v2.iso", first.name)
+            self.assertIn("offline-repo-v3.iso", first.name)
 
     def test_unattended_media_is_generated_per_instance(self):
         grub_by_flavor = {

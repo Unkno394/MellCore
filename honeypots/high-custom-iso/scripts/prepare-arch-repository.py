@@ -26,12 +26,17 @@ from pathlib import Path
 from urllib.parse import quote
 
 
-SNAPSHOT = "2025/08/01"
-SNAPSHOT_ID = "2025-08-01"
-CACHE_FORMAT_VERSION = 2
+SNAPSHOT = "2026/09/10"
+SNAPSHOT_ID = "2026-09-10"
+CACHE_FORMAT_VERSION = 3
 ARCH = "x86_64"
 SOURCE_ROOT = f"https://archive.archlinux.org/repos/{SNAPSHOT}"
 REPOSITORIES = ("core", "extra")
+KEYRING_VERSION = "20260909-1"
+KEYRING_FILENAME = f"archlinux-keyring-{KEYRING_VERSION}-any.pkg.tar.zst"
+# Pinned from the signed official core database for the approved snapshot.
+KEYRING_PACKAGE_SHA256 = "6a8ea16f51d3b305c18322d5884ca959f12c32a3f186873090fdc18465605293"
+KEYRING_SIGNATURE_SHA256 = "5942acd5b5e27a45051c447b8054696465872e834af1a5bd3cb85e2881cf6cf8"
 ROOT_PACKAGES = (
     "base",
     "base-devel",
@@ -164,6 +169,12 @@ def repository_manifest(databases: dict[str, Path], packages: list[Package]) -> 
         "source": SOURCE_ROOT,
         "architecture": ARCH,
         "database_signatures_required": False,
+        "bootstrap_keyring": {
+            "version": KEYRING_VERSION,
+            "filename": KEYRING_FILENAME,
+            "sha256": KEYRING_PACKAGE_SHA256,
+            "signature_sha256": KEYRING_SIGNATURE_SHA256,
+        },
         "databases": {
             repository: sha256_file(database)
             for repository, database in sorted(databases.items())
@@ -310,6 +321,128 @@ def parse_xorriso_listing(output: str) -> set[str]:
     return listing
 
 
+def signature_status_error(output: str, revoked_fingerprints: set[str]) -> str | None:
+    """Return a safe diagnostic for a detached signature, or None when trusted."""
+    statuses: list[tuple[str, list[str]]] = []
+    for line in output.splitlines():
+        marker = "[GNUPG:] "
+        if marker not in line:
+            continue
+        fields = line.split(marker, 1)[1].split()
+        if fields:
+            statuses.append((fields[0], fields[1:]))
+    names = {name for name, _ in statuses}
+    for rejected in (
+        "BADSIG",
+        "ERRSIG",
+        "NO_PUBKEY",
+        "EXPKEYSIG",
+        "KEYEXPIRED",
+        "SIGEXPIRED",
+        "REVKEYSIG",
+    ):
+        if rejected in names:
+            return rejected
+    valid = [arguments for name, arguments in statuses if name == "VALIDSIG"]
+    if len(valid) != 1:
+        return "VALIDSIG_MISSING"
+    fingerprints = {
+        value.upper()
+        for value in valid[0]
+        if re.fullmatch(r"[0-9A-Fa-f]{40,64}", value)
+    }
+    if fingerprints & {fingerprint.upper() for fingerprint in revoked_fingerprints}:
+        return "REVOKED_FINGERPRINT"
+    if not ({"TRUST_FULLY", "TRUST_ULTIMATE"} & names):
+        return "SIGNER_NOT_TRUSTED"
+    return None
+
+
+def parse_revoked_fingerprints(content: str) -> set[str]:
+    fingerprints: set[str] = set()
+    for line in content.splitlines():
+        candidate = line.strip().split(":", 1)[0]
+        if re.fullmatch(r"[0-9A-Fa-f]{40,64}", candidate):
+            fingerprints.add(candidate.upper())
+    return fingerprints
+
+
+def extract_keyring_file(package: Path, member: str, destination: Path) -> None:
+    result = subprocess.run(
+        ["bsdtar", "-xOf", str(package), member],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode or not result.stdout:
+        detail = result.stderr.decode("utf-8", "replace").strip().splitlines()[-1:]
+        raise RepositoryError(
+            "ARCH_REPO_KEYRING_INVALID",
+            f"cannot extract {member}: {(detail or ['bsdtar failed'])[0][:300]}",
+        )
+    destination.write_bytes(result.stdout)
+    os.chmod(destination, 0o600)
+
+
+def preflight_package_signatures(source_cache: Path, packages: list[Package]) -> None:
+    """Verify every package with the pinned current Arch keyring before VM launch."""
+    keyring_package = source_cache / KEYRING_FILENAME
+    if sha256_file(keyring_package) != KEYRING_PACKAGE_SHA256:
+        raise RepositoryError("ARCH_REPO_KEYRING_INVALID", "bootstrap keyring checksum mismatch")
+    with tempfile.TemporaryDirectory(prefix=".arch-keyring-", dir=source_cache) as directory:
+        root = Path(directory)
+        homedir = root / "gnupg"
+        homedir.mkdir(mode=0o700)
+        public_keys = root / "archlinux.gpg"
+        trusted = root / "archlinux-trusted"
+        revoked = root / "archlinux-revoked"
+        for member, destination in (
+            ("usr/share/pacman/keyrings/archlinux.gpg", public_keys),
+            ("usr/share/pacman/keyrings/archlinux-trusted", trusted),
+            ("usr/share/pacman/keyrings/archlinux-revoked", revoked),
+        ):
+            extract_keyring_file(keyring_package, member, destination)
+        commands = (
+            ["gpg", "--batch", "--homedir", str(homedir), "--import", str(public_keys)],
+            ["gpg", "--batch", "--homedir", str(homedir), "--import-ownertrust", str(trusted)],
+            ["gpg", "--batch", "--homedir", str(homedir), "--check-trustdb"],
+        )
+        for command in commands:
+            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            if result.returncode:
+                raise RepositoryError(
+                    "ARCH_REPO_KEYRING_INVALID", "could not initialize isolated verification keyring"
+                )
+        revoked_fingerprints = parse_revoked_fingerprints(revoked.read_text(encoding="ascii"))
+        for package in packages:
+            package_path = source_cache / package.filename
+            signature_path = source_cache / f"{package.filename}.sig"
+            result = subprocess.run(
+                [
+                    "gpg",
+                    "--batch",
+                    "--no-auto-key-retrieve",
+                    "--auto-key-locate",
+                    "clear",
+                    "--homedir",
+                    str(homedir),
+                    "--status-fd",
+                    "1",
+                    "--verify",
+                    str(signature_path),
+                    str(package_path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            diagnostic = signature_status_error(result.stdout, revoked_fingerprints)
+            if result.returncode or diagnostic:
+                raise RepositoryError(
+                    "ARCH_REPO_SIGNATURE_PREFLIGHT_FAILED",
+                    f"{package.filename}: {diagnostic or f'gpg-exit-{result.returncode}'}",
+                )
+
+
 def validate_cached_iso(iso_path: Path, checksum_path: Path) -> bool:
     ensure_safe_regular(iso_path)
     ensure_safe_regular(checksum_path)
@@ -343,6 +476,8 @@ def validate_cached_iso(iso_path: Path, checksum_path: Path) -> bool:
         "/core/os/x86_64/core.db",
         "/extra/os/x86_64/extra.db",
         "/HF-ARCH-REPO.json",
+        f"/core/os/x86_64/{KEYRING_FILENAME}",
+        f"/core/os/x86_64/{KEYRING_FILENAME}.sig",
     }
     listing = parse_xorriso_listing(result.stdout)
     missing = sorted(required - listing)
@@ -373,12 +508,11 @@ def build_repository(cache_dir: Path) -> Path:
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        # v2 deliberately uses a new filename: previously published repository ISOs
-        # remain immutable while the database-signature policy changes.
+        # Each format uses a new filename: previously published repository ISOs remain
+        # immutable when the approved snapshot or trust bootstrap changes.
         iso_path = cache_dir / f"archlinux-{SNAPSHOT_ID}-offline-repo-v{CACHE_FORMAT_VERSION}.iso"
         checksum_path = iso_path.with_suffix(iso_path.suffix + ".sha256")
-        if validate_cached_iso(iso_path, checksum_path):
-            return iso_path
+        cached_iso = validate_cached_iso(iso_path, checksum_path)
 
         source_cache = cache_dir / SNAPSHOT_ID
         source_cache.mkdir(mode=0o700, exist_ok=True)
@@ -397,14 +531,32 @@ def build_repository(cache_dir: Path) -> Path:
             all_packages.extend(parse_database(repository, database))
 
         packages = resolve_packages(all_packages)
+        keyring = next((package for package in packages if package.name == "archlinux-keyring"), None)
+        if (
+            keyring is None
+            or keyring.filename != KEYRING_FILENAME
+            or keyring.sha256 != KEYRING_PACKAGE_SHA256
+        ):
+            raise RepositoryError(
+                "ARCH_REPO_KEYRING_INVALID", "approved keyring is absent from snapshot metadata"
+            )
         total_size = sum(package.compressed_size for package in packages)
         if total_size <= 0 or total_size > MAX_BUNDLE_BYTES:
             raise RepositoryError("ARCH_REPO_SIZE_INVALID", str(total_size))
+        missing_package_bytes = 0
+        for package in packages:
+            cached_package = source_cache / package.filename
+            ensure_safe_regular(cached_package)
+            if not cached_package.is_file() or sha256_file(cached_package) != package.sha256:
+                missing_package_bytes += package.compressed_size
+        required_free = missing_package_bytes + DOWNLOAD_HEADROOM_BYTES
+        if not cached_iso:
+            required_free += total_size
         free = shutil.disk_usage(cache_dir).free
-        if free < total_size * 2 + DOWNLOAD_HEADROOM_BYTES:
+        if free < required_free:
             raise RepositoryError(
                 "ARCH_REPO_DISK_SPACE_LOW",
-                f"need at least {total_size * 2 + DOWNLOAD_HEADROOM_BYTES} free bytes, have {free}",
+                f"need at least {required_free} free bytes, have {free}",
             )
 
         for package in packages:
@@ -417,9 +569,15 @@ def build_repository(cache_dir: Path) -> Path:
                 package_url + ".sig",
                 package_path.with_suffix(package_path.suffix + ".sig"),
                 1024 * 1024,
-                None,
+                KEYRING_SIGNATURE_SHA256 if package.name == "archlinux-keyring" else None,
                 "ARCH_REPO_PACKAGE_SIGNATURE_MISSING",
             )
+
+        # Always repeat cryptographic preflight, including when the immutable ISO is
+        # already cached. Hash-validated source files are reused without downloading.
+        preflight_package_signatures(source_cache, packages)
+        if cached_iso:
+            return iso_path
 
         staging = Path(tempfile.mkdtemp(prefix=".arch-repo-stage-", dir=cache_dir))
         temporary_iso = cache_dir / f".{iso_path.name}.{os.getpid()}.tmp"

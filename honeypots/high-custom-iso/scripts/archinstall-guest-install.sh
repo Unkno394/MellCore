@@ -6,6 +6,7 @@ export LC_ALL
 disk=/dev/vda
 root_partition=${disk}1
 repo_mount=/run/hf-arch-repo
+bootstrap_keyring_filename=archlinux-keyring-20260909-1-any.pkg.tar.zst
 current_step=ARCHINSTALL_INITIALIZATION
 failure_reported=false
 
@@ -155,9 +156,9 @@ try:
     manifest = json.loads((root / "HF-ARCH-REPO.json").read_text(encoding="utf-8"))
 except (OSError, UnicodeError, json.JSONDecodeError):
     fail("ARCH_REPO_METADATA_INVALID", "manifest cannot be decoded")
-if manifest.get("format_version") != 2 or manifest.get("snapshot") != "2025-08-01":
+if manifest.get("format_version") != 3 or manifest.get("snapshot") != "2026-09-10":
     fail("ARCH_REPO_METADATA_INVALID", "unexpected repository format or snapshot")
-if manifest.get("source") != "https://archive.archlinux.org/repos/2025/08/01":
+if manifest.get("source") != "https://archive.archlinux.org/repos/2026/09/10":
     fail("ARCH_REPO_METADATA_INVALID", "unexpected repository source")
 if manifest.get("architecture") != "x86_64" or manifest.get("database_signatures_required") is not False:
     fail("ARCH_REPO_METADATA_INVALID", "unexpected repository architecture or signature policy")
@@ -174,6 +175,22 @@ for repository, expected in databases.items():
         fail("ARCH_REPO_METADATA_INVALID", f"cannot read {repository}.db")
     if actual != expected:
         fail("ARCH_REPO_METADATA_INVALID", f"{repository}.db checksum mismatch")
+keyring = manifest.get("bootstrap_keyring")
+if keyring != {
+    "version": "20260909-1",
+    "filename": "archlinux-keyring-20260909-1-any.pkg.tar.zst",
+    "sha256": "6a8ea16f51d3b305c18322d5884ca959f12c32a3f186873090fdc18465605293",
+    "signature_sha256": "5942acd5b5e27a45051c447b8054696465872e834af1a5bd3cb85e2881cf6cf8",
+}:
+    fail("ARCH_REPO_KEYRING_INVALID", "unexpected bootstrap keyring")
+keyring_path = root / "core" / "os" / "x86_64" / keyring["filename"]
+try:
+    if sha256_file(keyring_path) != keyring["sha256"]:
+        fail("ARCH_REPO_KEYRING_INVALID", "bootstrap keyring checksum mismatch")
+    if sha256_file(keyring_path.with_name(keyring_path.name + ".sig")) != keyring["signature_sha256"]:
+        fail("ARCH_REPO_KEYRING_INVALID", "bootstrap keyring signature checksum mismatch")
+except OSError:
+    fail("ARCH_REPO_KEYRING_INVALID", "bootstrap keyring or signature is absent")
 packages = manifest.get("packages")
 if not isinstance(packages, list) or not packages:
     fail("ARCH_REPO_METADATA_INVALID", "package manifest is empty")
@@ -206,6 +223,8 @@ PY
       fail_install ARCH_REPO_PACKAGE_MISSING "${metadata_error#*:}" ;;
     ARCH_REPO_PACKAGE_CHECKSUM_MISMATCH:*)
       fail_install ARCH_REPO_PACKAGE_CHECKSUM_MISMATCH "${metadata_error#*:}" ;;
+    ARCH_REPO_KEYRING_INVALID:*)
+      fail_install ARCH_REPO_KEYRING_INVALID "${metadata_error#*:}" ;;
     *) fail_install ARCH_REPO_METADATA_INVALID "${metadata_error#*:}" ;;
   esac
 fi
@@ -224,6 +243,47 @@ Server = file://$repo_mount/\$repo/os/\$arch
 [extra]
 Server = file://$repo_mount/\$repo/os/\$arch
 EOF
+
+verify_package_signature() {
+  package_path=$1
+  expired_code=$2
+  timeout_code=$3
+  invalid_code=$4
+  package_name=${package_path##*/}
+  signature_log=/tmp/hf-package-signature.log
+  if timeout 30 pacman-key --verify "$package_path.sig" "$package_path" > "$signature_log" 2>&1; then
+    signature_status=0
+  else
+    signature_status=$?
+  fi
+  if grep -Eiq 'key has expired|expired key|key[^[:alnum:]]+expired|signature has expired|\[expired\]|EXPKEYSIG|KEYEXPIRED' "$signature_log"; then
+    rm -f "$signature_log"
+    fail_install "$expired_code" "$package_name"
+  fi
+  if [ "$signature_status" -eq 124 ]; then
+    rm -f "$signature_log"
+    fail_install "$timeout_code" "$package_name"
+  fi
+  if [ "$signature_status" -ne 0 ]; then
+    rm -f "$signature_log"
+    fail_install "$invalid_code" "$package_name"
+  fi
+  rm -f "$signature_log"
+}
+
+# The updated keyring is anchored by pinned SHA-256 values in the repository
+# manifest and must also be signed by a key trusted by the bundled ArchISO
+# keyring before it can replace any trust material.
+bootstrap_keyring_path="$repo_mount/core/os/x86_64/$bootstrap_keyring_filename"
+verify_package_signature "$bootstrap_keyring_path" \
+  ARCH_REPO_KEYRING_SIGNING_KEY_EXPIRED ARCH_REPO_KEYRING_SIGNATURE_TIMEOUT \
+  ARCH_REPO_KEYRING_SIGNATURE_INVALID
+run_bounded ARCH_REPO_KEYRING_INSTALL_FAILED 120 "installing approved Arch keyring" \
+  pacman --config /etc/pacman.conf -U --noconfirm "$bootstrap_keyring_path"
+run_bounded ARCH_PACMAN_KEYRING_POPULATE_FAILED 120 "populating updated Arch keyring" \
+  pacman-key --populate archlinux
+pacman -Q archlinux-keyring 2>/dev/null | grep -F "archlinux-keyring 20260909-1" >/dev/null ||
+  fail_install ARCH_REPO_KEYRING_INSTALL_FAILED "approved keyring version is not active"
 run_step ARCH_REPO_DATABASE_SYNC_FAILED pacman -Sy --noconfirm
 
 # Resolve exactly what archinstall 3.0.x and the HoneyForge post-install need.
@@ -247,25 +307,9 @@ while IFS= read -r package_file; do
   done
   [ -n "$package_path" ] || fail_install ARCH_REPO_PACKAGE_MISSING "$package_file"
   [ -s "$package_path.sig" ] || fail_install ARCH_REPO_PACKAGE_SIGNATURE_MISSING "$package_file"
-  signature_log=/tmp/hf-package-signature.log
-  if timeout 30 pacman-key --verify "$package_path.sig" "$package_path" > "$signature_log" 2>&1; then
-    signature_status=0
-  else
-    signature_status=$?
-  fi
-  if grep -Eiq 'key has expired|expired key|key[^[:alnum:]]+expired|signature has expired|\[expired\]|EXPKEYSIG|KEYEXPIRED' "$signature_log"; then
-    rm -f "$signature_log"
-    fail_install ARCH_REPO_PACKAGE_SIGNING_KEY_EXPIRED "$package_file"
-  fi
-  if [ "$signature_status" -eq 124 ]; then
-    rm -f "$signature_log"
-    fail_install ARCH_REPO_PACKAGE_SIGNATURE_TIMEOUT "$package_file"
-  fi
-  if [ "$signature_status" -ne 0 ]; then
-    rm -f "$signature_log"
-    fail_install ARCH_REPO_PACKAGE_SIGNATURE_INVALID "$package_file"
-  fi
-  rm -f "$signature_log"
+  verify_package_signature "$package_path" \
+    ARCH_REPO_PACKAGE_SIGNING_KEY_EXPIRED ARCH_REPO_PACKAGE_SIGNATURE_TIMEOUT \
+    ARCH_REPO_PACKAGE_SIGNATURE_INVALID
 done < "$package_list"
 
 if mountpoint -q /mnt; then
@@ -390,7 +434,7 @@ run_step ARCH_TELEMETRY_PYTHON_VERIFY_FAILED arch-chroot /mnt python3 -m py_comp
 
 # Do not leave the ephemeral file:// repository configured on the installed system.
 cat > /mnt/etc/pacman.d/mirrorlist <<'EOF'
-Server = https://archive.archlinux.org/repos/2025/08/01/$repo/os/$arch
+Server = https://archive.archlinux.org/repos/2026/09/10/$repo/os/$arch
 EOF
 
 cat > /mnt/etc/default/grub <<'EOF'

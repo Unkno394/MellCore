@@ -2717,6 +2717,8 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
             "mksquashfs",
             "unsquashfs",
             "sha512sum",
+            "gpg",
+            "bsdtar",
         ]);
     }
     if profile == HighOsProfile::ubuntu_iso_ssh() {
@@ -2757,6 +2759,8 @@ fn high_vm_package_for_tool(platform: Platform, tool: &str) -> Option<&'static s
             "wimlib-imagex" => Some("wimtools"),
             "expect" => Some("expect"),
             "mksquashfs" | "unsquashfs" => Some("squashfs-tools"),
+            "gpg" => Some("gnupg"),
+            "bsdtar" => Some("libarchive-tools"),
             "setfacl" => Some("acl"),
             "packer" => Some("packer"),
             _ => None,
@@ -2779,6 +2783,8 @@ fn high_vm_package_for_tool(platform: Platform, tool: &str) -> Option<&'static s
             "wimlib-imagex" => Some("wimlib"),
             "expect" => Some("expect"),
             "mksquashfs" | "unsquashfs" => Some("squashfs-tools"),
+            "gpg" => Some("gnupg2"),
+            "bsdtar" => Some("bsdtar"),
             "setfacl" => Some("acl"),
             "packer" => Some("packer"),
             _ => None,
@@ -2800,6 +2806,8 @@ fn high_vm_package_for_tool(platform: Platform, tool: &str) -> Option<&'static s
             "wimlib-imagex" => Some("wimlib"),
             "expect" => Some("expect"),
             "mksquashfs" | "unsquashfs" => Some("squashfs-tools"),
+            "gpg" => Some("gnupg"),
+            "bsdtar" => Some("libarchive"),
             "setfacl" => Some("acl"),
             "packer" => Some("packer"),
             _ => None,
@@ -3515,9 +3523,15 @@ mod tests {
         assert!(arch_iso.contains(&"mksquashfs"));
         assert!(arch_iso.contains(&"unsquashfs"));
         assert!(arch_iso.contains(&"sha512sum"));
+        assert!(arch_iso.contains(&"gpg"));
+        assert!(arch_iso.contains(&"bsdtar"));
         assert_eq!(
             high_vm_package_for_tool(Platform::Debian, "mksquashfs"),
             Some("squashfs-tools")
+        );
+        assert_eq!(
+            high_vm_package_for_tool(Platform::Debian, "bsdtar"),
+            Some("libarchive-tools")
         );
 
         let custom_iso = high_vm_required_tools(HighOsProfile::custom_linux_iso_ssh(), true);
