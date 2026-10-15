@@ -1,0 +1,12 @@
+[Match]
+Name=en* eth*
+Type=ether
+
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=no
+LinkLocalAddressing=no
+
+[DHCPv4]
+UseDNS=no
+UseNTP=no

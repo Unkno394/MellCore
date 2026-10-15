@@ -1,6 +1,8 @@
 version: 2
 ethernets:
-  ens3:
+  virtio0:
+    match:
+      driver: virtio_net
     dhcp4: true
     dhcp6: false
     accept-ra: false

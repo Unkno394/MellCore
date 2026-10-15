@@ -20,7 +20,9 @@ cloud-init настраивает уже присутствующий в trusted
 `sshd`. При первом запуске Agent сам скачивает
 официальный Ubuntu 24.04 amd64 cloud image в `/var/lib/honeyforge/images/`, сверяет SHA-256 с
 официальным `SHA256SUMS`, затем скрипт create-overlay создаёт из него QCOW2 overlay и cloud-init
-seed. Пользователь может передать путь к своему QCOW2 только как явный custom image.
+seed. Новый `DeployHighVm` принимает только agent-managed путь встроенного профиля; загрузка
+произвольных пользовательских образов не поддерживается. Старый `DeployHighUbuntu` сохранён для
+wire-совместимости с уже развёрнутыми Ubuntu trap.
 
 Запуск первой VM выполняет scripts/launch.sh:
 
@@ -36,7 +38,8 @@ seed. Пользователь может передать путь к свое�
     sh scripts/package-recipe.sh /tmp/hf-high-ubuntu-ssh.tar.gz
 
 и запускается с `HF_HIGH_UBUNTU_RECIPE_ARCHIVE=/tmp/hf-high-ubuntu-ssh.tar.gz`.
-Bootstrap распаковывает его в `/usr/local/lib/honeyforge/high-ubuntu-ssh`.
+Bootstrap распаковывает из него `high-ubuntu-ssh`, `high-arch-ssh` и `high-windows-rdp` в
+`/usr/local/lib/honeyforge/`; основной lifecycle выбирает recipe по типизированному OS profile.
 
 ## High telemetry v1
 
@@ -92,24 +95,42 @@ Host events пока не отправляются в Kazik. Store уже соз
 
 `$HF_STATE_DIR/traps/INSTANCE_UUID/high.json` хранит исходный deployment, desired state и
 последнюю lifecycle-ошибку. Deploy/repeated command сверяет реальный domain, telemetry channel,
-SSH и DNAT. Stop снимает DNAT и останавливает domain без удаления overlay. Reset удаляет runtime
+гостевой SSH/RDP service и DNAT. Stop снимает DNAT и останавливает domain без удаления overlay. Reset удаляет runtime
 и пересоздаёт чистый overlay по manifest. Remove удаляет domain, DNAT, runtime и manifest.
 После restart и затем с operational interval agent reconciles все High manifests. Это повторно
 устанавливает policy после перезагрузки UFW/Docker/libvirt и завершает прерванный Remove без
 воскрешения VM.
 
+### Автономный локальный режим hf-agent
+
+Для отдельного KVM test host High lifecycle и telemetry можно запустить без Center и
+production-регистрации:
+
+    sudo /usr/local/bin/hf-agent \
+      --standalone-high \
+      --state-dir /var/lib/honeyforge-standalone
+
+Режим требует отдельный state dir, не читает и не создаёт production `identity.json`, не
+подключает Hysteria/Kazik и принимает только High-команды. Команды помещаются JSON-файлами в
+`/var/lib/honeyforge-standalone/inbox/`; успешно обработанные файлы перемещаются в `processed/`,
+ошибочные — в `failed/`. `--command-file FILE --once` подходит для одной lifecycle-операции, но
+после её завершения процесс уже не собирает telemetry. Для E2E оставляйте процесс запущенным либо
+используйте отдельный локальный systemd unit с той же командой. Stop, Reset и Remove в этом режиме
+разрешены только для High manifest из standalone state dir; агент не применяет legacy/Compose
+fallback к неизвестной VM.
+
 Раз в 30 секунд (настраивается `HF_HIGH_OPERATIONAL_INTERVAL_SECONDS`, минимум 5) agent заменяет
 `$HF_STATE_DIR/high/INSTANCE_UUID/operational.json`. Это bounded current-state snapshot:
 domain state, CPU time и рассчитанную по delta aggregate vCPU utilization, memory, disk bytes,
-aggregate RX/TX, uptime, SSH/DNAT/QGA readiness,
+aggregate RX/TX, uptime, profile-aware SSH/RDP, DNAT и QGA readiness,
 последняя lifecycle-ошибка и свежесть sensor heartbeat. Эти host-side данные продолжают
 обновляться при остановленном guest sensor, но не заменяют flow-level network telemetry.
 
 Isolated bridge разрешает гостям только DHCP к host, блокирует guest→host INPUT, IPv6 и любой
-guest-initiated FORWARD к LAN/management сетям. Входящий DNAT разрешает только SSH конкретной VM,
+guest-initiated FORWARD к LAN/management сетям. Входящий DNAT разрешает только сервис конкретной VM,
 не применяется к пакетам с High bridge и не может занять management SSH port 2222. Выделенные
 цепочки вставляются перед UFW/Docker/libvirt policy и идемпотентно переустанавливаются при
-публикации SSH после restart; virtio channel bridge не использует.
+публикации сервиса после restart; virtio channel bridge не использует.
 
 Пароль `analyst` генерируется отдельно для каждого overlay. В seed хранится только SHA-512 hash,
 а исходный пароль доступен root на KVM host в

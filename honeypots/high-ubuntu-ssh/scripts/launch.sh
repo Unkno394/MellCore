@@ -35,6 +35,22 @@ trap cleanup_failed_launch EXIT INT TERM
 
 sh "$script_dir/create-overlay.sh" "$base_image" "$instance_dir" "$instance_id"
 
+# Operator-provided images are cached below the agent state directory with mode 0600. Grant only
+# the libvirt worker the traversal/read access needed for this VM; no directory is made public.
+if command -v setfacl >/dev/null 2>&1; then
+  libvirt_user=${HF_HIGH_LIBVIRT_USER:-libvirt-qemu}
+  getent passwd "$libvirt_user" >/dev/null || {
+    echo "libvirt QEMU user does not exist: $libvirt_user" >&2
+    exit 1
+  }
+  setfacl -m "u:$libvirt_user:--x" \
+    "$(dirname "$root_dir")" "$root_dir" \
+    "$(dirname "$(dirname "$base_image")")" "$(dirname "$base_image")"
+  setfacl -m "u:$libvirt_user:r--" "$base_image" "$instance_dir/seed.iso"
+  setfacl -m "u:$libvirt_user:rw-" "$instance_dir/disk.qcow2"
+  setfacl -m "u:$libvirt_user:rwx" "$instance_dir"
+fi
+
 virt-install \
   --name "$vm_name" \
   --memory 2048 \

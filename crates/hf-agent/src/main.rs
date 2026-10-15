@@ -10,6 +10,7 @@ use std::{
 };
 
 mod emergency;
+mod high_image;
 #[cfg(unix)]
 mod high_telemetry;
 mod sandbox;
@@ -20,7 +21,7 @@ mod telemetry;
 use anyhow::Context;
 use clap::Parser;
 use hf_core::{
-    AgentCommand, AgentRegistration, CommandResult, CoreError, HighUbuntuDeployment,
+    AgentCommand, AgentRegistration, CommandResult, CoreError, HighOsProfile, HighVmDeployment,
     HysteriaConnection, KozyavkaDeployment, PacketTransport, PritvoryashkaDeployment,
     RegisteredAgent, RegistrationTransport, SHARED_SSH_IDENTIFICATION, SharedTcpTrapKind,
     TcpPortGroup, TrapSpec,
@@ -32,17 +33,26 @@ use hf_services::{
 use kazik_protocol::{
     AckDisposition, Acknowledgement, AgentStatus, DurableOutbox, KazikBody, KazikEnvelope,
 };
-use sandbox::{HighDomainState, LibvirtSandboxManager, UbuntuSshVm, default_recipe_dir};
+use sandbox::{
+    HighDomainState, HighVm, LibvirtSandboxManager, default_image_for, default_recipe_dir,
+    is_supported_profile, profile_manifest_kind, profile_recipe_name,
+};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const CENTER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(75);
+const DEFAULT_STATE_DIR: &str = "/var/lib/honeyforge";
+const STANDALONE_IDENTITY_FILE: &str = "standalone-high-identity.json";
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long, env = "HF_CENTER_URL")]
-    center_url: String,
+    #[arg(
+        long,
+        env = "HF_CENTER_URL",
+        required_unless_present = "standalone_high"
+    )]
+    center_url: Option<String>,
     #[arg(
         long,
         env = "HF_ENROLLMENT_TOKEN_FILE",
@@ -50,9 +60,13 @@ struct Args {
     )]
     enrollment_token_file: String,
     /// Root-owned durable state: agent identity, transport credential and prepared trap projects.
-    #[arg(long, env = "HF_STATE_DIR", default_value = "/var/lib/honeyforge")]
+    #[arg(long, env = "HF_STATE_DIR", default_value = DEFAULT_STATE_DIR)]
     state_dir: PathBuf,
-    /// Register (if necessary) and stop. Useful for smoke tests; omit in systemd.
+    /// Run only the High VM lifecycle and local High telemetry without Center registration or
+    /// Kazik. A dedicated non-production --state-dir is mandatory.
+    #[arg(long, conflicts_with = "center_url")]
+    standalone_high: bool,
+    /// Initialize identity, apply an optional command and stop. Omit in systemd so telemetry runs.
     #[arg(long)]
     once: bool,
     /// Applies one decoded HFSP AgentCommand from a root-owned JSON file. This is the local
@@ -102,6 +116,13 @@ struct AgentIdentity {
     transport_credential: String,
     #[serde(default)]
     hysteria: Option<HysteriaConnection>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StandaloneHighIdentity {
+    version: u8,
+    agent_id: Uuid,
 }
 
 /// Infrastructure service. It owns project files but deliberately does not contain trap recipes.
@@ -155,7 +176,9 @@ enum HighDesiredState {
 struct HighRuntimeManifest {
     version: u8,
     kind: String,
-    deployment: HighUbuntuDeployment,
+    #[serde(default = "HighOsProfile::ubuntu_ssh")]
+    profile: HighOsProfile,
+    deployment: HighVmDeployment,
     desired_state: HighDesiredState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
@@ -523,7 +546,8 @@ impl ComposeProjectStore {
         }
         let manifest: HighRuntimeManifest = serde_json::from_slice(&fs::read(&path)?)?;
         if manifest.version != 1
-            || manifest.kind != "high_ubuntu_ssh"
+            || manifest.kind != profile_manifest_kind(manifest.profile)
+            || manifest.deployment.profile != manifest.profile
             || manifest.deployment.trap_id != trap_id
         {
             anyhow::bail!("invalid High manifest {}", path.display());
@@ -537,37 +561,110 @@ impl ComposeProjectStore {
         atomic_write(&path, &serde_json::to_vec_pretty(manifest)?)
     }
 
-    fn high_vm(deployment: &HighUbuntuDeployment) -> UbuntuSshVm {
-        UbuntuSshVm {
-            instance_id: deployment.trap_id,
-            base_image: PathBuf::from(&deployment.base_image),
-            external_ssh_port: deployment.external_ssh_port,
+    /// Standalone mode is deliberately narrower than the production command adapter. It may
+    /// create a new High VM, or manage a High VM whose manifest already lives in the dedicated
+    /// standalone state directory. It never falls back to Compose or legacy High teardown.
+    fn validate_standalone_high_command(&self, command: &AgentCommand) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            standalone_high_command(command),
+            "standalone High mode accepts only DeployHighVm, DeployHighUbuntu, ResetHighVm, ResetHighUbuntu, StopTrap and RemoveTrap"
+        );
+        let trap_id = match command {
+            AgentCommand::DeployHighVm(deployment) => deployment.trap_id,
+            AgentCommand::DeployHighUbuntu(deployment) => deployment.trap_id,
+            AgentCommand::ResetHighVm { trap_id, .. }
+            | AgentCommand::ResetHighUbuntu { trap_id, .. }
+            | AgentCommand::StopTrap { trap_id, .. }
+            | AgentCommand::RemoveTrap { trap_id, .. } => *trap_id,
+            _ => unreachable!("command kind was checked above"),
+        };
+        let manifest = self.load_high_manifest(trap_id)?;
+        match command {
+            AgentCommand::DeployHighVm(_) | AgentCommand::DeployHighUbuntu(_)
+                if manifest.is_none() =>
+            {
+                anyhow::ensure!(
+                    !self.has_high_runtime(trap_id),
+                    "refusing to adopt untracked High runtime {trap_id} in standalone mode"
+                );
+                anyhow::ensure!(
+                    !self.root.join(trap_id.to_string()).join("compose.yaml").exists(),
+                    "refusing to replace non-High trap {trap_id} in standalone mode"
+                );
+                anyhow::ensure!(
+                    self.high_manager().domain_state(trap_id)? == HighDomainState::Missing,
+                    "refusing to adopt existing libvirt domain hf-high-{trap_id} in standalone mode"
+                );
+            }
+            AgentCommand::ResetHighVm { .. }
+            | AgentCommand::ResetHighUbuntu { .. }
+            | AgentCommand::StopTrap { .. }
+            | AgentCommand::RemoveTrap { .. } => anyhow::ensure!(
+                manifest.is_some(),
+                "standalone mode can manage only High traps recorded in its own state directory"
+            ),
+            _ => {}
         }
+        Ok(())
     }
 
-    fn deploy_high(&self, deployment: HighUbuntuDeployment) -> anyhow::Result<()> {
-        if deployment.trap_id.is_nil()
-            || deployment.external_ssh_port == 0
-            || deployment.base_image.trim().is_empty()
-        {
-            anyhow::bail!("invalid High Ubuntu deployment command");
+    fn high_vm(deployment: &HighVmDeployment) -> HighVm {
+        HighVm::with_source(
+            deployment.trap_id,
+            PathBuf::from(&deployment.base_image),
+            deployment.external_service_port,
+            deployment.profile,
+            deployment.image_source.clone(),
+        )
+    }
+
+    /// High runtimes created before a manifest was persisted are Ubuntu-only.  Keep their
+    /// teardown path available while all newly persisted runtimes carry a full [`HighVm`].
+    fn legacy_ubuntu_vm(trap_id: uuid::Uuid) -> HighVm {
+        HighVm::ubuntu_ssh(trap_id, PathBuf::new(), 22)
+    }
+
+    fn deploy_high(
+        &self,
+        mut deployment: HighVmDeployment,
+        allow_existing_ubuntu_image: bool,
+    ) -> anyhow::Result<()> {
+        Self::validate_high_deployment(&deployment, allow_existing_ubuntu_image)?;
+        if let Some(source) = &deployment.image_source {
+            let state_dir = self
+                .root
+                .parent()
+                .unwrap_or(Path::new(DEFAULT_STATE_DIR));
+            deployment.base_image = high_image::materialize_image(
+                source,
+                deployment.profile,
+                &state_dir.join("images").join("custom"),
+            )?
+            .to_string_lossy()
+            .into_owned();
         }
         let changed = self
             .load_high_manifest(deployment.trap_id)?
             .is_some_and(|current| {
                 current.deployment.base_image != deployment.base_image
-                    || current.deployment.external_ssh_port != deployment.external_ssh_port
+                    || current.deployment.external_service_port != deployment.external_service_port
+                    || current.deployment.profile != deployment.profile
+                    || current.deployment.image_source != deployment.image_source
             });
         let mut manifest = HighRuntimeManifest {
             version: 1,
-            kind: "high_ubuntu_ssh".into(),
+            kind: profile_manifest_kind(deployment.profile).into(),
+            profile: deployment.profile,
             deployment: deployment.clone(),
             desired_state: HighDesiredState::Running,
             last_error: None,
         };
         self.save_high_manifest(&manifest)?;
         if changed {
-            if let Err(error) = self.high_manager().reset(deployment.trap_id) {
+            if let Err(error) = self
+                .high_manager()
+                .reset(&Self::high_vm(&deployment))
+            {
                 manifest.last_error = Some(error.to_string());
                 self.save_high_manifest(&manifest)?;
                 return Err(error);
@@ -583,6 +680,53 @@ impl ComposeProjectStore {
         result
     }
 
+    fn validate_high_deployment(
+        deployment: &HighVmDeployment,
+        allow_existing_ubuntu_image: bool,
+    ) -> anyhow::Result<()> {
+        if deployment.trap_id.is_nil()
+            || (deployment.external_service_port == 0
+                && deployment.profile != HighOsProfile::windows_rdp()
+                && deployment.profile != HighOsProfile::custom_linux_iso_ssh())
+        {
+            anyhow::bail!(
+                "HF_HIGH_ERROR code=DEPLOYMENT_INVALID stage=validation: trap id or service port is invalid"
+            );
+        }
+        if !is_supported_profile(deployment.profile) {
+            anyhow::bail!(
+                "HF_HIGH_ERROR code=PROFILE_UNSUPPORTED stage=validation: this High OS profile is not registered"
+            );
+        }
+        if allow_existing_ubuntu_image && deployment.profile != HighOsProfile::ubuntu_ssh() {
+            anyhow::bail!("legacy High deployment supports only Ubuntu SSH");
+        }
+        if (deployment.profile == HighOsProfile::custom_linux_qcow2_ssh()
+            || deployment.profile == HighOsProfile::custom_linux_iso_ssh())
+            && deployment.image_source.is_none()
+        {
+            anyhow::bail!(
+                "HF_HIGH_ERROR code=IMAGE_SOURCE_REQUIRED stage=validation: custom OS profiles require image_source"
+            );
+        }
+        if deployment.base_image.trim().is_empty() && deployment.image_source.is_none() {
+            anyhow::bail!(
+                "HF_HIGH_ERROR code=IMAGE_PATH_REQUIRED stage=validation: deployment has neither an agent-managed image path nor image_source"
+            );
+        }
+        if !allow_existing_ubuntu_image
+            && deployment.image_source.is_none()
+            && deployment.base_image != default_image_for(deployment.profile)
+        {
+            anyhow::bail!(
+                "HF_HIGH_ERROR code=IMAGE_SOURCE_UNMANAGED stage=validation: High {} uses the agent-managed image path {}; provide image_source for a custom image",
+                profile_recipe_name(deployment.profile),
+                default_image_for(deployment.profile)
+            );
+        }
+        Ok(())
+    }
+
     fn reset_high(&self, trap_id: uuid::Uuid) -> anyhow::Result<()> {
         let mut manifest = self
             .load_high_manifest(trap_id)?
@@ -590,7 +734,10 @@ impl ComposeProjectStore {
         manifest.desired_state = HighDesiredState::Running;
         manifest.last_error = None;
         self.save_high_manifest(&manifest)?;
-        if let Err(error) = self.high_manager().reset(trap_id) {
+        if let Err(error) = self
+            .high_manager()
+            .reset(&Self::high_vm(&manifest.deployment))
+        {
             manifest.last_error = Some(error.to_string());
             self.save_high_manifest(&manifest)?;
             return Err(error);
@@ -612,7 +759,9 @@ impl ComposeProjectStore {
         manifest.desired_state = HighDesiredState::Stopped;
         manifest.last_error = None;
         self.save_high_manifest(&manifest)?;
-        let result = self.high_manager().stop(trap_id);
+        let result = self
+            .high_manager()
+            .stop(&Self::high_vm(&manifest.deployment));
         if let Err(error) = &result {
             manifest.last_error = Some(error.to_string());
             self.save_high_manifest(&manifest)?;
@@ -630,7 +779,10 @@ impl ComposeProjectStore {
         manifest.desired_state = HighDesiredState::Removing;
         manifest.last_error = None;
         self.save_high_manifest(&manifest)?;
-        if let Err(error) = self.high_manager().remove(trap_id) {
+        if let Err(error) = self
+            .high_manager()
+            .remove(&Self::high_vm(&manifest.deployment))
+        {
             manifest.last_error = Some(error.to_string());
             self.save_high_manifest(&manifest)?;
             return Err(error);
@@ -667,7 +819,7 @@ impl ComposeProjectStore {
             if manifest.desired_state == HighDesiredState::Removing {
                 match self
                     .high_manager()
-                    .remove(trap_id)
+                    .remove(&Self::high_vm(&manifest.deployment))
                     .and_then(|()| fs::remove_dir_all(entry.path()).map_err(anyhow::Error::from))
                 {
                     Ok(()) => {}
@@ -682,7 +834,10 @@ impl ComposeProjectStore {
             let desired_running = manifest.desired_state == HighDesiredState::Running;
             match self
                 .high_manager()
-                .reconcile(&Self::high_vm(&manifest.deployment), desired_running)
+                .reconcile(
+                    &Self::high_vm(&manifest.deployment),
+                    desired_running,
+                )
             {
                 Ok(()) => {
                     manifest.last_error = None;
@@ -699,16 +854,34 @@ impl ComposeProjectStore {
 
     fn cached_command_is_satisfied(&self, command: &AgentCommand) -> anyhow::Result<bool> {
         match command {
+            AgentCommand::DeployHighVm(deployment) => {
+                let Some(manifest) = self.load_high_manifest(deployment.trap_id)? else {
+                    return Ok(false);
+                };
+                Ok(manifest.desired_state == HighDesiredState::Running
+                    && manifest.deployment.base_image == deployment.base_image
+                    && manifest.deployment.external_service_port
+                        == deployment.external_service_port
+                    && manifest.deployment.profile == deployment.profile
+                    && manifest.deployment.image_source == deployment.image_source
+                    && self
+                        .high_manager()
+                        .healthy(&Self::high_vm(&manifest.deployment))?)
+            }
             AgentCommand::DeployHighUbuntu(deployment) => {
                 let Some(manifest) = self.load_high_manifest(deployment.trap_id)? else {
                     return Ok(false);
                 };
                 Ok(manifest.desired_state == HighDesiredState::Running
+                    && manifest.deployment.base_image == deployment.base_image
+                    && manifest.deployment.external_service_port == deployment.external_ssh_port
+                    && manifest.deployment.profile == HighOsProfile::ubuntu_ssh()
                     && self
                         .high_manager()
                         .healthy(&Self::high_vm(&manifest.deployment))?)
             }
-            AgentCommand::ResetHighUbuntu { trap_id, .. } => {
+            AgentCommand::ResetHighVm { trap_id, .. }
+            | AgentCommand::ResetHighUbuntu { trap_id, .. } => {
                 let Some(manifest) = self.load_high_manifest(*trap_id)? else {
                     return Ok(false);
                 };
@@ -721,7 +894,9 @@ impl ComposeProjectStore {
                 if let Some(manifest) = self.load_high_manifest(*trap_id)? {
                     Ok(manifest.desired_state == HighDesiredState::Stopped
                         && self.high_manager().domain_state(*trap_id)? == HighDomainState::Stopped
-                        && !self.high_manager().has_dnat(*trap_id))
+                        && !self
+                            .high_manager()
+                            .service_is_published(&Self::high_vm(&manifest.deployment)))
                 } else if self.has_high_runtime(*trap_id) {
                     Ok(
                         self.high_manager().domain_state(*trap_id)? == HighDomainState::Stopped
@@ -801,8 +976,10 @@ impl ComposeProjectStore {
         let trap_id = match &command {
             AgentCommand::DeployKozyavka(deployment) => deployment.trap_id,
             AgentCommand::DeployPritvoryashka(deployment) => deployment.trap_id,
+            AgentCommand::DeployHighVm(deployment) => deployment.trap_id,
             AgentCommand::DeployHighUbuntu(deployment) => deployment.trap_id,
-            AgentCommand::ResetHighUbuntu { trap_id, .. } => *trap_id,
+            AgentCommand::ResetHighVm { trap_id, .. }
+            | AgentCommand::ResetHighUbuntu { trap_id, .. } => *trap_id,
             AgentCommand::ReconcileTcpPortGroup(group) => {
                 group
                     .members
@@ -878,11 +1055,19 @@ impl ComposeProjectStore {
                     identity.as_deref(),
                 )
             }
-            AgentCommand::DeployHighUbuntu(deployment) => {
-                ensure_high_vm_runtime()?;
-                self.deploy_high(deployment)
+            AgentCommand::DeployHighVm(deployment) => {
+                Self::validate_high_deployment(&deployment, false)?;
+                ensure_high_vm_runtime(deployment.profile, deployment.image_source.is_some())?;
+                self.deploy_high(deployment, false)
             }
-            AgentCommand::ResetHighUbuntu { trap_id, .. } => self.reset_high(trap_id),
+            AgentCommand::DeployHighUbuntu(deployment) => {
+                let deployment: HighVmDeployment = deployment.into();
+                Self::validate_high_deployment(&deployment, true)?;
+                ensure_high_vm_runtime(HighOsProfile::ubuntu_ssh(), false)?;
+                self.deploy_high(deployment, true)
+            }
+            AgentCommand::ResetHighVm { trap_id, .. }
+            | AgentCommand::ResetHighUbuntu { trap_id, .. } => self.reset_high(trap_id),
             AgentCommand::ReconcileTcpPortGroup(group) => {
                 ensure_docker_runtime()?;
                 self.reconcile_tcp_port_group(group, kozyavka_image, pritvoryashka_image, agent_id)
@@ -978,7 +1163,7 @@ impl ComposeProjectStore {
                 if high_manifest.is_some() {
                     self.stop_high(trap_id)
                 } else if high_runtime {
-                    self.high_manager().stop(trap_id)
+                    self.high_manager().stop(&Self::legacy_ubuntu_vm(trap_id))
                 } else {
                     let manifest = self.root.join(trap_id.to_string()).join("manifest.json");
                     let shared = fs::read(manifest)
@@ -998,7 +1183,7 @@ impl ComposeProjectStore {
                 if high_manifest.is_some() {
                     self.remove_high(trap_id)
                 } else if high_runtime {
-                    self.high_manager().remove(trap_id)
+                    self.high_manager().remove(&Self::legacy_ubuntu_vm(trap_id))
                 } else if deferred_remove {
                     self.prepare_remove(trap_id)
                 } else {
@@ -1854,47 +2039,69 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    if args.standalone_high {
+        validate_standalone_high_args(&args)?;
+    }
     fs::create_dir_all(&args.state_dir)?;
-    if let Err(error) = emergency::install(&args.state_dir) {
+    if args.standalone_high {
+        secure_standalone_high_state_dir(&args.state_dir)?;
+    }
+    if !args.standalone_high
+        && let Err(error) = emergency::install(&args.state_dir)
+    {
         if emergency::armed() {
             return Err(error.context("armed emergency service could not be installed"));
         }
         tracing::warn!(%error, "emergency service installation failed; monitoring will continue unarmed");
     }
     let identity_path = args.state_dir.join("identity.json");
-    let identity = match load_identity(&identity_path)? {
-        Some(identity) => identity,
-        None => {
-            tracing::info!("no local identity found; registering agent with center");
-            let token = fs::read_to_string(&args.enrollment_token_file)?
-                .trim()
-                .to_owned();
-            let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into());
-            let transport = HttpRegistrationTransport {
-                client: reqwest::Client::new(),
-                center_url: args.center_url,
-            };
-            let agent = transport
-                .register(AgentRegistration {
-                    enrollment_token: token,
-                    hostname,
-                    agent_version: env!("CARGO_PKG_VERSION").into(),
-                })
-                .await?;
-            tracing::info!(agent_id = %agent.agent_id, "registration accepted by center");
-            let identity = AgentIdentity {
-                agent_id: agent.agent_id,
-                transport_credential: agent.transport_credential,
-                hysteria: agent.hysteria,
-            };
-            atomic_write(&identity_path, &serde_json::to_vec(&identity)?)?;
-            identity
+    let identity = if args.standalone_high {
+        let identity = load_or_create_standalone_high_identity(&args.state_dir)?;
+        tracing::info!(
+            agent_id = %identity.agent_id,
+            state_dir = %args.state_dir.display(),
+            "standalone High mode started without Center registration"
+        );
+        identity
+    } else {
+        let identity = match load_identity(&identity_path)? {
+            Some(identity) => identity,
+            None => {
+                tracing::info!("no local identity found; registering agent with center");
+                let token = fs::read_to_string(&args.enrollment_token_file)?
+                    .trim()
+                    .to_owned();
+                let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into());
+                let transport = HttpRegistrationTransport {
+                    client: reqwest::Client::new(),
+                    center_url: args
+                        .center_url
+                        .clone()
+                        .expect("clap requires Center URL outside standalone mode"),
+                };
+                let agent = transport
+                    .register(AgentRegistration {
+                        enrollment_token: token,
+                        hostname,
+                        agent_version: env!("CARGO_PKG_VERSION").into(),
+                    })
+                    .await?;
+                tracing::info!(agent_id = %agent.agent_id, "registration accepted by center");
+                let identity = AgentIdentity {
+                    agent_id: agent.agent_id,
+                    transport_credential: agent.transport_credential,
+                    hysteria: agent.hysteria,
+                };
+                atomic_write(&identity_path, &serde_json::to_vec(&identity)?)?;
+                identity
+            }
+        };
+        tracing::info!(agent_id = %identity.agent_id, "agent is registered and running");
+        if let Some(connection) = &identity.hysteria {
+            ensure_hysteria_client(connection, &identity.transport_credential)?;
         }
+        identity
     };
-    tracing::info!(agent_id = %identity.agent_id, "agent is registered and running");
-    if let Some(connection) = &identity.hysteria {
-        ensure_hysteria_client(connection, &identity.transport_credential)?;
-    }
     let compose_projects = ComposeProjectStore::new(&args.state_dir);
     fs::create_dir_all(&compose_projects.root)?;
     if emergency::pending(&args.state_dir)?.is_none() {
@@ -1913,6 +2120,9 @@ async fn main() -> anyhow::Result<()> {
             "confirmed security incident blocks local commands"
         );
         let command: AgentCommand = serde_json::from_slice(&fs::read(command_file)?)?;
+        if args.standalone_high {
+            compose_projects.validate_standalone_high_command(&command)?;
+        }
         let deferred_remove = compose_remove_id(&compose_projects, &command);
         let mut result = compose_projects.apply(
             command,
@@ -2004,6 +2214,7 @@ async fn main() -> anyhow::Result<()> {
                 &args.kozyavka_image,
                 &args.pritvoryashka_image,
                 &identity,
+                args.standalone_high,
             );
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -2134,6 +2345,7 @@ async fn run_kazik_hysteria_loop(
                 kozyavka_image,
                 pritvoryashka_image,
                 &identity,
+                false,
             );
         }
         let receiving_transport = transport.clone();
@@ -2666,15 +2878,60 @@ fn install_docker_ce_with_dnf() -> anyhow::Result<()> {
 }
 
 /// KVM/libvirt dependencies are separate from Docker because High runs a real guest VM.
-fn ensure_high_vm_runtime() -> anyhow::Result<()> {
-    let required_tools = [
+fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'static str> {
+    let mut required_tools = vec![
         "virsh",
         "virt-install",
         "qemu-img",
-        "cloud-localds",
         "iptables",
         "ss",
+        "openssl",
+        "sha256sum",
+        "python3",
+        "curl",
     ];
+    match profile.image_preparation {
+        hf_core::HighImagePreparation::CloudInitSeed => {
+            required_tools.extend(["cloud-localds", "base64"]);
+        }
+        hf_core::HighImagePreparation::UnattendedInstall => required_tools.push("xorriso"),
+        hf_core::HighImagePreparation::Sysprep => required_tools.push("xorriso"),
+        hf_core::HighImagePreparation::OfflineGuestPreparation => {}
+        hf_core::HighImagePreparation::BestEffortInstall => required_tools.push("xorriso"),
+    }
+    if custom_image {
+        required_tools.extend(["virt-inspector", "xorriso"]);
+    }
+    if profile == HighOsProfile::arch_linux_ssh() {
+        required_tools.push("virt-customize");
+    }
+    if profile == HighOsProfile::windows_rdp() {
+        required_tools.extend([
+            "packer",
+            "qemu-system-x86_64",
+            "virt-inspector",
+            "virt-cat",
+            "virt-ls",
+            "wimlib-imagex",
+        ]);
+    }
+    if matches!(
+        profile.guest_os,
+        hf_core::HighGuestOs::Debian
+            | hf_core::HighGuestOs::ArchLinux
+            | hf_core::HighGuestOs::Windows
+            | hf_core::HighGuestOs::CustomLinux
+    ) || custom_image
+    {
+        required_tools.push("setfacl");
+    }
+    required_tools
+}
+
+/// Install only the host tools needed by the selected adapter.  In particular, existing Ubuntu
+/// deployments do not acquire Windows ISO tooling as a side effect.
+fn ensure_high_vm_runtime(profile: HighOsProfile, custom_image: bool) -> anyhow::Result<()> {
+    let required_tools = high_vm_required_tools(profile, custom_image);
     let tools_ready = required_tools
         .iter()
         .all(|program| Command::new(program).arg("--version").output().is_ok());
@@ -2682,56 +2939,130 @@ fn ensure_high_vm_runtime() -> anyhow::Result<()> {
         match detect_platform()? {
             Platform::Debian => {
                 run_program("apt-get", &["update"])?;
-                run_program(
-                    "apt-get",
-                    &[
-                        "install",
-                        "-y",
-                        "qemu-kvm",
-                        "libvirt-daemon-system",
-                        "libvirt-clients",
-                        "virtinst",
-                        "cloud-image-utils",
-                        "iptables",
-                        "iproute2",
-                        "curl",
-                    ],
-                )?;
+                let mut packages = vec![
+                    "install",
+                    "-y",
+                    "qemu-kvm",
+                    "libvirt-daemon-system",
+                    "libvirt-clients",
+                    "virtinst",
+                    "iptables",
+                    "iproute2",
+                    "curl",
+                    "openssl",
+                    "coreutils",
+                    "python3",
+                ];
+                match profile.image_preparation {
+                    hf_core::HighImagePreparation::CloudInitSeed => {
+                        packages.push("cloud-image-utils")
+                    }
+                    hf_core::HighImagePreparation::UnattendedInstall => packages.push("xorriso"),
+                    hf_core::HighImagePreparation::Sysprep => packages.push("xorriso"),
+                    hf_core::HighImagePreparation::OfflineGuestPreparation => {}
+                    hf_core::HighImagePreparation::BestEffortInstall => packages.push("xorriso"),
+                }
+                if (custom_image || profile == HighOsProfile::arch_linux_ssh())
+                    && !packages.contains(&"libguestfs-tools")
+                {
+                    packages.push("libguestfs-tools");
+                }
+                if profile == HighOsProfile::windows_rdp() {
+                    packages.extend(["qemu-system-x86", "libguestfs-tools", "wimtools"]);
+                }
+                if custom_image {
+                    if !packages.contains(&"xorriso") {
+                        packages.push("xorriso");
+                    }
+                }
+                if required_tools.contains(&"setfacl") {
+                    packages.push("acl");
+                }
+                run_program("apt-get", &packages)?;
                 run_program("systemctl", &["enable", "--now", "libvirtd"])?;
             }
             Platform::Fedora | Platform::Rhel => {
-                run_program(
-                    "dnf",
-                    &[
-                        "install",
-                        "-y",
-                        "qemu-kvm",
-                        "libvirt",
-                        "virt-install",
-                        "cloud-utils",
-                        "iptables-nft",
-                        "curl",
-                    ],
-                )?;
+                let mut packages = vec![
+                    "install",
+                    "-y",
+                    "qemu-kvm",
+                    "libvirt",
+                    "virt-install",
+                    "iptables-nft",
+                    "iproute",
+                    "curl",
+                    "openssl",
+                    "coreutils",
+                    "python3",
+                ];
+                match profile.image_preparation {
+                    hf_core::HighImagePreparation::CloudInitSeed => {
+                        packages.push("cloud-utils")
+                    }
+                    hf_core::HighImagePreparation::UnattendedInstall => packages.push("xorriso"),
+                    hf_core::HighImagePreparation::Sysprep => packages.push("xorriso"),
+                    hf_core::HighImagePreparation::OfflineGuestPreparation => {}
+                    hf_core::HighImagePreparation::BestEffortInstall => packages.push("xorriso"),
+                }
+                if custom_image {
+                    packages.push("libguestfs-tools-c");
+                }
+                if profile == HighOsProfile::arch_linux_ssh() {
+                    packages.push("guestfs-tools");
+                }
+                if custom_image {
+                    if !packages.contains(&"xorriso") {
+                        packages.push("xorriso");
+                    }
+                }
+                if required_tools.contains(&"setfacl") {
+                    packages.push("acl");
+                }
+                run_program("dnf", &packages)?;
                 run_program("systemctl", &["enable", "--now", "libvirtd"])?;
             }
             Platform::Arch => {
-                run_program(
-                    "pacman",
-                    &[
-                        "-Sy",
-                        "--noconfirm",
-                        "qemu-desktop",
-                        "libvirt",
-                        "virt-install",
-                        "cloud-image-utils",
-                        "iptables-nft",
-                        "curl",
-                    ],
-                )?;
+                let mut packages = vec![
+                    "-Sy",
+                    "--noconfirm",
+                    "qemu-desktop",
+                    "libvirt",
+                    "virt-install",
+                    "iptables-nft",
+                    "iproute2",
+                    "curl",
+                    "openssl",
+                    "coreutils",
+                    "python",
+                ];
+                match profile.image_preparation {
+                    hf_core::HighImagePreparation::CloudInitSeed => {
+                        packages.push("cloud-image-utils")
+                    }
+                    hf_core::HighImagePreparation::UnattendedInstall => {
+                        packages.push("libisoburn")
+                    }
+                    hf_core::HighImagePreparation::Sysprep => packages.push("libisoburn"),
+                    hf_core::HighImagePreparation::OfflineGuestPreparation => {}
+                    hf_core::HighImagePreparation::BestEffortInstall => {
+                        packages.push("libisoburn")
+                    }
+                }
+                if custom_image || profile == HighOsProfile::arch_linux_ssh() {
+                    packages.push("libguestfs");
+                }
+                if custom_image {
+                    if !packages.contains(&"libisoburn") {
+                        packages.push("libisoburn");
+                    }
+                }
+                if required_tools.contains(&"setfacl") {
+                    packages.push("acl");
+                }
+                run_program("pacman", &packages)?;
                 run_program("systemctl", &["enable", "--now", "libvirtd"])?;
             }
-            Platform::Alpine => anyhow::bail!("High Ubuntu VM is not supported on Alpine yet"),
+            Platform::Alpine => anyhow::bail!("High VM runtime is not supported on Alpine yet"),
         }
     }
     anyhow::ensure!(
@@ -2876,6 +3207,7 @@ fn process_inbox(
     kozyavka_image: &str,
     pritvoryashka_image: &str,
     identity: &AgentIdentity,
+    standalone_high_only: bool,
 ) {
     let entries = match fs::read_dir(inbox) {
         Ok(entries) => entries,
@@ -2893,6 +3225,9 @@ fn process_inbox(
             .map_err(anyhow::Error::from)
             .and_then(|bytes| Ok(serde_json::from_slice::<AgentCommand>(&bytes)?))
             .and_then(|command| {
+                if standalone_high_only {
+                    projects.validate_standalone_high_command(&command)?;
+                }
                 let deferred_remove = compose_remove_id(projects, &command);
                 let result = projects.apply(
                     command,
@@ -2953,6 +3288,95 @@ fn load_identity(path: &Path) -> anyhow::Result<Option<AgentIdentity>> {
     }
 }
 
+fn validate_standalone_high_args(args: &Args) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.state_dir.is_absolute(),
+        "standalone High --state-dir must be absolute"
+    );
+    anyhow::ensure!(
+        args.state_dir != Path::new("/")
+            && !args.state_dir.starts_with(Path::new(DEFAULT_STATE_DIR)),
+        "standalone High requires a dedicated --state-dir outside {DEFAULT_STATE_DIR}"
+    );
+    anyhow::ensure!(
+        !args
+            .state_dir
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir)),
+        "standalone High --state-dir must not contain '..'"
+    );
+    anyhow::ensure!(
+        args.kazik_hysteria_socks.is_none() && args.kazik_center_udp.is_none(),
+        "standalone High mode does not permit Kazik transport settings"
+    );
+    Ok(())
+}
+
+fn secure_standalone_high_state_dir(state_dir: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(state_dir)?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+        "standalone High state path must be a real directory"
+    );
+    let canonical = fs::canonicalize(state_dir)?;
+    anyhow::ensure!(
+        canonical != Path::new("/"),
+        "standalone High state directory cannot be the filesystem root"
+    );
+    if let Ok(production) = fs::canonicalize(DEFAULT_STATE_DIR) {
+        anyhow::ensure!(
+            !canonical.starts_with(&production),
+            "standalone High state directory resolves inside production state {}",
+            production.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn standalone_high_command(command: &AgentCommand) -> bool {
+    matches!(
+        command,
+        AgentCommand::DeployHighVm(_)
+            | AgentCommand::DeployHighUbuntu(_)
+            | AgentCommand::ResetHighVm { .. }
+            | AgentCommand::ResetHighUbuntu { .. }
+            | AgentCommand::StopTrap { .. }
+            | AgentCommand::RemoveTrap { .. }
+    )
+}
+
+fn load_or_create_standalone_high_identity(state_dir: &Path) -> anyhow::Result<AgentIdentity> {
+    let path = state_dir.join(STANDALONE_IDENTITY_FILE);
+    let standalone = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<StandaloneHighIdentity>(&bytes)
+            .with_context(|| format!("invalid standalone identity {}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let identity = StandaloneHighIdentity {
+                version: 1,
+                agent_id: Uuid::new_v4(),
+            };
+            atomic_write(&path, &serde_json::to_vec_pretty(&identity)?)?;
+            identity
+        }
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        standalone.version == 1 && !standalone.agent_id.is_nil(),
+        "invalid standalone High identity {}",
+        path.display()
+    );
+    Ok(AgentIdentity {
+        agent_id: standalone.agent_id,
+        transport_credential: String::new(),
+        hysteria: None,
+    })
+}
+
 fn atomic_write(path: &Path, content: &[u8]) -> anyhow::Result<()> {
     let temporary = path.with_extension("tmp");
     let mut file = fs::File::create(&temporary)?;
@@ -3004,11 +3428,15 @@ fn set_shared_identity_permissions(path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentIdentity, ComposeProjectStore, DispatcherConfig, DispatcherListener,
-        DispatcherTarget, HighDesiredState, HighRuntimeManifest, Platform, QuarantineMarker,
-        SqliteKazikOutbox, compose_remove_id, enqueue_ack, parse_platform, quarantine_result,
+        AgentIdentity, Args, ComposeProjectStore, DispatcherConfig, DispatcherListener,
+        DispatcherTarget, HighDesiredState, HighOsProfile, HighRuntimeManifest, Platform,
+        QuarantineMarker, STANDALONE_IDENTITY_FILE, SqliteKazikOutbox, compose_remove_id,
+        default_image_for, enqueue_ack, high_vm_required_tools,
+        load_or_create_standalone_high_identity, parse_platform, quarantine_result,
+        standalone_high_command, validate_standalone_high_args,
     };
-    use hf_core::{AgentCommand, HighUbuntuDeployment};
+    use clap::Parser;
+    use hf_core::{AgentCommand, HighUbuntuDeployment, HighVmDeployment};
     use kazik_protocol::{AckDisposition, AgentStatus, DurableOutbox, KazikBody, KazikEnvelope};
     use std::fs;
 
@@ -3196,6 +3624,96 @@ mod tests {
     }
 
     #[test]
+    fn high_runtime_dependencies_follow_the_selected_profile() {
+        let ubuntu = high_vm_required_tools(HighOsProfile::ubuntu_ssh(), false);
+        assert!(ubuntu.contains(&"cloud-localds"));
+        assert!(ubuntu.contains(&"python3"));
+        assert!(!ubuntu.contains(&"xorriso"));
+        assert!(!ubuntu.contains(&"setfacl"));
+
+        let arch = high_vm_required_tools(HighOsProfile::arch_linux_ssh(), false);
+        assert!(arch.contains(&"cloud-localds"));
+        assert!(arch.contains(&"setfacl"));
+        assert!(arch.contains(&"virt-customize"));
+
+        let windows = high_vm_required_tools(HighOsProfile::windows_rdp(), false);
+        assert!(windows.contains(&"xorriso"));
+        assert!(windows.contains(&"setfacl"));
+        assert!(windows.contains(&"packer"));
+        assert!(windows.contains(&"wimlib-imagex"));
+        assert!(windows.contains(&"virt-inspector"));
+        assert!(!windows.contains(&"cloud-localds"));
+
+        let custom = high_vm_required_tools(HighOsProfile::debian_ssh(), true);
+        assert!(custom.contains(&"virt-inspector"));
+        assert!(custom.contains(&"xorriso"));
+        assert!(custom.contains(&"setfacl"));
+    }
+
+    #[test]
+    fn generic_high_deployment_rejects_arbitrary_image_paths_before_lifecycle() {
+        let directory =
+            std::env::temp_dir().join(format!("hf-high-managed-image-{}", Uuid::new_v4()));
+        let store = ComposeProjectStore::new(&directory);
+        let trap_id = Uuid::new_v4();
+        let error = store
+            .deploy_high(
+                HighVmDeployment {
+                    command_id: Uuid::new_v4(),
+                    trap_id,
+                    base_image: "/tmp/untrusted-arch.qcow2".into(),
+                    external_service_port: 2222,
+                    profile: HighOsProfile::arch_linux_ssh(),
+                    image_source: None,
+                },
+                false,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("code=IMAGE_SOURCE_UNMANAGED"));
+        assert!(!store.high_manifest_path(trap_id).exists());
+    }
+
+    #[test]
+    fn prepared_windows_accepts_host_only_rdp_without_an_external_port() {
+        let deployment = HighVmDeployment {
+            command_id: Uuid::new_v4(),
+            trap_id: Uuid::new_v4(),
+            base_image: default_image_for(HighOsProfile::windows_rdp()).into(),
+            external_service_port: 0,
+            profile: HighOsProfile::windows_rdp(),
+            image_source: None,
+        };
+        ComposeProjectStore::validate_high_deployment(&deployment, false).unwrap();
+
+        let mut legacy = deployment;
+        legacy.profile = HighOsProfile::windows_rdp_legacy_iso();
+        legacy.base_image = default_image_for(legacy.profile).into();
+        assert!(ComposeProjectStore::validate_high_deployment(&legacy, false).is_err());
+    }
+
+    #[test]
+    fn custom_iso_is_host_only_and_requires_a_verified_source() {
+        let mut deployment = HighVmDeployment {
+            command_id: Uuid::new_v4(),
+            trap_id: Uuid::new_v4(),
+            base_image: String::new(),
+            external_service_port: 0,
+            profile: HighOsProfile::custom_linux_iso_ssh(),
+            image_source: Some(hf_core::HighImageSource {
+                url: "https://images.example.invalid/installer.iso".into(),
+                sha256: "a".repeat(64),
+                format: hf_core::HighImageFormat::Iso,
+                architecture: hf_core::HighImageArchitecture::X86_64,
+            }),
+        };
+        ComposeProjectStore::validate_high_deployment(&deployment, false).unwrap();
+        deployment.image_source = None;
+        let error = ComposeProjectStore::validate_high_deployment(&deployment, false).unwrap_err();
+        assert!(error.to_string().contains("code=IMAGE_SOURCE_REQUIRED"));
+    }
+
+    #[test]
     fn high_manifest_round_trip_preserves_reset_configuration_and_desired_state() {
         let directory = std::env::temp_dir().join(format!("hf-high-manifest-{}", Uuid::new_v4()));
         let store = ComposeProjectStore::new(&directory);
@@ -3203,12 +3721,13 @@ mod tests {
         let manifest = HighRuntimeManifest {
             version: 1,
             kind: "high_ubuntu_ssh".into(),
+            profile: HighOsProfile::ubuntu_ssh(),
             deployment: HighUbuntuDeployment {
                 command_id: Uuid::new_v4(),
                 trap_id,
                 base_image: "/images/prepared.qcow2".into(),
                 external_ssh_port: 2222,
-            },
+            }.into(),
             desired_state: HighDesiredState::Stopped,
             last_error: Some("test error".into()),
         };
@@ -3218,8 +3737,34 @@ mod tests {
             recovered.deployment.base_image,
             manifest.deployment.base_image
         );
-        assert_eq!(recovered.deployment.external_ssh_port, 2222);
+        assert_eq!(recovered.deployment.external_service_port, 2222);
+        assert_eq!(recovered.profile, HighOsProfile::ubuntu_ssh());
         assert_eq!(recovered.desired_state, HighDesiredState::Stopped);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_high_manifest_defaults_to_the_ubuntu_profile() {
+        let directory = std::env::temp_dir().join(format!("hf-high-legacy-profile-{}", Uuid::new_v4()));
+        let store = ComposeProjectStore::new(&directory);
+        let trap_id = Uuid::new_v4();
+        let legacy = serde_json::json!({
+            "version": 1,
+            "kind": "high_ubuntu_ssh",
+            "deployment": {
+                "command_id": Uuid::new_v4(),
+                "trap_id": trap_id,
+                "base_image": "/images/prepared.qcow2",
+                "external_ssh_port": 2222,
+            },
+            "desired_state": "running",
+        });
+        let path = store.high_manifest_path(trap_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let recovered = store.load_high_manifest(trap_id).unwrap().unwrap();
+        assert_eq!(recovered.profile, HighOsProfile::ubuntu_ssh());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3231,12 +3776,13 @@ mod tests {
         let manifest = HighRuntimeManifest {
             version: 1,
             kind: "high_ubuntu_ssh".into(),
+            profile: HighOsProfile::ubuntu_ssh(),
             deployment: HighUbuntuDeployment {
                 command_id: Uuid::new_v4(),
                 trap_id,
                 base_image: "/images/prepared.qcow2".into(),
                 external_ssh_port: 22022,
-            },
+            }.into(),
             desired_state: HighDesiredState::Removing,
             last_error: None,
         };
@@ -3277,12 +3823,13 @@ mod tests {
             .save_high_manifest(&HighRuntimeManifest {
                 version: 1,
                 kind: "high_ubuntu_ssh".into(),
+                profile: HighOsProfile::ubuntu_ssh(),
                 deployment: HighUbuntuDeployment {
                     command_id: Uuid::new_v4(),
                     trap_id,
                     base_image: "/images/prepared.qcow2".into(),
                     external_ssh_port: 2222,
-                },
+                }.into(),
                 desired_state: HighDesiredState::Running,
                 last_error: None,
             })
@@ -3313,5 +3860,100 @@ mod tests {
 
         assert_eq!(compose_remove_id(&store, &command), None);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn standalone_cli_does_not_require_center_registration() {
+        let state_dir = std::env::temp_dir().join(format!("hf-high-cli-{}", Uuid::new_v4()));
+        let args = Args::try_parse_from([
+            "hf-agent",
+            "--standalone-high",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--once",
+        ])
+        .unwrap();
+        assert!(args.standalone_high);
+        assert!(args.center_url.is_none());
+        assert_eq!(args.state_dir, state_dir);
+    }
+
+    #[test]
+    fn standalone_cli_requires_a_non_production_state_directory() {
+        let args = Args::try_parse_from(["hf-agent", "--standalone-high", "--once"]).unwrap();
+        let error = validate_standalone_high_args(&args).unwrap_err();
+        assert!(error.to_string().contains("dedicated --state-dir"));
+    }
+
+    #[test]
+    fn production_cli_still_accepts_the_center_registration_path() {
+        let args = Args::try_parse_from([
+            "hf-agent",
+            "--center-url",
+            "https://center.test.invalid",
+            "--once",
+        ])
+        .unwrap();
+        assert!(!args.standalone_high);
+        assert_eq!(
+            args.center_url.as_deref(),
+            Some("https://center.test.invalid")
+        );
+    }
+
+    #[test]
+    fn standalone_identity_is_stable_and_separate_from_production_identity() {
+        let directory =
+            std::env::temp_dir().join(format!("hf-high-identity-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+
+        let first = load_or_create_standalone_high_identity(&directory).unwrap();
+        let second = load_or_create_standalone_high_identity(&directory).unwrap();
+
+        assert_eq!(first.agent_id, second.agent_id);
+        assert!(!first.agent_id.is_nil());
+        assert!(directory.join(STANDALONE_IDENTITY_FILE).is_file());
+        assert!(!directory.join("identity.json").exists());
+        assert!(first.transport_credential.is_empty());
+        assert!(first.hysteria.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn standalone_command_scope_rejects_low_and_middle_lifecycle() {
+        let high = AgentCommand::ResetHighVm {
+            command_id: Uuid::new_v4(),
+            trap_id: Uuid::new_v4(),
+        };
+        let low: AgentCommand = serde_json::from_value(serde_json::json!({
+            "type": "deploy_kozyavka",
+            "command_id": Uuid::new_v4(),
+            "trap_id": Uuid::new_v4(),
+            "host_port": 2222,
+            "container_port": 2222,
+            "banner": "SSH-2.0-test",
+            "resources": {"cpu_cores": 0.5, "memory_mb": 128, "pids": 64},
+            "publish_address": "127.0.0.1"
+        }))
+        .unwrap();
+
+        assert!(standalone_high_command(&high));
+        assert!(!standalone_high_command(&low));
+    }
+
+    #[test]
+    fn standalone_stop_cannot_fall_back_to_an_untracked_runtime() {
+        let directory =
+            std::env::temp_dir().join(format!("hf-high-scope-{}", Uuid::new_v4()));
+        let store = ComposeProjectStore::new(&directory);
+        let command = AgentCommand::StopTrap {
+            command_id: Uuid::new_v4(),
+            trap_id: Uuid::new_v4(),
+        };
+
+        let error = store
+            .validate_standalone_high_command(&command)
+            .unwrap_err();
+        assert!(error.to_string().contains("recorded in its own state directory"));
     }
 }

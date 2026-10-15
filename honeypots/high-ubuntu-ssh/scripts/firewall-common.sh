@@ -18,6 +18,54 @@ validate_instance_id() {
   fi
 }
 
+validate_publish_interface_name() {
+  value=$1
+  case "$value" in
+    ''|*[!A-Za-z0-9_.:-]*)
+      echo "invalid High publish interface: $value" >&2
+      return 1
+      ;;
+  esac
+  [ "${#value}" -le 15 ] || {
+    echo "High publish interface name is too long: $value" >&2
+    return 1
+  }
+  [ "$value" != lo ] && [ "$value" != "$HF_HIGH_BRIDGE" ] || {
+    echo "refusing High publication on isolated or loopback interface: $value" >&2
+    return 1
+  }
+}
+
+resolve_high_publish_interface() {
+  candidate=${HF_HIGH_PUBLISH_INTERFACE:-}
+  if [ -z "$candidate" ]; then
+    command -v ip >/dev/null
+    candidate=$(ip -4 route show default | awk '
+      $1 == "default" {
+        for (i = 1; i < NF; i++) {
+          if ($i == "dev" && !seen[$(i + 1)]++) {
+            count++
+            selected = $(i + 1)
+          }
+        }
+      }
+      END {
+        if (count == 1) print selected
+        else exit(count == 0 ? 1 : 2)
+      }
+    ') || {
+      echo "cannot select one High publish interface; set HF_HIGH_PUBLISH_INTERFACE" >&2
+      return 1
+    }
+  fi
+  validate_publish_interface_name "$candidate"
+  ip -o link show dev "$candidate" >/dev/null 2>&1 || {
+    echo "High publish interface does not exist: $candidate" >&2
+    return 1
+  }
+  printf '%s\n' "$candidate"
+}
+
 ipt() {
   iptables -w 5 "$@"
 }
@@ -77,6 +125,9 @@ apply_high_firewall_base() {
 
   ensure_chain filter "$HF_HIGH_INPUT_CHAIN"
   ipt -F "$HF_HIGH_INPUT_CHAIN"
+  # Allow only replies to connections initiated by the KVM host. A guest cannot manufacture
+  # ESTABLISHED state for a new guest-to-host flow, which still reaches the terminal DROP.
+  ipt -A "$HF_HIGH_INPUT_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
   ipt -A "$HF_HIGH_INPUT_CHAIN" -p udp --sport 68 --dport 67 -j ACCEPT
   ipt -A "$HF_HIGH_INPUT_CHAIN" -j DROP
   ensure_jump_first filter INPUT -i "$bridge" -j "$HF_HIGH_INPUT_CHAIN"
@@ -99,6 +150,7 @@ apply_high_firewall_base() {
   if command -v ip6tables >/dev/null 2>&1; then
     ensure_chain6 filter "$HF_HIGH_INPUT6_CHAIN"
     ip6t -F "$HF_HIGH_INPUT6_CHAIN"
+    ip6t -A "$HF_HIGH_INPUT6_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     ip6t -A "$HF_HIGH_INPUT6_CHAIN" -j DROP
     ensure_jump_first6 filter INPUT -i "$bridge" -j "$HF_HIGH_INPUT6_CHAIN"
 
@@ -129,5 +181,37 @@ nat_port_is_claimed_elsewhere() {
       }
     }
     END { exit(found ? 0 : 1) }
+  '
+}
+
+nat_port_has_only_expected_claim() {
+  candidate=$1
+  expected_chain=$2
+  expected_interface=$3
+  expected_destination=$4
+  iptables-save -t nat 2>/dev/null | awk \
+    -v port="$candidate" \
+    -v chain="$expected_chain" \
+    -v interface="$expected_interface" \
+    -v destination="$expected_destination" '
+    $1 == "-A" {
+      rule_chain = $2
+      rule_interface = ""
+      rule_destination = ""
+      rule_target = ""
+      rule_port = ""
+      for (i = 3; i <= NF; i++) {
+        if ($i == "-i") rule_interface = $(i + 1)
+        if ($i == "--dport") rule_port = $(i + 1)
+        if ($i == "-j") rule_target = $(i + 1)
+        if ($i == "--to-destination") rule_destination = $(i + 1)
+      }
+      if (rule_port == port) {
+        claims++
+        if (rule_chain == chain && rule_interface == interface &&
+            rule_target == "DNAT" && rule_destination == destination) expected++
+      }
+    }
+    END { exit(claims == 1 && expected == 1 ? 0 : 1) }
   '
 }
