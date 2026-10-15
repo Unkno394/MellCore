@@ -159,7 +159,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
                     self.assertIn("preseed/late_command", preseed)
                     self.assertIn("apt-setup/use_mirror boolean false", preseed)
 
-    def test_arch_media_rebuilds_one_rootfs_without_etc_conflict(self):
+    def test_arch_media_selects_bios_entry_before_pxe_and_rebuilds_rootfs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             fake_bin = root / "bin"
@@ -182,6 +182,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 "    mkdir -p \"$extract\"\n"
                 "    printf '%s\\n' 'DEFAULT select' 'TIMEOUT 150' 'INCLUDE archiso_head.cfg' 'INCLUDE archiso_sys-linux.cfg' > \"$extract/archiso_sys.cfg\"\n"
                 "    printf '%s\\n' 'SERIAL 0 115200' > \"$extract/archiso_head.cfg\"\n"
+                "    printf '%s\\n' 'LABEL arch64_nbd' '  LINUX /arch/boot/x86_64/vmlinuz-linux' '  INITRD /arch/boot/x86_64/initramfs-linux.img' '  APPEND archisobasedir=arch archiso_nbd_srv=192.0.2.1' > \"$extract/archiso_pxe-linux.cfg\"\n"
                 "    printf '%s\\n' 'LABEL arch64' '  LINUX /arch/boot/x86_64/vmlinuz-linux' '  INITRD /arch/boot/x86_64/initramfs-linux.img' '  APPEND archisobasedir=arch archisolabel=ARCH_202508' > \"$extract/archiso_sys-linux.cfg\"\n"
                 "    exit 0 ;;\n"
                 "  /arch/boot/x86_64/vmlinuz-linux|/arch/boot/x86_64/initramfs-linux.img|/EFI/BOOT/BOOTx64.EFI)\n"
@@ -267,7 +268,9 @@ class CustomIsoRecipeTests(unittest.TestCase):
             instance = root / "high" / INSTANCE_ID
             main = (instance / "boot-syslinux/archiso_sys.cfg").read_text()
             entry = (instance / "boot-syslinux/archiso_sys-linux.cfg").read_text()
+            pxe = (instance / "boot-syslinux/archiso_pxe-linux.cfg").read_text()
             self.assertIn("DEFAULT arch64", main)
+            self.assertNotIn("DEFAULT arch64_nbd", main)
             self.assertIn("PROMPT 0", main)
             self.assertIn("TIMEOUT 1", main)
             self.assertIn("SERIAL 0 115200", main)
@@ -276,6 +279,9 @@ class CustomIsoRecipeTests(unittest.TestCase):
             self.assertIn("console=ttyS0,115200n8", entry)
             self.assertIn("console=tty0", entry)
             self.assertIn("archisobasedir=arch", entry)
+            self.assertIn("LABEL arch64_nbd", pxe)
+            self.assertIn("archiso_nbd_srv=192.0.2.1", pxe)
+            self.assertNotIn("console=tty", pxe)
             calls = xorriso_log.read_text()
             self.assertIn("-extract /boot/syslinux", calls)
             self.assertIn("-extract /EFI/BOOT/BOOTx64.EFI", calls)
@@ -301,7 +307,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
             self.assertFalse((repack_capture / "etc_1").exists())
             self.assertEqual(
                 (instance / "unattended-arch.version").read_text().strip(),
-                "arch-serial-getty-v2",
+                "arch-serial-getty-v3",
             )
             self.assertEqual(hashlib.sha256(base.read_bytes()).hexdigest(), base_digest)
 

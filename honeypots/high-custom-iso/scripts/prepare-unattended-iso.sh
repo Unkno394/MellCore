@@ -8,7 +8,7 @@ validate_instance_id "$instance_id"
 case "$flavor" in ubuntu|debian|arch) ;; *) echo "unsupported unattended ISO flavor: $flavor" >&2; exit 1 ;; esac
 for command in xorriso openssl python3; do command -v "$command" >/dev/null; done
 [ -r "$base_iso" ]
-arch_recipe_revision=arch-serial-getty-v2
+arch_recipe_revision=arch-serial-getty-v3
 if [ "$flavor" = arch ]; then
   for command in mksquashfs unsquashfs sha512sum; do
     command -v "$command" >/dev/null || {
@@ -187,53 +187,71 @@ elif [ "$flavor" = arch ]; then
   python3 - "$syslinux_dir" <<'PY'
 import pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
-configs = sorted(root.rglob("*.cfg"))
 main = root / "archiso_sys.cfg"
 if not main.is_file():
     raise SystemExit("Arch SYSLINUX tree lacks archiso_sys.cfg")
+entry_path = root / "archiso_sys-linux.cfg"
+if not entry_path.is_file():
+    raise SystemExit("Arch SYSLINUX tree lacks archiso_sys-linux.cfg")
 
-selected = None
-for path in configs:
-    text = path.read_text(encoding="utf-8")
-    labels = list(re.finditer(r"(?mi)^\s*LABEL\s+(\S+)", text))
-    for index, label in enumerate(labels):
-        end = labels[index + 1].start() if index + 1 < len(labels) else len(text)
-        block = text[label.start():end]
-        if selected is None and "vmlinuz-linux" in block and "initramfs-linux.img" in block:
-            selected = (path, label.group(1), label.start(), end)
+main_text = main.read_text(encoding="utf-8")
+includes = re.findall(r"(?mi)^\s*INCLUDE\s+(\S+)", main_text)
+if not any(pathlib.PurePosixPath(value).name == entry_path.name for value in includes):
+    raise SystemExit("Arch archiso_sys.cfg does not include archiso_sys-linux.cfg")
 
-if selected is None:
-    raise SystemExit("Arch SYSLINUX config has no x86_64 live kernel entry")
-entry_path, default_label, start, end = selected
 entry_text = entry_path.read_text(encoding="utf-8")
+labels = list(re.finditer(r"(?mi)^\s*LABEL\s+(\S+)", entry_text))
+selected = [
+    (label, labels[index + 1].start() if index + 1 < len(labels) else len(entry_text))
+    for index, label in enumerate(labels)
+    if label.group(1) == "arch64"
+]
+if len(selected) != 1:
+    raise SystemExit("Arch archiso_sys-linux.cfg must contain exactly one LABEL arch64")
+label, end = selected[0]
+start = label.start()
 block = entry_text[start:end]
+if not re.search(r"(?mi)^\s*LINUX\s+/arch/boot/x86_64/vmlinuz-linux(?:\s|$)", block):
+    raise SystemExit("Arch BIOS label arch64 has an unexpected kernel")
+if not re.search(r"(?mi)^\s*INITRD\s+/arch/boot/x86_64/initramfs-linux\.img(?:\s|$)", block):
+    raise SystemExit("Arch BIOS label arch64 has an unexpected initramfs")
 append_pattern = re.compile(r"(?mi)^(\s*APPEND\s+)([^\r\n]*)")
 
 def serial_args(match):
-    args = match.group(2)
-    if "console=ttyS0" not in args:
-        args += " console=tty0 console=ttyS0,115200n8"
+    args = re.sub(
+        r"(?<!\S)console=tty(?:0|S0)(?:,[^\s]+)?(?=\s|$)",
+        "",
+        match.group(2),
+    )
+    args = " ".join(args.split()) + " console=tty0 console=ttyS0,115200n8"
     return match.group(1) + args
 
 block, append_count = append_pattern.subn(serial_args, block, count=1)
-if append_count != 1 or "console=ttyS0" not in block:
-    raise SystemExit("Arch SYSLINUX live entry has no usable APPEND directive for serial boot")
-entry_path.write_text(entry_text[:start] + block + entry_text[end:], encoding="utf-8")
+if append_count != 1:
+    raise SystemExit("Arch BIOS label arch64 has no unique APPEND directive")
+if not re.search(r"(?m)^\s*APPEND\s+.*\bconsole=tty0\b.*\bconsole=ttyS0,115200n8\b", block):
+    raise SystemExit("Arch BIOS label arch64 was not configured for the serial console")
+patched_entry = entry_text[:start] + block + entry_text[end:]
 
 # Avoid accumulating contradictory directives when an interrupted deployment is
 # retried against the same per-instance tree.
-main_text = main.read_text(encoding="utf-8")
 main_text = re.sub(
     r"(?mi)^\s*(?:DEFAULT|PROMPT|TIMEOUT|SERIAL)\b[^\r\n]*(?:\r?\n|$)",
     "",
     main_text,
 )
-main.write_text(
+patched_main = (
     "# HoneyForge deterministic serial boot\n"
-    f"SERIAL 0 115200\nDEFAULT {default_label}\nPROMPT 0\nTIMEOUT 1\n"
-    + main_text,
-    encoding="utf-8",
+    "SERIAL 0 115200\nDEFAULT arch64\nPROMPT 0\nTIMEOUT 1\n"
+    + main_text
 )
+if not re.search(r"(?m)^DEFAULT\s+arch64\s*$", patched_main):
+    raise SystemExit("Arch SYSLINUX default is not the BIOS label arch64")
+if not re.search(r"(?mi)^\s*LABEL\s+arch64\s*$", patched_entry):
+    raise SystemExit("Arch SYSLINUX default label is absent from archiso_sys-linux.cfg")
+
+entry_path.write_text(patched_entry, encoding="utf-8")
+main.write_text(patched_main, encoding="utf-8")
 PY
 
   # console=ttyS0 makes systemd-getty-generator instantiate serial-getty, but the
