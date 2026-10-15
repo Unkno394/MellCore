@@ -2672,6 +2672,9 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
     if profile == HighOsProfile::arch_linux_iso_ssh() {
         required_tools.extend(["expect", "virt-cat", "timeout"]);
     }
+    if profile == HighOsProfile::ubuntu_iso_ssh() {
+        required_tools.extend(["virt-cat", "timeout"]);
+    }
     if matches!(
         profile.guest_os,
         hf_core::HighGuestOs::Debian
@@ -3423,7 +3426,8 @@ mod tests {
         let ubuntu_iso = high_vm_required_tools(HighOsProfile::ubuntu_iso_ssh(), true);
         assert!(ubuntu_iso.contains(&"xorriso"));
         assert!(!ubuntu_iso.contains(&"expect"));
-        assert!(!ubuntu_iso.contains(&"virt-cat"));
+        assert!(ubuntu_iso.contains(&"virt-cat"));
+        assert!(ubuntu_iso.contains(&"timeout"));
         assert!(ubuntu_iso.contains(&"setfacl"));
 
         let debian_iso = high_vm_required_tools(HighOsProfile::debian_iso_ssh(), true);

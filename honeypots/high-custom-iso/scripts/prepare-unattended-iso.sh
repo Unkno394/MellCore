@@ -28,6 +28,10 @@ cp "$shared_guest_dir/90-honeyforge.rules" "$instance_dir/iso-payload/honeyforge
 printf 'instance-id: %s\nlocal-hostname: %s\n' "$instance_id" "$hostname" > "$instance_dir/iso-payload/nocloud/meta-data"
 
 if [ "$flavor" = ubuntu ]; then
+  offline_bundle=${HF_HIGH_UBUNTU_OFFLINE_BUNDLE:-$(dirname "$root_dir")/images/ubuntu-24.04-offline-packages}
+  sh "$script_dir/../../high-ubuntu-ssh/offline/build-package-bundle.sh" "$offline_bundle"
+  rm -rf "$instance_dir/iso-payload/honeyforge/offline-packages"
+  cp -a "$offline_bundle" "$instance_dir/iso-payload/honeyforge/offline-packages"
   cat > "$instance_dir/iso-payload/nocloud/user-data" <<EOF
 #cloud-config
 autoinstall:
@@ -36,6 +40,8 @@ autoinstall:
     update: no
   apt:
     fallback: offline-install
+  source:
+    id: ubuntu-server
   identity:
     hostname: $hostname
     username: analyst
@@ -46,9 +52,13 @@ autoinstall:
   storage:
     layout:
       name: direct
-  packages: [qemu-guest-agent, auditd, python3]
+  shutdown: poweroff
   late-commands:
     - install -d -m 0755 /target/usr/local/lib/honeyforge /target/etc/audit/rules.d /target/srv/operations/backups
+    - cp -a /cdrom/honeyforge/offline-packages /target/opt/honeyforge-offline-packages
+    - curtin in-target -- sh -c 'cd /opt/honeyforge-offline-packages && sha256sum -c SHA256SUMS && (dpkg -i ./*.deb || true)'
+    - curtin in-target -- sh -c 'cd /opt/honeyforge-offline-packages && dpkg -i ./*.deb'
+    - curtin in-target -- sh -c 'command -v qemu-ga && command -v auditctl && command -v python3 && command -v sshd'
     - cp /cdrom/honeyforge/high-telemetry-sensor /target/usr/local/lib/honeyforge/high-telemetry-sensor
     - cp /cdrom/honeyforge/high_telemetry_audit.py /target/usr/local/lib/honeyforge/high_telemetry_audit.py
     - cp /cdrom/honeyforge/high-telemetry.service /target/etc/systemd/system/high-telemetry.service
@@ -56,6 +66,7 @@ autoinstall:
     - curtin in-target -- chmod 0755 /usr/local/lib/honeyforge/high-telemetry-sensor
     - curtin in-target -- systemctl enable ssh qemu-guest-agent auditd high-telemetry.service
     - curtin in-target -- sh -c 'printf "%s\\n" installed > /etc/honeyforge-installed'
+    - rm -rf /target/opt/honeyforge-offline-packages
 EOF
   grub="$instance_dir/grub.cfg"
   xorriso -osirrox on -indev "$base_iso" -extract /boot/grub/grub.cfg "$grub" >/dev/null 2>&1 || {

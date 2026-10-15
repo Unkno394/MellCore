@@ -1,7 +1,10 @@
 # Reproducible offline guest preparation
 
-The runtime cloud-init seed performs no `apt update` and does not download packages. Build the
-package bundle on a disposable Ubuntu 24.04 amd64 staging host with repository access:
+The guest performs no `apt update` and does not download packages. For Ubuntu ISO deployments,
+`hf-agent` invokes the bundle builder on the host and caches the result under
+`/var/lib/honeyforge/images/ubuntu-24.04-offline-packages`. A trusted Ubuntu archive keyring is
+required; APT verifies signed Noble metadata and package hashes before the bundle is published.
+The same builder can also be run manually:
 
     sh offline/build-package-bundle.sh /srv/hf-bundles/noble-amd64
 

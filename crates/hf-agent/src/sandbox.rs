@@ -1,4 +1,5 @@
 use std::{
+    io::Read,
     net::{IpAddr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::Command,
@@ -524,6 +525,12 @@ impl LibvirtSandboxManager {
             lifecycle_error(code, stage, failure)
         })?;
         if let Err(error) = self.prepare_access_and_wait(vm) {
+            if preserve_installation_on_readiness_failure(vm.profile) {
+                // Preserve a completed or partially completed installation so an explicit retry
+                // or startup reconciliation can resume it.  Resetting here would destroy the
+                // installed disk merely because QGA/SSH/telemetry needed more time to start.
+                return Err(error);
+            }
             let cleanup = self.run(vm.profile, adapter.scripts.reset, &[&instance_id]);
             if let Err(cleanup_error) = cleanup {
                 return Err(anyhow::anyhow!(
@@ -587,13 +594,17 @@ impl LibvirtSandboxManager {
 
     pub fn healthy(&self, vm: &HighVm) -> anyhow::Result<bool> {
         let require_guest_agent = self.adapter_for(vm.profile)?.require_guest_agent;
+        let guest_ready = self.guest_service_ready(vm)
+            && (!require_guest_agent || self.guest_agent_ready(vm.instance_id))
+            && required_telemetry_unit(vm.profile).map_or(true, |unit| {
+                self.guest_systemd_unit_active(vm.instance_id, unit)
+            })
+            && self.installed_marker_ready(vm);
         Ok(high_running_health(
             self.domain_state(vm.instance_id)?,
             self.domain_matches_security_profile(vm)?,
             self.has_published_service(vm),
-            self.guest_service_ready(vm)
-                && (!require_guest_agent || self.guest_agent_ready(vm.instance_id))
-                && self.installed_marker_ready(vm),
+            guest_ready,
         ))
     }
 
@@ -787,12 +798,30 @@ impl LibvirtSandboxManager {
         let Ok(ip) = address.trim().parse::<IpAddr>() else {
             return false;
         };
-        let guest_port = match vm.profile.connection {
-            HighGuestConnection::Ssh { guest_port } | HighGuestConnection::Rdp { guest_port } => {
-                guest_port
+        let (guest_port, require_ssh_banner) = match vm.profile.connection {
+            HighGuestConnection::Ssh { guest_port } => {
+                (guest_port, vm.profile == HighOsProfile::ubuntu_iso_ssh())
             }
+            HighGuestConnection::Rdp { guest_port } => (guest_port, false),
         };
-        TcpStream::connect_timeout(&SocketAddr::new(ip, guest_port), Duration::from_secs(2)).is_ok()
+        let Ok(mut stream) =
+            TcpStream::connect_timeout(&SocketAddr::new(ip, guest_port), Duration::from_secs(2))
+        else {
+            return false;
+        };
+        if !require_ssh_banner {
+            return true;
+        }
+        if stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .is_err()
+        {
+            return false;
+        }
+        let mut banner = [0_u8; 255];
+        stream
+            .read(&mut banner)
+            .is_ok_and(|length| valid_ssh_banner(&banner[..length]))
     }
 
     fn installed_marker_ready(&self, vm: &HighVm) -> bool {
@@ -1094,11 +1123,19 @@ fn requires_installed_disk_marker(profile: HighOsProfile) -> bool {
         && profile.image_preparation == HighImagePreparation::UnattendedInstall
 }
 
+fn preserve_installation_on_readiness_failure(profile: HighOsProfile) -> bool {
+    profile == HighOsProfile::ubuntu_iso_ssh()
+}
+
 fn required_telemetry_unit(profile: HighOsProfile) -> Option<&'static str> {
     if !requires_installed_disk_marker(profile) || profile.guest_os == HighGuestOs::Windows {
         return None;
     }
     Some("high-telemetry.service")
+}
+
+fn valid_ssh_banner(banner: &[u8]) -> bool {
+    banner.starts_with(b"SSH-2.0-") || banner.starts_with(b"SSH-1.99-")
 }
 
 fn lifecycle_error(
@@ -1401,6 +1438,20 @@ mod tests {
             None
         );
         assert!(!requires_installed_disk_marker(HighOsProfile::ubuntu_ssh()));
+        assert!(preserve_installation_on_readiness_failure(
+            HighOsProfile::ubuntu_iso_ssh()
+        ));
+        assert!(!preserve_installation_on_readiness_failure(
+            HighOsProfile::ubuntu_ssh()
+        ));
+    }
+
+    #[test]
+    fn ssh_readiness_requires_an_openssh_protocol_banner() {
+        assert!(valid_ssh_banner(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu\r\n"));
+        assert!(valid_ssh_banner(b"SSH-1.99-compatible\r\n"));
+        assert!(!valid_ssh_banner(b"HTTP/1.1 200 OK\r\n"));
+        assert!(!valid_ssh_banner(b""));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import pathlib
+import hashlib
 import os
 import stat
 import subprocess
@@ -89,12 +90,26 @@ class CustomIsoRecipeTests(unittest.TestCase):
                     "[ -n \"$out\" ] && { : > \"$out\"; exit 0; }\n"
                     "exit 2\n",
                 )
+                executable(fake_bin / "dpkg-deb", "#!/bin/sh\nexit 0\n")
+                executable(fake_bin / "sha256sum", "#!/bin/sh\nexit 0\n")
+                bundle = root / "ubuntu-offline"
+                bundle.mkdir()
+                package = bundle / "qemu-guest-agent_fixture_amd64.deb"
+                package.write_bytes(b"test package fixture")
+                digest = hashlib.sha256(package.read_bytes()).hexdigest()
+                (bundle / "SHA256SUMS").write_text(
+                    f"{digest}  {package.name}\n", encoding="utf-8"
+                )
+                (bundle / "VERSIONS").write_text(
+                    "ubuntu_release=24.04\narchitecture=amd64\n", encoding="utf-8"
+                )
                 base = root / "source.iso"
                 base.write_bytes(b"verified fixture")
                 environment = dict(
                     os.environ,
                     PATH=f"{fake_bin}:{os.environ['PATH']}",
                     HF_HIGH_ROOT=str(root / "high"),
+                    HF_HIGH_UBUNTU_OFFLINE_BUNDLE=str(bundle),
                     FAKE_GRUB=grub,
                 )
                 subprocess.run(
@@ -126,10 +141,29 @@ class CustomIsoRecipeTests(unittest.TestCase):
                         "fallback: offline-install",
                         (instance / "iso-payload/nocloud/user-data").read_text(),
                     )
+                    user_data = (instance / "iso-payload/nocloud/user-data").read_text()
+                    self.assertNotIn("packages: [qemu-guest-agent", user_data)
+                    self.assertIn("sha256sum -c SHA256SUMS", user_data)
+                    self.assertIn("dpkg -i ./*.deb", user_data)
+                    self.assertIn("shutdown: poweroff", user_data)
                 if flavor == "debian":
                     preseed = (instance / "preseed.cfg").read_text()
                     self.assertIn("preseed/late_command", preseed)
                     self.assertIn("apt-setup/use_mirror boolean false", preseed)
+
+    def test_ubuntu_finalizer_requires_disk_boot_and_full_guest_readiness(self):
+        finalizer = (RECIPE / "scripts" / "finalize-linux-install.sh").read_text()
+        self.assertIn("wait_for_installer_poweroff", finalizer)
+        self.assertIn("disk_marker_ready", finalizer)
+        self.assertIn('change-media "$vm_name" "$target" --eject --config', finalizer)
+        self.assertIn('"guest-ping"', finalizer)
+        self.assertIn('"qemu-guest-agent.service"', finalizer)
+        self.assertIn('"high-telemetry.service"', finalizer)
+        self.assertIn('banner.startswith(b"SSH-2.0-")', finalizer)
+        self.assertLess(
+            finalizer.index('change-media "$vm_name" "$target" --eject --config'),
+            finalizer.rindex(': > "$instance_dir/installed-disk-verified"'),
+        )
 
 
 if __name__ == "__main__":
