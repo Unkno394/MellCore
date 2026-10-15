@@ -546,6 +546,16 @@ impl ComposeProjectStore {
                         return Err(error.into());
                     }
                 };
+            if let Err(error) =
+                ensure_high_vm_runtime(deployment.profile, deployment.image_source.as_ref())
+            {
+                self.transition_high_lifecycle(
+                    &mut manifest,
+                    HighLifecycleState::Failed,
+                    Some(error.to_string()),
+                )?;
+                return Err(error);
+            }
             Self::validate_high_deployment(&deployment, false)?;
         }
         let changed = previous.is_some_and(|current| {
@@ -2575,12 +2585,8 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
     } else if profile == HighOsProfile::windows_rdp_legacy_iso() {
         required_tools.push("wimlib-imagex");
     }
-    if profile == HighOsProfile::custom_linux_iso_ssh()
-        || profile == HighOsProfile::ubuntu_iso_ssh()
-        || profile == HighOsProfile::debian_iso_ssh()
-        || profile == HighOsProfile::arch_linux_iso_ssh()
-    {
-        required_tools.extend(["expect", "virt-cat"]);
+    if profile == HighOsProfile::arch_linux_iso_ssh() {
+        required_tools.extend(["expect", "virt-cat", "timeout"]);
     }
     if matches!(
         profile.guest_os,
@@ -2606,7 +2612,7 @@ fn high_vm_package_for_tool(platform: Platform, tool: &str) -> Option<&'static s
             "iptables" => Some("iptables"),
             "ss" => Some("iproute2"),
             "openssl" => Some("openssl"),
-            "sha256sum" | "base64" => Some("coreutils"),
+            "sha256sum" | "base64" | "timeout" => Some("coreutils"),
             "python3" => Some("python3"),
             "curl" => Some("curl"),
             "cloud-localds" => Some("cloud-image-utils"),
@@ -2629,7 +2635,7 @@ fn high_vm_package_for_tool(platform: Platform, tool: &str) -> Option<&'static s
             "iptables" => Some("iptables-nft"),
             "ss" => Some("iproute"),
             "openssl" => Some("openssl"),
-            "sha256sum" | "base64" => Some("coreutils"),
+            "sha256sum" | "base64" | "timeout" => Some("coreutils"),
             "python3" => Some("python3"),
             "curl" => Some("curl"),
             "cloud-localds" => Some("cloud-utils"),
@@ -2649,7 +2655,7 @@ fn high_vm_package_for_tool(platform: Platform, tool: &str) -> Option<&'static s
             "iptables" => Some("iptables-nft"),
             "ss" => Some("iproute2"),
             "openssl" => Some("openssl"),
-            "sha256sum" | "base64" => Some("coreutils"),
+            "sha256sum" | "base64" | "timeout" => Some("coreutils"),
             "python3" => Some("python"),
             "curl" => Some("curl"),
             "cloud-localds" => Some("cloud-image-utils"),
@@ -2700,11 +2706,24 @@ fn high_vm_missing_packages(
     Ok(packages)
 }
 
-fn high_tool_works(program: &str) -> bool {
-    Command::new(program)
-        .arg("--version")
+fn high_tool_probe_args(program: &str) -> &'static [&'static str] {
+    match program {
+        "expect" => &["-v"],
+        "openssl" => &["version"],
+        "ss" => &["-V"],
+        _ => &["--version"],
+    }
+}
+
+fn high_tool_works_at(program: &str, executable: &str) -> bool {
+    Command::new(executable)
+        .args(high_tool_probe_args(program))
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+fn high_tool_works(program: &str) -> bool {
+    high_tool_works_at(program, program)
 }
 
 fn libvirt_system_works() -> bool {
@@ -3139,13 +3158,13 @@ mod tests {
         Args, ComposeProjectStore, DispatcherConfig, DispatcherListener, DispatcherTarget,
         HighDesiredState, HighLifecycleState, HighOsProfile, HighRuntimeManifest, Platform,
         QuarantineMarker, STANDALONE_IDENTITY_FILE, compose_remove_id, default_image_for,
-        dependency_auto_install_from_value, high_vm_missing_packages, high_vm_required_tools,
-        load_or_create_standalone_high_identity, parse_platform, quarantine_result,
-        standalone_high_command, validate_standalone_high_args,
+        dependency_auto_install_from_value, high_tool_probe_args, high_tool_works_at,
+        high_vm_missing_packages, high_vm_required_tools, load_or_create_standalone_high_identity,
+        parse_platform, quarantine_result, standalone_high_command, validate_standalone_high_args,
     };
     use clap::Parser;
     use hf_core::{AgentCommand, HighUbuntuDeployment, HighVmDeployment};
-    use std::fs;
+    use std::{fs, os::unix::fs::PermissionsExt};
 
     use uuid::Uuid;
 
@@ -3317,12 +3336,44 @@ mod tests {
 
         let ubuntu_iso = high_vm_required_tools(HighOsProfile::ubuntu_iso_ssh(), true);
         assert!(ubuntu_iso.contains(&"xorriso"));
-        assert!(ubuntu_iso.contains(&"expect"));
-        assert!(ubuntu_iso.contains(&"virt-cat"));
+        assert!(!ubuntu_iso.contains(&"expect"));
+        assert!(!ubuntu_iso.contains(&"virt-cat"));
         assert!(ubuntu_iso.contains(&"setfacl"));
+
+        let debian_iso = high_vm_required_tools(HighOsProfile::debian_iso_ssh(), true);
+        assert!(!debian_iso.contains(&"expect"));
+        assert!(!debian_iso.contains(&"virt-cat"));
+
+        let arch_iso = high_vm_required_tools(HighOsProfile::arch_linux_iso_ssh(), true);
+        assert!(arch_iso.contains(&"expect"));
+        assert!(arch_iso.contains(&"virt-cat"));
+        assert!(arch_iso.contains(&"timeout"));
+
+        let custom_iso = high_vm_required_tools(HighOsProfile::custom_linux_iso_ssh(), true);
+        assert!(!custom_iso.contains(&"expect"));
+        assert!(!custom_iso.contains(&"virt-cat"));
 
         let windows_iso = high_vm_required_tools(HighOsProfile::windows_rdp_legacy_iso(), true);
         assert!(windows_iso.contains(&"wimlib-imagex"));
+    }
+
+    #[test]
+    fn expect_probe_uses_supported_version_flag() {
+        assert_eq!(high_tool_probe_args("expect"), &["-v"]);
+        assert_ne!(high_tool_probe_args("expect"), &["--version"]);
+
+        let directory = std::env::temp_dir().join(format!("hf-expect-probe-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let executable = directory.join("expect");
+        fs::write(
+            &executable,
+            "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = -v ]\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(high_tool_works_at("expect", executable.to_str().unwrap()));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
