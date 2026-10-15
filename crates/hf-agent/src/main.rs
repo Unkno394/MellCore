@@ -2857,7 +2857,29 @@ fn high_tool_works_at(program: &str, executable: &str) -> bool {
     Command::new(executable)
         .args(high_tool_probe_args(program))
         .output()
-        .is_ok_and(|output| output.status.success())
+        .is_ok_and(|output| {
+            if program != "unsquashfs" {
+                return output.status.success();
+            }
+
+            // squashfs-tools 4.7.x prints a valid version for `-version` but
+            // exits with status 1. Only tolerate that status when the actual
+            // unsquashfs version banner is present, so a missing or broken
+            // executable is not accepted as a working dependency.
+            if !output.status.success() && output.status.code() != Some(1) {
+                return false;
+            }
+            [&output.stdout, &output.stderr].iter().any(|stream| {
+                String::from_utf8_lossy(stream).lines().any(|line| {
+                    line.trim()
+                        .to_ascii_lowercase()
+                        .strip_prefix("unsquashfs version ")
+                        .is_some_and(|version| {
+                            version.starts_with(|character: char| character.is_ascii_digit())
+                        })
+                })
+            })
+        })
 }
 
 fn high_tool_works(program: &str) -> bool {
@@ -3524,6 +3546,51 @@ mod tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
 
         assert!(high_tool_works_at("expect", executable.to_str().unwrap()));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn unsquashfs_probe_accepts_version_banner_with_exit_one_only() {
+        let directory =
+            std::env::temp_dir().join(format!("hf-unsquashfs-probe-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+
+        let working = directory.join("working-unsquashfs");
+        fs::write(
+            &working,
+            "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = -version ] || exit 9\nprintf '%s\\n' 'unsquashfs version 4.7.5 (2025/04/12)' >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&working, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(high_tool_works_at(
+            "unsquashfs",
+            working.to_str().unwrap()
+        ));
+
+        let broken = directory.join("broken-unsquashfs");
+        fs::write(&broken, "#!/bin/sh\necho broken >&2\nexit 1\n").unwrap();
+        fs::set_permissions(&broken, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!high_tool_works_at(
+            "unsquashfs",
+            broken.to_str().unwrap()
+        ));
+
+        let failed = directory.join("failed-unsquashfs");
+        fs::write(
+            &failed,
+            "#!/bin/sh\necho 'unsquashfs version 4.7.5'\nexit 2\n",
+        )
+        .unwrap();
+        fs::set_permissions(&failed, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!high_tool_works_at(
+            "unsquashfs",
+            failed.to_str().unwrap()
+        ));
+        assert!(!high_tool_works_at(
+            "unsquashfs",
+            directory.join("missing").to_str().unwrap()
+        ));
+
         fs::remove_dir_all(directory).unwrap();
     }
 
