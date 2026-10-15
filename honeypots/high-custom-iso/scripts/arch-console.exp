@@ -51,6 +51,19 @@ proc fail_install {fd code message status} {
     exit $status
 }
 
+proc accept_install_result {fd diagnostic_log status failure_code failure_detail} {
+    if {$status eq "0"} { return }
+    if {$failure_code eq ""} {
+        set failure_code ARCH_GUEST_INSTALL_FAILED
+        set failure_detail "guest installer exited with status $status"
+    } else {
+        append failure_detail " (installer exit status $status)"
+    }
+    close $fd
+    puts stderr "HF_HIGH_ERROR code=$failure_code stage=installation: $failure_detail; sanitized log: $diagnostic_log"
+    exit 5
+}
+
 # Accept either the familiar root@archiso prompt or a bare root `#`, with common
 # ANSI CSI sequences around it. Requiring an otherwise empty terminal line keeps
 # hashes in kernel messages, progress output and comments from being treated as
@@ -90,6 +103,8 @@ send -- "\r"
 set login_attempts 0
 set empty_password_attempted 0
 set completed_before_prompt 0
+set installer_failure_code ""
+set installer_failure_detail ""
 set prompt_retry_seconds 5
 set root_deadline [expr {[clock milliseconds] + ($boot_timeout * 1000)}]
 while {1} {
@@ -101,28 +116,27 @@ while {1} {
     if {$timeout > $prompt_retry_seconds} { set timeout $prompt_retry_seconds }
     set root_seen 0
     expect {
-        -re {HF_INSTALL_COMPLETE} {
-            # Reconciliation can attach while the detached installer is still
-            # running. In that case there is deliberately no interactive prompt;
-            # accept only its explicit completion sentinel.
+        -re {(?:^|\r\n|\n|\r)HF_INSTALL_FAILED:([A-Z0-9_]+):([^\r\n]*)} {
             record_console $log_fd $expect_out(buffer)
+            set installer_failure_code $expect_out(1,string)
+            set installer_failure_detail $expect_out(2,string)
+            exp_continue -continue_timer
+        }
+        -re {(?:^|\r\n|\n|\r)HF_INSTALL_FAILED:([^\r\n]*)} {
+            record_console $log_fd $expect_out(buffer)
+            set installer_failure_code ARCH_GUEST_INSTALL_FAILED
+            set installer_failure_detail $expect_out(1,string)
+            exp_continue -continue_timer
+        }
+        -re {(?:^|\r\n|\n|\r)HF_INSTALL_RESULT:([0-9]+)(?:\r\n|\n|\r|$)} {
+            # The result record is written only after the guest installer exits.
+            # Its complete spelling never occurs in the command sent below, so
+            # terminal echo cannot be mistaken for completion.
+            record_console $log_fd $expect_out(buffer)
+            set installer_status $expect_out(1,string)
+            accept_install_result $log_fd $diagnostic_log $installer_status $installer_failure_code $installer_failure_detail
             set completed_before_prompt 1
             set root_seen 1
-        }
-        -re {HF_INSTALL_FAILED:([A-Z0-9_]+):([^\r\n]*)} {
-            record_console $log_fd $expect_out(buffer)
-            set failure_code $expect_out(1,string)
-            set failure_detail $expect_out(2,string)
-            close $log_fd
-            puts stderr "HF_HIGH_ERROR code=$failure_code stage=installation: $failure_detail; sanitized log: $diagnostic_log"
-            exit 5
-        }
-        -re {HF_INSTALL_FAILED:[^\r\n]*} {
-            record_console $log_fd $expect_out(buffer)
-            set failure $expect_out(0,string)
-            close $log_fd
-            puts stderr "HF_HIGH_ERROR code=ARCH_GUEST_INSTALL_FAILED stage=installation: $failure; sanitized log: $diagnostic_log"
-            exit 5
         }
         -re {(?i)archiso[[:space:]]+login:} {
             record_console $log_fd $expect_out(buffer)
@@ -218,26 +232,25 @@ while {$offset < $payload_length} {
     incr offset 768
 }
 
-send -- "base64 -d /tmp/hf-install.b64 > /tmp/hf-install.sh && rm -f /tmp/hf-install.b64 && chmod 0700 /tmp/hf-install.sh && if test -e /run/hf-installing; then while test -e /run/hf-installing; do sleep 5; done; test -e /mnt/etc/honeyforge-installed && echo HF_INSTALL_COMPLETE || echo HF_INSTALL_FAILED:previous-run; else : > /run/hf-installing; nohup /tmp/hf-install.sh >/dev/ttyS0 2>&1 & while test -e /run/hf-installing; do sleep 5; done; fi\r"
+send -- "base64 -d /tmp/hf-install.b64 > /tmp/hf-install.sh && rm -f /tmp/hf-install.b64 && chmod 0700 /tmp/hf-install.sh && if test -s /run/hf-install-result; then :; elif test -e /run/hf-installing; then while test -e /run/hf-installing; do sleep 5; done; else rm -f /run/hf-install-result /run/hf-install-result.tmp /run/hf-install-failure /run/hf-install-failure.tmp; : > /run/hf-installing; /tmp/hf-install.sh; hf_rc=\$?; printf '%s\\n' \"\$hf_rc\" > /run/hf-install-result.tmp && mv /run/hf-install-result.tmp /run/hf-install-result; rm -f /run/hf-installing; fi; hf_wait=0; while test ! -s /run/hf-install-result && test \"\$hf_wait\" -lt 3; do sleep 1; hf_wait=\$((hf_wait + 1)); done; if test -s /run/hf-install-failure; then IFS= read -r hf_failure < /run/hf-install-failure || hf_failure=unknown; printf 'HF_INSTALL_%s:%s\\n' FAILED \"\$hf_failure\"; fi; if test -s /run/hf-install-result; then IFS= read -r hf_rc < /run/hf-install-result || hf_rc=126; else hf_rc=125; fi; printf 'HF_INSTALL_%s:%s\\n' RESULT \"\$hf_rc\"\r"
 set timeout $install_timeout
 expect {
-    -re {HF_INSTALL_COMPLETE} {
+    -re {(?:^|\r\n|\n|\r)HF_INSTALL_FAILED:([A-Z0-9_]+):([^\r\n]*)} {
         record_console $log_fd $expect_out(buffer)
+        set installer_failure_code $expect_out(1,string)
+        set installer_failure_detail $expect_out(2,string)
+        exp_continue -continue_timer
     }
-    -re {HF_INSTALL_FAILED:([A-Z0-9_]+):([^\r\n]*)} {
+    -re {(?:^|\r\n|\n|\r)HF_INSTALL_FAILED:([^\r\n]*)} {
         record_console $log_fd $expect_out(buffer)
-        set failure_code $expect_out(1,string)
-        set failure_detail $expect_out(2,string)
-        close $log_fd
-        puts stderr "HF_HIGH_ERROR code=$failure_code stage=installation: $failure_detail; sanitized log: $diagnostic_log"
-        exit 5
+        set installer_failure_code ARCH_GUEST_INSTALL_FAILED
+        set installer_failure_detail $expect_out(1,string)
+        exp_continue -continue_timer
     }
-    -re {HF_INSTALL_FAILED:[^\r\n]*} {
+    -re {(?:^|\r\n|\n|\r)HF_INSTALL_RESULT:([0-9]+)(?:\r\n|\n|\r|$)} {
         record_console $log_fd $expect_out(buffer)
-        set failure $expect_out(0,string)
-        close $log_fd
-        puts stderr "HF_HIGH_ERROR code=ARCH_GUEST_INSTALL_FAILED stage=installation: $failure; sanitized log: $diagnostic_log"
-        exit 5
+        set installer_status $expect_out(1,string)
+        accept_install_result $log_fd $diagnostic_log $installer_status $installer_failure_code $installer_failure_detail
     }
     -re {\r\n|\n|\r} {
         record_console $log_fd $expect_out(buffer)

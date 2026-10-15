@@ -98,10 +98,13 @@ class CustomIsoRecipeTests(unittest.TestCase):
 
         console = (RECIPE / "scripts" / "arch-console.exp").read_text()
         self.assertIn("HF_INSTALL_FAILED:([A-Z0-9_]+)", console)
-        self.assertIn("code=$failure_code stage=installation", console)
+        self.assertIn("HF_INSTALL_RESULT:([0-9]+)", console)
+        self.assertIn("guest installer exited with status $status", console)
+        self.assertIn("/run/hf-install-result.tmp", console)
+        self.assertNotIn("test -e /mnt/etc/honeyforge-installed && echo HF_INSTALL_COMPLETE", console)
         self.assertIn("completed_before_prompt", console)
         self.assertLess(
-            console.index("-re {HF_INSTALL_COMPLETE}"),
+            console.index("HF_INSTALL_RESULT:([0-9]+)"),
             console.index("-re {(?i)archiso[[:space:]]+login:}"),
         )
 
@@ -659,7 +662,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 "    if line.startswith('base64 -d '): break\n"
                 "    raise SystemExit(13)\n"
                 "if chunks < 2: raise SystemExit(14)\n"
-                "emit('installing offline\\r\\nHF_INSTALL_COMPLETE\\r\\n')\n",
+                "emit('echo HF_INSTALL_COMPLETE\\r\\nHF_INSTALL_RESULT:0\\r\\n')\n",
             )
             payload_value = base64.b64encode(b"fixture" * 600).decode("ascii")
             payload = root / "payload.b64"
@@ -708,7 +711,7 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 "import sys\n"
                 "sys.stdout.write('Connected to domain fixture-vm\\r\\n'); sys.stdout.flush()\n"
                 "sys.stdin.readline()\n"
-                "sys.stdout.write('archinstall resumed\\r\\nHF_INSTALL_COMPLETE\\r\\n'); sys.stdout.flush()\n",
+                "sys.stdout.write('archinstall resumed\\r\\necho HF_INSTALL_COMPLETE\\r\\nHF_INSTALL_RESULT:0\\r\\n'); sys.stdout.flush()\n",
             )
             payload = root / "payload.b64"
             payload.write_text("Zml4dHVyZQ==", encoding="ascii")
@@ -734,7 +737,61 @@ class CustomIsoRecipeTests(unittest.TestCase):
                 timeout=10,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertIn("HF_INSTALL_COMPLETE", console_log.read_text(encoding="utf-8"))
+            self.assertIn("HF_INSTALL_RESULT:0", console_log.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(shutil.which("expect"), "expect is required for Arch console tests")
+    def test_arch_console_rejects_reflected_success_and_reports_installer_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            executable(
+                fake_bin / "virsh",
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "sys.stdout.write('Connected to domain fixture-vm\\r\\n'); sys.stdout.flush()\n"
+                "sys.stdin.readline()\n"
+                "sys.stdout.write('# \\r\\n'); sys.stdout.flush()\n"
+                "setup = sys.stdin.readline()\n"
+                "sys.stdout.write('HF_SERIAL_READY\\r\\n# \\r\\n'); sys.stdout.flush()\n"
+                "sys.stdin.readline(); sys.stdout.write('# \\r\\n'); sys.stdout.flush()\n"
+                "while True:\n"
+                "    line = sys.stdin.readline()\n"
+                "    if line.startswith(\"printf '%s' '\"):\n"
+                "        sys.stdout.write('# \\r\\n'); sys.stdout.flush(); continue\n"
+                "    if line.startswith('base64 -d '): break\n"
+                "    raise SystemExit(13)\n"
+                "sys.stdout.write('echo HF_INSTALL_COMPLETE\\r\\n')\n"
+                "sys.stdout.write('HF_INSTALL_FAILED:ARCH_FIXTURE_FAILED:package verification failed\\r\\n')\n"
+                "sys.stdout.write('HF_INSTALL_RESULT:23\\r\\n'); sys.stdout.flush()\n",
+            )
+            payload = root / "payload.b64"
+            payload.write_text(base64.b64encode(b"fixture" * 200).decode("ascii"), encoding="ascii")
+            console_log = root / "console.log"
+            console_log.write_text("", encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    shutil.which("expect"),
+                    str(RECIPE / "scripts" / "arch-console.exp"),
+                    "fixture-vm",
+                    str(payload),
+                    str(console_log),
+                ],
+                check=False,
+                env=dict(
+                    os.environ,
+                    PATH=f"{fake_bin}:{os.environ['PATH']}",
+                    HF_HIGH_INSTALL_TIMEOUT_SECONDS="10",
+                    HF_HIGH_ARCH_BOOT_TIMEOUT_SECONDS="5",
+                ),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(completed.returncode, 5, completed.stderr)
+            self.assertIn("code=ARCH_FIXTURE_FAILED", completed.stderr)
+            self.assertIn("package verification failed", completed.stderr)
+            self.assertIn("installer exit status 23", completed.stderr)
 
     @unittest.skipUnless(shutil.which("expect"), "expect is required for Arch console tests")
     def test_arch_console_root_wait_has_diagnostic_timeout(self):

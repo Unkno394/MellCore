@@ -8,9 +8,16 @@ root_partition=${disk}1
 current_step=ARCH_INSTALL_INITIALIZATION
 failure_reported=false
 
+persist_failure() {
+  umask 077
+  printf '%s:%s\n' "$1" "$2" > /run/hf-install-failure.tmp &&
+    mv /run/hf-install-failure.tmp /run/hf-install-failure || true
+}
+
 fail_install() {
   current_step=$1
   failure_reported=true
+  persist_failure "$1" "$2"
   echo "HF_INSTALL_FAILED:$1:$2" >&2
   exit 1
 }
@@ -26,6 +33,7 @@ finish_or_report() {
   trap - EXIT
   rm -f /run/hf-installing || true
   if [ "$status" -ne 0 ] && [ "$failure_reported" = false ]; then
+    persist_failure "$current_step" "unexpected command failure"
     echo "HF_INSTALL_FAILED:$current_step:unexpected command failure" >&2
   fi
   exit "$status"

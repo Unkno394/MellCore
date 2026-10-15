@@ -9,9 +9,16 @@ repo_mount=/run/hf-arch-repo
 current_step=ARCHINSTALL_INITIALIZATION
 failure_reported=false
 
+persist_failure() {
+  umask 077
+  printf '%s:%s\n' "$1" "$2" > /run/hf-install-failure.tmp &&
+    mv /run/hf-install-failure.tmp /run/hf-install-failure || true
+}
+
 fail_install() {
   current_step=$1
   failure_reported=true
+  persist_failure "$1" "$2"
   echo "HF_INSTALL_FAILED:$1:$2" >&2
   exit 1
 }
@@ -29,6 +36,7 @@ finish_or_report() {
   mountpoint -q /mnt && umount -R /mnt >/dev/null 2>&1 || true
   mountpoint -q "$repo_mount" && umount "$repo_mount" >/dev/null 2>&1 || true
   if [ "$status" -ne 0 ] && [ "$failure_reported" = false ]; then
+    persist_failure "$current_step" "unexpected command failure"
     echo "HF_INSTALL_FAILED:$current_step:unexpected command failure" >&2
   fi
   exit "$status"
