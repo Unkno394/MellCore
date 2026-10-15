@@ -197,9 +197,13 @@ fn resumes_interrupted_high_download(manifest: &HighRuntimeManifest) -> bool {
         && manifest.lifecycle_state == HighLifecycleState::Downloading
 }
 
-fn holds_failed_high_for_explicit_retry(manifest: &HighRuntimeManifest) -> bool {
+fn holds_failed_high_for_explicit_retry(
+    manifest: &HighRuntimeManifest,
+    installed_system_detected: bool,
+) -> bool {
     manifest.desired_state == HighDesiredState::Running
         && manifest.lifecycle_state == HighLifecycleState::Failed
+        && !installed_system_detected
 }
 
 fn same_image_artifact(
@@ -895,11 +899,47 @@ impl ComposeProjectStore {
                 }
                 continue;
             }
-            if holds_failed_high_for_explicit_retry(&manifest) {
-                tracing::debug!(
+            if holds_failed_high_for_explicit_retry(&manifest, false) {
+                let vm = Self::high_vm(&manifest.deployment);
+                let installed_system_detected =
+                    self.high_manager().can_resume_failed_installation(&vm);
+                if holds_failed_high_for_explicit_retry(&manifest, installed_system_detected) {
+                    tracing::debug!(
+                        trap_id = %trap_id,
+                        "High trap remains failed until an explicit lifecycle command retries it"
+                    );
+                    continue;
+                }
+                tracing::info!(
                     trap_id = %trap_id,
-                    "High trap remains failed until an explicit lifecycle command retries it"
+                    "resuming finalization of an installed Ubuntu High VM"
                 );
+                if let Err(error) = self.transition_high_lifecycle(
+                    &mut manifest,
+                    HighLifecycleState::Configuring,
+                    None,
+                ) {
+                    tracing::error!(trap_id = %trap_id, %error, "cannot persist recovered High lifecycle state");
+                    continue;
+                }
+                let result = self.high_manager().resume_failed_installation(&vm);
+                match result {
+                    Ok(()) => {
+                        let _ = self.transition_high_lifecycle(
+                            &mut manifest,
+                            HighLifecycleState::Ready,
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(trap_id = %trap_id, %error, "installed High VM finalization recovery failed");
+                        let _ = self.transition_high_lifecycle(
+                            &mut manifest,
+                            HighLifecycleState::Failed,
+                            Some(error.to_string()),
+                        );
+                    }
+                }
                 continue;
             }
             if manifest.desired_state == HighDesiredState::Running
@@ -3694,7 +3734,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_running_high_waits_for_an_explicit_retry() {
+    fn failed_running_high_resumes_only_after_installed_system_is_detected() {
         let profile = HighOsProfile::ubuntu_iso_ssh();
         let mut manifest = HighRuntimeManifest {
             version: 1,
@@ -3712,9 +3752,10 @@ mod tests {
             lifecycle_state: HighLifecycleState::Failed,
             last_error: Some("previous permanent failure".into()),
         };
-        assert!(holds_failed_high_for_explicit_retry(&manifest));
+        assert!(holds_failed_high_for_explicit_retry(&manifest, false));
+        assert!(!holds_failed_high_for_explicit_retry(&manifest, true));
         manifest.desired_state = HighDesiredState::Stopped;
-        assert!(!holds_failed_high_for_explicit_retry(&manifest));
+        assert!(!holds_failed_high_for_explicit_retry(&manifest, false));
     }
 
     #[test]

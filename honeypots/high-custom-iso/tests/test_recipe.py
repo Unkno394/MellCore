@@ -159,11 +159,113 @@ class CustomIsoRecipeTests(unittest.TestCase):
         self.assertIn('"guest-ping"', finalizer)
         self.assertIn('"qemu-guest-agent.service"', finalizer)
         self.assertIn('"high-telemetry.service"', finalizer)
+        self.assertIn('["-Fxq", "installed", "/etc/honeyforge-installed"]', finalizer)
         self.assertIn('banner.startswith(b"SSH-2.0-")', finalizer)
         self.assertLess(
             finalizer.index('change-media "$vm_name" "$target" --eject --config'),
             finalizer.rindex(': > "$instance_dir/installed-disk-verified"'),
         )
+
+    def test_ubuntu_finalization_is_idempotent_with_empty_cdrom(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            high_root = root / "high"
+            instance = high_root / INSTANCE_ID
+            instance.mkdir(parents=True)
+            (instance / "disk.qcow2").write_bytes(b"installed disk fixture")
+            state = root / "domain-state"
+            state.write_text("shut off\n", encoding="utf-8")
+            log = root / "virsh.log"
+            probes = root / "cdrom-probes"
+            probes.write_text("0\n", encoding="utf-8")
+            executable(
+                fake_bin / "virsh",
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$*\" >> \"$FAKE_VIRSH_LOG\"\n"
+                "case $1 in\n"
+                "  domblklist)\n"
+                "    count=$(cat \"$FAKE_CDROM_PROBES\"); count=$((count + 1)); printf '%s\\n' \"$count\" > \"$FAKE_CDROM_PROBES\"\n"
+                "    if [ \"$count\" -eq 1 ]; then source=/fixture/installer.iso; else source=-; fi\n"
+                "    printf '%s\\n' \"file cdrom hda $source\" 'file disk vda /fixture/disk.qcow2' ;;\n"
+                "  domstate) cat \"$FAKE_VM_STATE\" ;;\n"
+                "  start) printf '%s\\n' running > \"$FAKE_VM_STATE\" ;;\n"
+                "  domifaddr) printf '%s\\n' 'vnet0 52:54:00:00:00:01 ipv4 192.0.2.10/24' ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n",
+            )
+            executable(fake_bin / "virt-cat", "#!/bin/sh\nprintf '%s\\n' installed\n")
+            executable(fake_bin / "timeout", "#!/bin/sh\nshift\nexec \"$@\"\n")
+            # guest_checks is separately asserted above; this test isolates finalization state.
+            executable(fake_bin / "python3", "#!/bin/sh\nexit 0\n")
+            environment = dict(
+                os.environ,
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                HF_HIGH_ROOT=str(high_root),
+                FAKE_VM_STATE=str(state),
+                FAKE_VIRSH_LOG=str(log),
+                FAKE_CDROM_PROBES=str(probes),
+            )
+            command = [
+                "sh",
+                str(RECIPE / "scripts" / "finalize-linux-install.sh"),
+                INSTANCE_ID,
+                "ubuntu",
+            ]
+            subprocess.run(
+                command, check=True, env=environment, capture_output=True, text=True
+            )
+            subprocess.run(
+                command, check=True, env=environment, capture_output=True, text=True
+            )
+            self.assertTrue((instance / "installed-disk-verified").is_file())
+            calls = log.read_text(encoding="utf-8")
+            self.assertNotIn("change-media", calls)
+            self.assertEqual(calls.count("start hf-high-"), 1)
+            self.assertTrue((instance / "disk.qcow2").is_file())
+
+    def test_ubuntu_finalizer_does_not_hide_real_eject_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            high_root = root / "high"
+            instance = high_root / INSTANCE_ID
+            instance.mkdir(parents=True)
+            (instance / "disk.qcow2").write_bytes(b"installed disk fixture")
+            executable(
+                fake_bin / "virsh",
+                "#!/bin/sh\n"
+                "case $1 in\n"
+                "  domblklist) printf '%s\\n' 'file cdrom hda /fixture/installer.iso' 'file disk vda /fixture/disk.qcow2' ;;\n"
+                "  domstate) printf '%s\\n' 'shut off' ;;\n"
+                "  change-media) exit 1 ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n",
+            )
+            executable(fake_bin / "virt-cat", "#!/bin/sh\nprintf '%s\\n' installed\n")
+            executable(fake_bin / "timeout", "#!/bin/sh\nshift\nexec \"$@\"\n")
+            executable(fake_bin / "python3", "#!/bin/sh\nexit 0\n")
+            completed = subprocess.run(
+                [
+                    "sh",
+                    str(RECIPE / "scripts" / "finalize-linux-install.sh"),
+                    INSTANCE_ID,
+                    "ubuntu",
+                ],
+                check=False,
+                env=dict(
+                    os.environ,
+                    PATH=f"{fake_bin}:{os.environ['PATH']}",
+                    HF_HIGH_ROOT=str(high_root),
+                ),
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("INSTALL_MEDIA_EJECT_FAILED", completed.stderr)
+            self.assertFalse((instance / "installed-disk-verified").exists())
 
 
 if __name__ == "__main__":

@@ -58,6 +58,18 @@ disk_marker_ready() {
 }
 cdrom_target() { virsh domblklist "$vm_name" --details | awk '$2 == "cdrom" { print $3; exit }'; }
 cdrom_source() { virsh domblklist "$vm_name" --details | awk '$2 == "cdrom" && $4 != "-" { print $4; exit }'; }
+eject_install_media() {
+  target=$(cdrom_target)
+  [ -n "$target" ] || { echo 'HF_HIGH_ERROR code=INSTALL_MEDIA_DEVICE_MISSING stage=reboot: installer CD-ROM device is absent' >&2; return 1; }
+  # The installer or libvirt may already have emptied the tray after the earlier source probe.
+  # Re-check immediately before mutation; an empty drive is the requested final state.
+  [ -n "$(cdrom_source)" ] || return 0
+  if virsh change-media "$vm_name" "$target" --eject --config >/dev/null; then return 0; fi
+  # Suppress only the race where libvirt reports failure after another actor completed the eject.
+  [ -z "$(cdrom_source)" ] && return 0
+  echo 'HF_HIGH_ERROR code=INSTALL_MEDIA_EJECT_FAILED stage=reboot: libvirt failed to eject installation media and the CD-ROM is still populated' >&2
+  return 1
+}
 wait_for_installer_poweroff() {
   deadline=$(( $(date +%s) + timeout_seconds ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -119,7 +131,7 @@ def guest_exec(path, arguments):
         time.sleep(0.1)
     return False
 
-if not guest_exec("/usr/bin/test", ["-f", "/etc/honeyforge-installed"]):
+if not guest_exec("/usr/bin/grep", ["-Fxq", "installed", "/etc/honeyforge-installed"]):
     raise SystemExit(1)
 if not guest_exec("/bin/systemctl", ["is-active", "--quiet", "ssh.service", "qemu-guest-agent.service", "high-telemetry.service"]):
     raise SystemExit(1)
@@ -158,9 +170,7 @@ if [ -n "$source" ]; then
   esac
   wait_for_installer_poweroff
   record_phase REBOOTING
-  target=$(cdrom_target)
-  [ -n "$target" ] || { echo 'HF_HIGH_ERROR code=INSTALL_MEDIA_DEVICE_MISSING stage=reboot: installer CD-ROM device is absent' >&2; exit 1; }
-  virsh change-media "$vm_name" "$target" --eject --config >/dev/null
+  eject_install_media
 else
   record_phase REBOOTING
   state=$(domain_state)

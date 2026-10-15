@@ -592,6 +592,62 @@ impl LibvirtSandboxManager {
         }
     }
 
+    /// A failed Ubuntu ISO deployment may be resumed only after proving that Setup completed.
+    /// Running guests are inspected through QGA; stopped guests are inspected offline so the
+    /// existing disk can be finalized without starting the installer again.
+    pub fn can_resume_failed_installation(&self, vm: &HighVm) -> bool {
+        if vm.profile != HighOsProfile::ubuntu_iso_ssh() {
+            return false;
+        }
+        if self.installed_marker_ready(vm) {
+            return true;
+        }
+        match self.domain_state(vm.instance_id) {
+            Ok(HighDomainState::Running) => self.guest_command_succeeds(
+                vm.instance_id,
+                "/usr/bin/grep",
+                &["-Fxq", "installed", "/etc/honeyforge-installed"],
+            ),
+            Ok(HighDomainState::Stopped) => {
+                let disk = self
+                    .high_root
+                    .join(vm.instance_id.to_string())
+                    .join("disk.qcow2");
+                Command::new("timeout")
+                    .arg("120")
+                    .arg("virt-cat")
+                    .arg("-a")
+                    .arg(disk)
+                    .arg("/etc/honeyforge-installed")
+                    .output()
+                    .is_ok_and(|output| {
+                        output.status.success()
+                            && String::from_utf8_lossy(&output.stdout)
+                                .lines()
+                                .any(|line| line.trim() == "installed")
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// Continue only the post-install path. This deliberately bypasses launch-iso.sh so a
+    /// proven installed disk cannot be sent through unattended-media preparation again.
+    pub fn resume_failed_installation(&self, vm: &HighVm) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            vm.profile == HighOsProfile::ubuntu_iso_ssh(),
+            "failed-install recovery is supported only for the Ubuntu ISO profile"
+        );
+        let instance_id = vm.instance_id.to_string();
+        self.run(
+            vm.profile,
+            "finalize-linux-install.sh",
+            &[&instance_id, "ubuntu"],
+        )
+        .map_err(|failure| lifecycle_error("INSTALLATION_FAILED", "installation", failure))?;
+        self.prepare_access_and_wait(vm)
+    }
+
     pub fn healthy(&self, vm: &HighVm) -> anyhow::Result<bool> {
         let require_guest_agent = self.adapter_for(vm.profile)?.require_guest_agent;
         let guest_ready = self.guest_service_ready(vm)
@@ -834,12 +890,20 @@ impl LibvirtSandboxManager {
     }
 
     fn guest_systemd_unit_active(&self, instance_id: Uuid, unit: &str) -> bool {
+        self.guest_command_succeeds(
+            instance_id,
+            "/bin/systemctl",
+            &["is-active", "--quiet", unit],
+        )
+    }
+
+    fn guest_command_succeeds(&self, instance_id: Uuid, path: &str, args: &[&str]) -> bool {
         let name = format!("hf-high-{instance_id}");
         let request = serde_json::json!({
             "execute": "guest-exec",
             "arguments": {
-                "path": "/bin/systemctl",
-                "arg": ["is-active", "--quiet", unit],
+                "path": path,
+                "arg": args,
                 "capture-output": true
             }
         });
