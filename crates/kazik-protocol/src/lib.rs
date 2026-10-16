@@ -6,7 +6,9 @@
 
 use std::{net::IpAddr, time::Duration};
 
-use hf_core::{AgentCommand, HfspCodecError, HfspFrame, HfspMessageKind};
+use hf_core::{
+    AgentCommand, HfspCodecError, HfspFrame, HfspMessageKind, HighLifecycleState, HostInventory,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -16,7 +18,8 @@ pub const KAZIK_PROTOCOL_VERSION: u16 = 1;
 /// Application-level limits keep telemetry within one practical Hysteria UDP datagram while
 /// retaining the existing HFSP/Kazik version and envelope shape.
 pub const MAX_TELEMETRY_BATCH_EVENTS: usize = 20;
-pub const MAX_TELEMETRY_PACKET_BYTES: usize = 16 * 1024;
+// Hysteria accepts UDP payloads up to 4096 bytes. Leave room for transport framing.
+pub const MAX_TELEMETRY_PACKET_BYTES: usize = 3500;
 pub const MAX_TELEMETRY_BATCH_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +82,20 @@ pub struct AgentStatus {
     pub active_trap_count: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// Added to the existing heartbeat so inventory uses the authenticated, durable HFSP path.
+    /// Missing values keep heartbeats from older agents valid during rolling upgrades.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_inventory: Option<HostInventory>,
+    /// Current long-running High trap deployments. Older agents may omit this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub high_trap_progress: Vec<HighTrapProgress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HighTrapProgress {
+    pub trap_id: Uuid,
+    pub state: HighLifecycleState,
 }
 
 /// Normalized event emitted by any trap source. `payload` remains source-specific;
@@ -229,6 +246,8 @@ mod tests {
                     hostname: "vps".into(),
                     active_trap_count: 1,
                     capabilities: vec![],
+                    host_inventory: None,
+                    high_trap_progress: vec![],
                 },
             },
         );
@@ -240,5 +259,15 @@ mod tests {
             KazikEnvelope::decode_hfsp(&bad),
             Err(KazikCodecError::KindMismatch)
         ));
+    }
+
+    #[test]
+    fn heartbeat_without_inventory_remains_compatible() {
+        let status: AgentStatus = serde_json::from_value(json!({
+            "hostname": "older-agent",
+            "active_trap_count": 2
+        }))
+        .unwrap();
+        assert_eq!(status.host_inventory, None);
     }
 }

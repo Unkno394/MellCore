@@ -12,6 +12,7 @@ clap.workspace = true
 hf-core = { path = "../hf-core" }
 hf-services = { path = "../hf-services" }
 kazik-protocol = { path = "../kazik-protocol" }
+libc.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

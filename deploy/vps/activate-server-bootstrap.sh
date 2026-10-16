@@ -89,6 +89,7 @@ set +a
 /usr/local/bin/honeyforge-backend migrate
 install -m 0755 "$agent_bin" "/usr/local/bin/hf-agent.new.$$"
 mv -f "/usr/local/bin/hf-agent.new.$$" /usr/local/bin/hf-agent
+ln -sfn /usr/local/bin/hf-agent /usr/local/bin/hf
 install -m 0755 "$dispatcher_bin" "/usr/local/bin/hf-dispatcher.new.$$"
 mv -f "/usr/local/bin/hf-dispatcher.new.$$" /usr/local/bin/hf-dispatcher
 install -m 0755 "$center_bin" "/usr/local/bin/hf-center.new.$$"

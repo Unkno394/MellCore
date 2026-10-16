@@ -1,15 +1,17 @@
-import { profileNameLabel } from '../i18n/labels'
+import { highProgressDescription, highProgressLabel, profileNameLabel } from '../i18n/labels'
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import FuzzyText from '../components/FuzzyText'
 import SshAuthSettings, { chooseDefaultSshCredentials, validateSshCredentials, withFixedSshUsername } from '../components/SshAuthSettings'
 import type { ToastNotify } from '../components/ToastNotifications'
 import { ApiError, apiErrorMessage } from '../api/client'
 import type { MellCoreApi } from '../api/services'
-import type { ContainerResourceLimits, MiddleSshAuthMode, Profile, Server, SshCredential, Trap, TrapActionProgress, TrapLevel } from '../api/types'
+import type { ContainerResourceLimits, HighImageSource, MiddleSshAuthMode, Profile, Server, SshCredential, Trap, TrapActionProgress, TrapLevel } from '../api/types'
 
 type Props = { api: MellCoreApi; profiles: Profile[]; servers: Server[]; traps: Trap[]; readOnly: boolean; onCreated: () => Promise<void>; notify: ToastNotify; dismissToast: (id: number) => void }
 
 class ConfirmedTrapActionFailure extends Error {}
+
+const shellArg = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
 
 export default function CreateHoneypot({ api, profiles, servers, traps, readOnly, onCreated, notify, dismissToast }: Props) {
   const availableServers = servers
@@ -40,7 +42,19 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
   const [serverId, setServerId] = useState('')
   const [selectedLevel, setSelectedLevel] = useState<TrapLevel | ''>('')
   const [highOsProfile, setHighOsProfile] = useState('ubuntu_ssh')
+  const [highImageMode, setHighImageMode] = useState<'prepared' | 'custom_iso'>('prepared')
+  const [highCustomIsoOs, setHighCustomIsoOs] = useState<'ubuntu' | 'debian' | 'arch' | 'windows'>('ubuntu')
+  const [highIsoFile, setHighIsoFile] = useState<File | null>(null)
   const [highRuntimeMode, setHighRuntimeMode] = useState<'public_kvm' | 'private_tcg_test'>('public_kvm')
+  const [localHighHostname, setLocalHighHostname] = useState('web-01')
+  const [localHighUsername, setLocalHighUsername] = useState('admin')
+  const [localHighShell, setLocalHighShell] = useState<'bash' | 'sh' | 'zsh'>('bash')
+  const [localHighPasswordFile, setLocalHighPasswordFile] = useState('/root/hf-password')
+  const [localHighImage, setLocalHighImage] = useState('/srv/iso/ubuntu-server.iso')
+  const [localHighSource, setLocalHighSource] = useState<'prepared' | 'iso'>('prepared')
+  const [localHighOs, setLocalHighOs] = useState<'ubuntu' | 'debian' | 'arch' | 'windows'>('ubuntu')
+  const [localHighBait, setLocalHighBait] = useState('')
+  const [localHighVulnerability, setLocalHighVulnerability] = useState('')
   const [hostPort, setHostPort] = useState<number | null>(null)
   const manualPort = useRef(false)
   const [sharedPort, setSharedPort] = useState<number | null>(null)
@@ -50,12 +64,20 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const legacyHighProfile = supported.find((item) => item.level === 'high' && item.honeypot_type === 'high_ubuntu_ssh')
+  const customIsoProfileKey = {
+    ubuntu: 'ubuntu_ssh',
+    debian: 'debian_ssh',
+    arch: 'arch_linux_ssh',
+    windows: 'windows_rdp',
+  }[highCustomIsoOs]
+  const activeHighOsProfile = highImageMode === 'custom_iso' ? customIsoProfileKey : highOsProfile
   const profile = selectedLevel === 'high'
-    ? highVmProfiles.find((item) => item.config.os_profile === highOsProfile) ?? highVmProfiles[0] ?? legacyHighProfile
+    ? highVmProfiles.find((item) => item.config.os_profile === activeHighOsProfile) ?? highVmProfiles[0] ?? legacyHighProfile
     : supported.find((item) => item.level === selectedLevel
       && item.honeypot_type === (selectedLevel === 'low' ? 'kozyavka' : 'pritvoryashka'))
   const selectedServer = availableServers.find((server) => server.server_id === serverId)
-  const privateTcgTest = profile?.honeypot_type === 'high_vm' && highRuntimeMode === 'private_tcg_test'
+  const customHighIso = profile?.honeypot_type === 'high_vm' && highImageMode === 'custom_iso'
+  const privateTcgTest = profile?.honeypot_type === 'high_vm' && !customHighIso && highRuntimeMode === 'private_tcg_test'
   const isHigh = profile?.level === 'high'
   const windowsHigh = profile?.honeypot_type === 'high_vm' && profile.config.os_profile === 'windows_rdp'
   const highServiceLabel = profile?.service_type === 'rdp' ? 'RDP' : 'SSH'
@@ -76,17 +98,30 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
     && trap.ports.some((port) => port.transport === 'tcp' && port.host_port === sharedPort)).length
   const maxNewWeight = 100 - sharedMemberCount
 
-  async function awaitAction(trapId: string, queued: TrapActionProgress, phase: 'start' | 'share'): Promise<void> {
+  async function awaitAction(
+    trapId: string,
+    queued: TrapActionProgress,
+    phase: 'start' | 'share',
+    onProgress?: (stage: NonNullable<TrapActionProgress['progress']>) => void,
+  ): Promise<void> {
     let progress = queued
-    const waitSeconds = phase === 'start' && profile?.level === 'high' ? 1200 : 120
+    let lastReportedStage = progress.progress
+    const waitSeconds = phase === 'start' && profile?.level === 'high'
+      ? (highImageMode === 'custom_iso' ? 3600 : 1200)
+      : 120
+    const waitDuration = waitSeconds >= 60 ? `${Math.round(waitSeconds / 60)} минут` : `${waitSeconds} секунд`
     const deadline = Date.now() + waitSeconds * 1000
     while (progress.status === 'queued' && Date.now() < deadline) {
       await new Promise<void>((resolve) => window.setTimeout(resolve, 2000))
       progress = await api.traps.actionStatus(trapId, queued.action_id)
+      if (progress.progress && progress.progress !== lastReportedStage) {
+        lastReportedStage = progress.progress
+        onProgress?.(progress.progress)
+      }
     }
     if (progress.status === 'failed') throw new ConfirmedTrapActionFailure(progress.detail || 'Агент не смог выполнить команду.')
     if (progress.status === 'queued') throw new Error(phase === 'start'
-      ? `Агент не подтвердил запуск за ${waitSeconds === 1200 ? '20 минут' : '120 секунд'} (операция ${queued.action_id}). Настройка общего порта ещё не отправлялась.`
+      ? `Агент не подтвердил запуск за ${waitDuration} (операция ${queued.action_id}). Настройка общего порта ещё не отправлялась.`
       : `Агент не подтвердил настройку общего порта за 120 секунд (операция ${queued.action_id}).`)
   }
 
@@ -162,13 +197,28 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
       }
     }
     if (profile.honeypot_type === 'kozyavka' && lowAuthMode === 'configured' && (!lowUsername.trim() || !lowPassword)) return setError('Для Low укажите логин и пароль, которые ловушка будет принимать.')
+    if (profile.honeypot_type === 'high_vm' && highImageMode === 'custom_iso' && !highIsoFile) return setError('Выберите ISO-файл для собственной установки High.')
+    if (profile.honeypot_type === 'high_vm' && highImageMode === 'custom_iso' && highIsoFile && highIsoFile.size > 8 * 1024 * 1024 * 1024) return setError('Размер ISO не должен превышать 8 ГиБ.')
     const isHigh = profile.level === 'high'
     const isPrivateTcgTest = privateTcgTest
+    const isCustomIso = profile.honeypot_type === 'high_vm' && highImageMode === 'custom_iso'
     setBusy(true)
     let createdTrapId: string | null = null
     let started = false
     let progressToastId: number | null = null
+    let lastHighProgress: TrapActionProgress['progress']
     let effectiveSharedPort = sharedPort
+    const updateHighProgress = (stage: NonNullable<TrapActionProgress['progress']>) => {
+      if (!isHigh || progressToastId === null || stage === lastHighProgress) return
+      lastHighProgress = stage
+      dismissToast(progressToastId)
+      progressToastId = notify(
+        'info',
+        highProgressLabel(stage),
+        `«${name}»: ${highProgressDescription(stage)}`,
+        { persistent: true },
+      )
+    }
     try {
       const freshReservations = isPrivateTcgTest ? [] : await api.servers.ports(serverId)
       if (effectiveSharedPort === null && hostPort !== null && shareablePorts.includes(hostPort)
@@ -200,6 +250,20 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
         if (temporaryPort === null) return setError('Не найден свободный временный TCP-порт для запуска ловушки перед подключением к общему порту.')
         deploymentPort = temporaryPort
       }
+      let uploadedIso: HighImageSource | null = null
+      if (isCustomIso) {
+        if (!highIsoFile) throw new Error('Выберите ISO-файл для собственной установки High.')
+        progressToastId = notify(
+          'info',
+          'Загружаю собственный ISO',
+          `Передаю ${highIsoFile.name} (${(highIsoFile.size / 1024 ** 3).toFixed(2)} ГиБ) в MellCore. После загрузки агент скачает и проверит его перед установкой ОС.`,
+          { persistent: true },
+        )
+        const upload = await api.traps.uploadHighIso(highIsoFile)
+        uploadedIso = upload.image_source
+        if (progressToastId !== null) dismissToast(progressToastId)
+        progressToastId = null
+      }
       const isMiddle = profile.honeypot_type === 'pritvoryashka'
       const serviceLabel = profile.service_type.toUpperCase()
       const config = isMiddle ? {
@@ -212,6 +276,10 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
       } : profile.honeypot_type === 'kozyavka' ? {
         auth_mode: lowAuthMode,
         credentials: lowAuthMode === 'configured' ? [{ username: lowUsername.trim(), password: lowPassword }] : [],
+      } : isCustomIso ? {
+        high_image_mode: 'custom_iso',
+        custom_iso_os: highCustomIsoOs,
+        image_source: uploadedIso,
       } : isPrivateTcgTest ? { high_runtime_mode: 'private_tcg_test' } : {}
       const ports = isPrivateTcgTest ? [] : [{ transport: 'tcp' as const, host_port: deploymentPort, target_port: isHigh ? (profile.service_type === 'rdp' ? 3389 : 22) : 2222, route_mode: 'direct' as const }]
       const input = { name, profile_id: profile.id, config, resources, desired_state: 'stopped' as const, ports }
@@ -230,13 +298,18 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
         'Ловушка устанавливается',
         isPrivateTcgTest
           ? `Поднимаю «${name}» в приватном TCG-режиме на ${selectedServer?.host ?? 'выбранном сервере'}. Публичный порт не открывается; события будут поступать в Центр.`
+          : isHigh
+          ? isCustomIso
+            ? `Устанавливаю «${name}» на ${selectedServer?.host ?? 'выбранном сервере'}:${deploymentPort}. Агент скачивает загруженный ISO, проверяет SHA-256, создаёт VM и устанавливает выбранную ОС; этапы будут обновляться здесь.`
+            : `Устанавливаю «${name}» на ${selectedServer?.host ?? 'выбранном сервере'}:${deploymentPort}. Агент запускает готовый образ ОС; этапы настройки будут обновляться здесь.`
           : effectiveSharedPort === null
           ? `Устанавливаю «${name}» на ${selectedServer?.host ?? 'выбранном сервере'}:${deploymentPort}. Подождите — сообщу, когда она будет готова.`
           : `Устанавливаю «${name}» на временный порт и подключаю к общему порту ${effectiveSharedPort}. Подождите — сообщу по завершении.`,
         { persistent: true },
       )
       const queued = await api.traps.action(createdTrapId, 'start')
-      await awaitAction(createdTrapId, queued, 'start')
+      if (queued.progress) updateHighProgress(queued.progress)
+      await awaitAction(createdTrapId, queued, 'start', isHigh ? updateHighProgress : undefined)
       started = true
       if (effectiveSharedPort !== null) {
         const existing = traps.filter((trap) => trap.server_id === serverId && trap.actual_state === 'running'
@@ -308,11 +381,38 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
         {profile.honeypot_type === 'kozyavka' && <p className="mt-2 text-xs leading-5 text-white/45">Low запускается как Docker-контейнер. Образ и системная среда выбираются профилем ловушки.</p>}
         {profile.honeypot_type === 'pritvoryashka' && <label className="mt-3 block text-sm text-white/70">Операционная система<select disabled={readOnly || busy} value={middleDistribution} onChange={(event) => setMiddleDistribution(event.target.value as 'ubuntu' | 'debian' | 'arch' | 'windows')} className="mt-2 w-full rounded-lg border border-white/10 bg-[#100a09] px-4 py-3"><option value="ubuntu">Ubuntu 22.04</option><option value="debian">Debian 13</option><option value="arch">Arch Linux</option><option value="windows">Windows Server 2022 · PowerShell по SSH</option></select><span className="mt-1 block text-xs text-white/40">Выбранная система будет эмулироваться в SSH-ловушке.</span></label>}
         {profile.honeypot_type === 'pritvoryashka' && <p className="mt-2 text-xs leading-5 text-white/45">Средний запускается в Docker-контейнере; выбранная ОС эмулируется виртуальной файловой системой и shell.</p>}
-        {profile.honeypot_type === 'high_vm' && <div className="mt-3 grid gap-4 sm:grid-cols-2">
-          <label className="text-sm text-white/70">Операционная система<select disabled={readOnly || busy} value={highOsProfile} onChange={(event) => { const next = highVmProfiles.find((item) => item.config.os_profile === event.target.value); if (next) { setHighOsProfile(event.target.value); setResources(next.resources); setSharedPort(null); if (event.target.value === 'windows_rdp') { setHighRuntimeMode('public_kvm'); manualPort.current = false } } }} className="mt-2 w-full rounded-lg border border-white/10 bg-[#100a09] px-4 py-3">{highOsChoices.map((choice) => <option key={choice.value} value={choice.value}>{choice.label}</option>)}</select></label>
-          <label className="text-sm text-white/70">Способ запуска<select disabled={readOnly || busy} value={highRuntimeMode} onChange={(event) => { manualPort.current = false; setHighRuntimeMode(event.target.value as typeof highRuntimeMode); if (event.target.value === 'private_tcg_test') { setHostPort(null); setSharedPort(null) } }} className="mt-2 w-full rounded-lg border border-white/10 bg-[#100a09] px-4 py-3"><option value="public_kvm">Публичная VM · KVM</option><option value="private_tcg_test" disabled={windowsHigh}>Лабораторная VM · QEMU TCG</option></select></label>
+        {profile.honeypot_type === 'high_vm' && <div className="mt-3 space-y-4">
+          <div className="grid gap-3 sm:grid-cols-2" role="group" aria-label="Источник операционной системы">
+            <button type="button" disabled={readOnly || busy} aria-pressed={highImageMode === 'prepared'} onClick={() => { setHighImageMode('prepared'); setSharedPort(null) }} className={`rounded-lg border p-4 text-left transition ${highImageMode === 'prepared' ? 'border-orange-300/40 bg-orange-300/[0.08]' : 'border-white/10 bg-black/15'}`}><span className="block text-sm font-medium text-white/80">Готовый образ</span><span className="mt-1 block text-xs leading-5 text-white/45">Выбрать установленный в HoneyForge образ Ubuntu, Debian, Arch или Windows.</span></button>
+            <button type="button" disabled={readOnly || busy} aria-pressed={highImageMode === 'custom_iso'} onClick={() => { setHighImageMode('custom_iso'); setHighRuntimeMode('public_kvm'); setSharedPort(null); manualPort.current = false }} className={`rounded-lg border p-4 text-left transition ${highImageMode === 'custom_iso' ? 'border-orange-300/40 bg-orange-300/[0.08]' : 'border-white/10 bg-black/15'}`}><span className="block text-sm font-medium text-white/80">Свой ISO</span><span className="mt-1 block text-xs leading-5 text-white/45">Загрузить установочный образ и развернуть ОС из него.</span></button>
+          </div>
+          {highImageMode === 'prepared' ? <div className="grid gap-4 sm:grid-cols-2">
+            <label className="text-sm text-white/70">Операционная система<select disabled={readOnly || busy} value={highOsProfile} onChange={(event) => { const next = highVmProfiles.find((item) => item.config.os_profile === event.target.value); if (next) { setHighOsProfile(event.target.value); setResources(next.resources); setSharedPort(null); if (event.target.value === 'windows_rdp') { setHighRuntimeMode('public_kvm'); manualPort.current = false } } }} className="mt-2 w-full rounded-lg border border-white/10 bg-[#100a09] px-4 py-3">{highOsChoices.map((choice) => <option key={choice.value} value={choice.value}>{choice.label}</option>)}</select></label>
+            <label className="text-sm text-white/70">Способ запуска<select disabled={readOnly || busy} value={highRuntimeMode} onChange={(event) => { manualPort.current = false; setHighRuntimeMode(event.target.value as typeof highRuntimeMode); if (event.target.value === 'private_tcg_test') { setHostPort(null); setSharedPort(null) } }} className="mt-2 w-full rounded-lg border border-white/10 bg-[#100a09] px-4 py-3"><option value="public_kvm">Публичная VM · KVM</option><option value="private_tcg_test" disabled={windowsHigh}>Лабораторная VM · QEMU TCG</option></select></label>
+          </div> : <div className="space-y-3">
+            <label className="block text-sm text-white/70">ОС в загружаемом ISO<select disabled={readOnly || busy} value={highCustomIsoOs} onChange={(event) => { setHighCustomIsoOs(event.target.value as typeof highCustomIsoOs); setSharedPort(null); manualPort.current = false }} className="mt-2 w-full rounded-lg border border-white/10 bg-[#100a09] px-4 py-3"><option value="ubuntu">Ubuntu Server</option><option value="debian">Debian</option><option value="arch">Arch Linux</option><option value="windows">Windows Server</option></select></label>
+            <label className="block text-sm text-white/70">Файл установочного ISO<input type="file" accept=".iso,application/x-iso9660-image" disabled={readOnly || busy} onChange={(event) => { const file = event.target.files?.[0] ?? null; setHighIsoFile(file); setError(file && file.size > 8 * 1024 ** 3 ? 'Размер ISO не должен превышать 8 ГиБ.' : '') }} className="mt-2 block w-full rounded-lg border border-white/10 bg-[#100a09] px-4 py-3 text-sm file:mr-4 file:rounded-md file:border-0 file:bg-orange-300/10 file:px-3 file:py-2 file:text-orange-100"/><span className="mt-1 block text-xs text-white/40">До 8 ГиБ. MellCore проверит SHA-256, затем агент скачает ISO с Центра и установит ОС. В аккаунте хранится до 16 ГиБ загруженных ISO; файлы старше 30 дней удаляются при следующей загрузке.</span></label>
+            {highIsoFile && <p className="text-xs text-orange-100/70">Выбран: {highIsoFile.name} · {(highIsoFile.size / 1024 ** 3).toFixed(2)} ГиБ</p>}
+            <p className="rounded-lg border border-white/10 bg-black/20 p-3 text-xs leading-5 text-white/45">Нужен x86_64 ISO поддерживаемой версии Ubuntu, Debian, Arch или Windows и сервер с KVM. Агент сверит ОС внутри файла с выбором выше; установщик должен поддерживать автоматическую установку. Для Windows используется отдельный RDP-порт 3389, для Linux — SSH-порт 22.</p>
+          </div>}
         </div>}
-        {profile.honeypot_type === 'high_vm' && <p className="mt-3 text-xs leading-5 text-white/45">High разворачивается отдельной VM из подготовленного образа. {windowsHigh ? 'Windows публикует RDP на отдельном порту 3389 через изолированную сеть агента. Нужен сервер с KVM и готовый одобренный образ; для его первой сборки нужны Packer и заранее одобренные администратором Windows media и контрольные суммы.' : 'Linux-профиль использует SSH: публичный KVM открывает собственный порт, приватный TCG не открывает порт; события передаются в Центр через агент.'}</p>}
+        {profile.honeypot_type === 'high_vm' && <p className="mt-3 text-xs leading-5 text-white/45">{customHighIso ? `Свой ISO: ${windowsHigh ? 'Windows через RDP' : 'Linux через SSH'} устанавливается в отдельную VM на KVM; во время установки панель будет показывать этапы скачивания, проверки, установки и настройки.` : windowsHigh ? 'Готовый образ Windows публикует RDP на отдельном порту 3389 через изолированную сеть агента.' : 'Готовые образы Linux используют SSH: публичный KVM открывает собственный порт, приватный TCG не открывает порт; события передаются в Центр через агент.'}</p>}
+        {profile.honeypot_type === 'high_vm' && <div className="mt-4 rounded-xl border border-orange-300/20 bg-orange-300/[0.04] p-4">
+          <h4 className="text-sm font-medium text-orange-100">High через локальный CLI</h4>
+          <p className="mt-1 text-xs leading-5 text-white/50">Выберите готовый образ или путь к ISO на своём Linux-сервере. Эта команда запускается локально и не подключается к Центру.</p>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <label className="text-xs text-white/70">ОС<select value={localHighOs} onChange={(event) => setLocalHighOs(event.target.value as typeof localHighOs)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2"><option value="ubuntu">Ubuntu</option><option value="debian">Debian</option><option value="arch">Arch Linux</option><option value="windows">Windows Server 2022</option></select></label>
+            <label className="text-xs text-white/70">Источник<select value={localHighSource} onChange={(event) => setLocalHighSource(event.target.value as typeof localHighSource)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2"><option value="prepared">Готовый образ HoneyForge</option><option value="iso">Свой ISO на сервере</option></select></label>
+            {localHighSource === 'iso' && <label className="text-xs text-white/70 sm:col-span-2">Путь к ISO на сервере<input value={localHighImage} onChange={(event) => setLocalHighImage(event.target.value)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs" /></label>}
+            <label className="text-xs text-white/70">Hostname<input value={localHighHostname} onChange={(event) => setLocalHighHostname(event.target.value)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs" /></label>
+            {(localHighOs !== 'windows' || localHighSource === 'prepared') && <label className="text-xs text-white/70">Пользователь {localHighOs === 'windows' ? 'Windows' : 'SSH'}<input value={localHighUsername} onChange={(event) => setLocalHighUsername(event.target.value)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs" /></label>}
+            {localHighOs !== 'windows' && <label className="text-xs text-white/70">Shell<select value={localHighShell} onChange={(event) => setLocalHighShell(event.target.value as typeof localHighShell)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2"><option value="bash">/bin/bash</option><option value="sh">/bin/sh</option><option value="zsh">/bin/zsh</option></select></label>}
+            <label className="text-xs text-white/70">Файл пароля на сервере<input value={localHighPasswordFile} onChange={(event) => setLocalHighPasswordFile(event.target.value)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs" /></label>
+            {localHighOs !== 'windows' && <label className="text-xs text-white/70">Уязвимость<select value={localHighVulnerability} onChange={(event) => setLocalHighVulnerability(event.target.value)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2"><option value="">Без дополнительной уязвимости</option><option value="ssh_weak_credentials">Слабый пароль SSH</option><option value="ssh_root_login_enabled">Разрешить root по SSH</option><option value="sudo_nopasswd">sudo без пароля</option></select></label>}
+            {localHighOs !== 'windows' && <label className="text-xs text-white/70 sm:col-span-2">Приманка GUEST_PATH=HOST_FILE<input value={localHighBait} onChange={(event) => setLocalHighBait(event.target.value)} placeholder="/home/admin/.env=/root/decoy.env" className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs" /></label>}
+          </div>
+          <pre className="mt-3 overflow-x-auto rounded-lg bg-black/30 p-3 text-xs text-orange-100/80">{`sudo hf deploy high --os ${localHighOs}${localHighSource === 'iso' ? ` --iso ${shellArg(localHighImage)}` : ''} --port ${hostPort ?? (localHighOs === 'windows' ? 3389 : 2224)} --hostname ${shellArg(localHighHostname)}${localHighOs !== 'windows' || localHighSource === 'prepared' ? ` --username ${shellArg(localHighUsername)}` : ''}${localHighOs !== 'windows' ? ` --shell ${localHighShell}` : ''} --password-file ${shellArg(localHighPasswordFile)}${localHighOs !== 'windows' && localHighVulnerability ? ` --vulnerability ${localHighVulnerability}` : ''}${localHighOs !== 'windows' && localHighBait ? ` --bait ${shellArg(localHighBait)}` : ''}`}</pre>
+        </div>}
         {profile.honeypot_type === 'high_ubuntu_ssh' && <p className="mt-3 text-xs leading-5 text-white/45">Старый профиль фиксирован на Ubuntu Server и публичном запуске через KVM.</p>}
       </section>}
       {profile?.honeypot_type === 'pritvoryashka' && <section className="rounded-xl border border-white/10 bg-black/10 p-4"><h3 className="text-sm font-medium text-white/80">Виртуальная SSH-система Middle</h3><p className="mt-1 text-xs text-white/40">Имя ловушки используется в панели. Эти значения увидит посетитель SSH-сессии.</p><div className="mt-4 grid gap-3 sm:grid-cols-2"><label className="text-sm text-white/70">Hostname<input required disabled={readOnly || busy} maxLength={64} pattern="[A-Za-z0-9][A-Za-z0-9.-]*" value={middleHostname} onChange={(event) => setMiddleHostname(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-4 py-3 outline-none focus:border-orange-500/50" /></label><label className="text-sm text-white/70">Пользователь SSH и shell<input required disabled={readOnly || busy} maxLength={32} pattern="[a-z_][a-z0-9_-]*" value={middleUsername} onChange={(event) => setMiddleUsername(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-4 py-3 outline-none focus:border-orange-500/50" /></label></div><p className="mt-3 font-mono text-xs text-orange-100/75">{middleDistribution === 'windows' ? `PS C:\\Users\\${middleUsername || 'admin'}>` : `${middleUsername || 'admin'}@${middleHostname || 'srv-app-01'}:~$`}</p>{middleDistribution === 'windows' ? <p className="mt-2 text-xs text-white/45">Виртуальный PowerShell по SSH. RDP, WinRM и настоящие программы Windows здесь не запускаются. Linux-профили уязвимостей недоступны.</p> : <p className="mt-2 text-xs text-white/45">После создания сценарии можно выбрать на отдельной странице «Сценарии уязвимостей».</p>}</section>}
@@ -329,7 +429,7 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
         {privateTcgTest && <div className="mt-4 rounded-lg border border-sky-400/15 bg-sky-400/[0.04] p-3 text-xs leading-5 text-white/60"><p>VM будет доступна только внутри закрытой сети сервера. HoneyForge не резервирует и не открывает входящий порт. События High передаются в Центр через агент.</p><p className="mt-2">Для проверки используйте гостевой IP из `virsh domifaddr` на сервере и порт {profile?.service_type === 'rdp' ? '3389' : '22'}. Удаление ловушки из панели удалит и VM.</p></div>}
       </div>
       {error && <p role="alert" className="text-sm text-red-400">{error}</p>}
-      {!readOnly && <button disabled={busy || !availableServers.length || !profile || (!privateTcgTest && !hostPort) || (sharedPort !== null && (newWeight < 1 || newWeight > maxNewWeight || !Number.isInteger(newWeight)))} className="rounded-lg border border-orange-500/30 bg-orange-500/10 px-5 py-3 text-sm font-medium text-[#f1a36b] disabled:opacity-40">{busy ? 'Устанавливаю ловушку…' : 'Создать ловушку'}</button>}
+      {!readOnly && <button disabled={busy || !availableServers.length || !profile || (customHighIso && !highIsoFile) || (!privateTcgTest && !hostPort) || (sharedPort !== null && (newWeight < 1 || newWeight > maxNewWeight || !Number.isInteger(newWeight)))} className="rounded-lg border border-orange-500/30 bg-orange-500/10 px-5 py-3 text-sm font-medium text-[#f1a36b] disabled:opacity-40">{busy ? 'Устанавливаю ловушку…' : 'Создать ловушку'}</button>}
     </form></div></section>
 }
 

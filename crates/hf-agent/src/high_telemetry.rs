@@ -7,16 +7,67 @@ use std::{
     time::Duration,
 };
 
-use crate::sandbox::{
-    HighDomainState, LibvirtSandboxManager, default_recipe_dir, is_supported_profile,
-};
-use hf_core::{HighGuestConnection, HighOsProfile};
+use crate::sandbox::{HighDomainState, LibvirtSandboxManager, is_supported_profile};
+use hf_core::{HighGuestConnection, HighLifecycleState, HighOsProfile};
 use hf_services::high_telemetry::{
-    HighTelemetryStore, SharedHighTelemetryStore, receive_high_telemetry_connection,
+    DEFAULT_MAX_PENDING_HIGH_EVENTS, HighTelemetryStore, SharedHighTelemetryStore,
+    receive_high_telemetry_connection,
 };
+use hf_services::kazik_outbox::SqliteKazikOutbox;
+use kazik_protocol::{DurableOutbox, MAX_TELEMETRY_BATCH_EVENTS, MAX_TELEMETRY_PACKET_BYTES};
 use serde::{Deserialize, Serialize};
 use tokio::{net::UnixStream, task::JoinHandle};
 use uuid::Uuid;
+
+use crate::AgentIdentity;
+
+/// Move one stable High batch into the ordinary durable Kazik outbox.  Source rows remain in
+/// high-telemetry.sqlite until Center confirms that this exact message was durably persisted.
+pub fn queue_pending_for_center(
+    state_dir: &Path,
+    identity: &AgentIdentity,
+    outbox: &mut SqliteKazikOutbox,
+) -> anyhow::Result<usize> {
+    let path = state_dir.join("high-telemetry.sqlite");
+    if !path.is_file() {
+        return Ok(0);
+    }
+    let mut store = HighTelemetryStore::open(&path, DEFAULT_MAX_PENDING_HIGH_EVENTS)?;
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    let Some(batch) = store.prepare_kazik_batch(
+        MAX_TELEMETRY_BATCH_EVENTS,
+        MAX_TELEMETRY_PACKET_BYTES / 2,
+        created_at,
+    )?
+    else {
+        return Ok(0);
+    };
+    let count = batch.events.len();
+    let envelope = batch.kazik_envelope(identity.agent_id, identity.transport_credential.clone());
+    crate::telemetry::ensure_packet_size(&envelope)?;
+    outbox.enqueue(envelope)?;
+    Ok(count)
+}
+
+/// Apply a semantic Center ACK to the High source queue. Unknown message IDs are intentionally
+/// ignored because Low/Middle/heartbeat envelopes share the same Kazik outbox.
+pub fn acknowledge_center_batch_from_state_dir(
+    state_dir: &Path,
+    message_id: Uuid,
+) -> anyhow::Result<bool> {
+    let path = state_dir.join("high-telemetry.sqlite");
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let mut store = HighTelemetryStore::open(path, DEFAULT_MAX_PENDING_HIGH_EVENTS)?;
+    if !store.has_kazik_batch(message_id)? {
+        return Ok(false);
+    }
+    store.acknowledge_durable_kazik_batch(message_id)?;
+    Ok(true)
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct DomainCounters {
@@ -36,6 +87,8 @@ struct HighOperationalSnapshot {
     trap_id: Uuid,
     observed_at_unix_ms: i64,
     domain_state: String,
+    #[serde(default)]
+    lifecycle_state: HighLifecycleState,
     running_since_unix_ms: Option<i64>,
     uptime_seconds: Option<u64>,
     /// Aggregate busy percentage across all guest vCPUs (for example, 150% means 1.5 cores).
@@ -95,6 +148,7 @@ impl OperationalProbe for LibvirtSandboxManager {
 
 pub fn start(
     state_dir: &Path,
+    high_recipe_dir: PathBuf,
     agent_id: Uuid,
     max_pending_events: usize,
     operational_interval: Duration,
@@ -104,6 +158,9 @@ pub fn start(
     }
     let high_root = state_dir.join("high");
     let operational_state_dir = state_dir.to_path_buf();
+    let operational_manager =
+        LibvirtSandboxManager::with_high_root(high_recipe_dir, state_dir.join("high"));
+    operational_manager.validate_recipes()?;
     fs::create_dir_all(&high_root)?;
     let store = Arc::new(Mutex::new(HighTelemetryStore::open(
         state_dir.join("high-telemetry.sqlite"),
@@ -117,6 +174,7 @@ pub fn start(
             run_operational_monitor(
                 operational_state_dir,
                 operational_store,
+                operational_manager,
                 operational_interval
             )
         );
@@ -138,13 +196,15 @@ pub fn acknowledge_center_batch(
 async fn run_operational_monitor(
     state_dir: PathBuf,
     store: SharedHighTelemetryStore,
+    manager: LibvirtSandboxManager,
     interval: Duration,
 ) {
     loop {
         let state_dir_for_poll = state_dir.clone();
         let store_for_poll = store.clone();
+        let manager_for_poll = manager.clone();
         if let Err(error) = tokio::task::spawn_blocking(move || {
-            collect_operational_snapshots(&state_dir_for_poll, &store_for_poll)
+            collect_operational_snapshots(&state_dir_for_poll, &store_for_poll, &manager_for_poll)
         })
         .await
         .map_err(|error| anyhow::anyhow!("High operational worker panicked: {error}"))
@@ -159,10 +219,9 @@ async fn run_operational_monitor(
 fn collect_operational_snapshots(
     state_dir: &Path,
     store: &SharedHighTelemetryStore,
+    manager: &LibvirtSandboxManager,
 ) -> anyhow::Result<()> {
-    let manager =
-        LibvirtSandboxManager::with_high_root(default_recipe_dir(), state_dir.join("high"));
-    collect_operational_snapshots_with_probe(state_dir, store, &manager, now_ms())
+    collect_operational_snapshots_with_probe(state_dir, store, manager, now_ms())
 }
 
 fn collect_operational_snapshots_with_probe(
@@ -236,6 +295,11 @@ fn collect_operational_snapshots_with_probe(
             trap_id,
             observed_at_unix_ms: observed,
             domain_state: domain_state_name(state).into(),
+            lifecycle_state: manifest
+                .get("lifecycle_state")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default(),
             running_since_unix_ms: running_since,
             uptime_seconds: running_since.map(|started| {
                 u64::try_from(observed.saturating_sub(started) / 1_000).unwrap_or_default()
@@ -562,6 +626,68 @@ mod tests {
         assert!(snapshot.guest_service_ready && snapshot.dnat_ready);
         assert!(!snapshot.ssh_ready);
         assert_eq!(snapshot.guest_connection, "rdp");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn high_batch_is_stable_until_center_ack_then_source_rows_are_deleted() {
+        let root = std::env::temp_dir().join(format!("hf-high-forward-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let trap_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let mut source = HighTelemetryStore::open(root.join("high-telemetry.sqlite"), 10).unwrap();
+        source
+            .ingest(
+                agent_id,
+                trap_id,
+                hf_services::high_telemetry::GuestHighEvent {
+                    version: hf_services::high_telemetry::HIGH_TELEMETRY_VERSION,
+                    guest_event_id: Uuid::new_v4(),
+                    guest_sequence: 1,
+                    occurred_at_unix_ms: 1_760_000_000_000,
+                    event_type: "process.exec".into(),
+                    session_id: Some("audit:1".into()),
+                    source_ip: None,
+                    source_port: None,
+                    destination_ip: None,
+                    destination_port: None,
+                    event_origin: "kernel_audit".into(),
+                    event_confidence: "observed".into(),
+                    transport: Some("local".into()),
+                    payload: serde_json::json!({"executable":"/usr/bin/id"}),
+                },
+                1_760_000_000_100,
+            )
+            .unwrap();
+        drop(source);
+
+        let identity = AgentIdentity {
+            agent_id,
+            transport_credential: "test-credential".into(),
+            hysteria: None,
+        };
+        let mut outbox = SqliteKazikOutbox::open(root.join("kazik.sqlite")).unwrap();
+        assert_eq!(
+            queue_pending_for_center(&root, &identity, &mut outbox).unwrap(),
+            1
+        );
+        let first = outbox.ready_to_send(10).unwrap();
+        assert_eq!(first.len(), 1);
+        let message_id = first[0].envelope.message_id;
+
+        assert_eq!(
+            queue_pending_for_center(&root, &identity, &mut outbox).unwrap(),
+            1
+        );
+        assert_eq!(
+            outbox.ready_to_send(10).unwrap()[0].envelope.message_id,
+            message_id
+        );
+        assert!(acknowledge_center_batch_from_state_dir(&root, message_id).unwrap());
+        let source = HighTelemetryStore::open(root.join("high-telemetry.sqlite"), 10).unwrap();
+        assert_eq!(source.pending_count().unwrap(), 0);
+        drop(source);
+        assert!(!acknowledge_center_batch_from_state_dir(&root, message_id).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 }

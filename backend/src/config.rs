@@ -29,6 +29,7 @@ pub struct Config {
     pub docs_enabled: bool,
     pub log_filter: String,
     pub http_max_body_bytes: usize,
+    pub high_iso_storage_dir: String,
     pub telemetry: TelemetryLimits,
     pub telemetry_ingest_token: Option<Secret>,
     pub center_ingest_token: Option<Secret>,
@@ -129,6 +130,13 @@ impl Config {
             Ok(value)
         };
         let http_max_body_bytes = number("HTTP_MAX_BODY_BYTES", "1048576", 1024, 16 * 1024 * 1024)?;
+        let high_iso_storage_dir = get("HIGH_ISO_STORAGE_DIR", "/var/lib/honeyforge/high-iso")?;
+        if !std::path::Path::new(&high_iso_storage_dir).is_absolute() {
+            return Err(ConfigError {
+                key: "HIGH_ISO_STORAGE_DIR",
+                reason: "must be an absolute directory path",
+            });
+        }
         let telemetry = TelemetryLimits {
             max_batch_events: number("TELEMETRY_MAX_BATCH_EVENTS", "100", 1, 10_000)?,
             max_payload_bytes: number(
@@ -329,6 +337,7 @@ impl Config {
             docs_enabled,
             log_filter,
             http_max_body_bytes,
+            high_iso_storage_dir,
             telemetry,
             telemetry_ingest_token,
             center_ingest_token,

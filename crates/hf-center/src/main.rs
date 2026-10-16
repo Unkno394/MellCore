@@ -17,12 +17,12 @@ use axum::{
 };
 use clap::Parser;
 use hf_core::{
-    AgentCommand, AgentRegistration, BootstrapScript, CoreError, HighUbuntuDeployment,
-    HysteriaConnection, RegisteredAgent, RemoteBootstrap, SshBootstrapTarget,
+    AgentCommand, AgentRegistration, BootstrapScript, CoreError, HighLifecycleState,
+    HighUbuntuDeployment, HysteriaConnection, RegisteredAgent, RemoteBootstrap, SshBootstrapTarget,
 };
 use kazik_protocol::{
-    AckDisposition, Acknowledgement, KazikBody, KazikEnvelope, MAX_TELEMETRY_BATCH_EVENTS,
-    MAX_TELEMETRY_PACKET_BYTES,
+    AckDisposition, Acknowledgement, HighTrapProgress, KazikBody, KazikEnvelope,
+    MAX_TELEMETRY_BATCH_EVENTS, MAX_TELEMETRY_PACKET_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use ssh2::Session;
@@ -116,6 +116,7 @@ struct AppState {
     agent_credentials: Arc<Mutex<CredentialStore>>,
     agent_heartbeats: Arc<Mutex<HashMap<Uuid, std::time::Instant>>>,
     agent_capabilities: Arc<Mutex<HashMap<Uuid, Vec<String>>>>,
+    agent_high_trap_progress: Arc<Mutex<HashMap<Uuid, Vec<HighTrapProgress>>>>,
     agent_security: Arc<Mutex<AgentSecurityStore>>,
     bootstrapper: Arc<dyn RemoteBootstrap>,
     public_center_url: Arc<str>,
@@ -233,8 +234,12 @@ struct ExistingTrapResponse {
 struct CommandStatus {
     #[serde(skip_serializing)]
     agent_id: Uuid,
+    #[serde(skip_serializing)]
+    trap_id: Option<Uuid>,
     status: &'static str,
     detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<HighLifecycleState>,
 }
 
 #[derive(Clone)]
@@ -440,6 +445,7 @@ async fn main() -> anyhow::Result<()> {
         agent_credentials: Arc::new(Mutex::new(CredentialStore::open(args.credentials_file)?)),
         agent_heartbeats: Arc::default(),
         agent_capabilities: Arc::default(),
+        agent_high_trap_progress: Arc::default(),
         agent_security: Arc::new(Mutex::new(AgentSecurityStore::open(&args.security_file)?)),
         bootstrapper: Arc::new(SshBootstrapper {
             agent_binary: args.agent_binary,
@@ -1048,6 +1054,19 @@ async fn queue_command(
         AgentCommand::RemoveTrap { trap_id, .. } => Some(*trap_id),
         _ => None,
     };
+    let trap_id = match &command {
+        AgentCommand::DeployKozyavka(deployment) => Some(deployment.trap_id),
+        AgentCommand::DeployPritvoryashka(deployment) => Some(deployment.trap_id),
+        AgentCommand::DeployHighVm(deployment) => Some(deployment.trap_id),
+        AgentCommand::DeployHighUbuntu(deployment) => Some(deployment.trap_id),
+        AgentCommand::ResetHighVm { trap_id, .. }
+        | AgentCommand::ResetHighUbuntu { trap_id, .. }
+        | AgentCommand::StopTrap { trap_id, .. }
+        | AgentCommand::RemoveTrap { trap_id, .. } => Some(*trap_id),
+        AgentCommand::ReconcileTcpPortGroup(_)
+        | AgentCommand::RebootSystem { .. }
+        | AgentCommand::UninstallAgent { .. } => None,
+    };
     let envelope = KazikEnvelope::new(agent_id, credential, now, KazikBody::Command { command });
     let message_id = envelope.message_id;
     if let Some(trap_id) = removal {
@@ -1062,8 +1081,10 @@ async fn queue_command(
         message_id,
         CommandStatus {
             agent_id,
+            trap_id,
             status: "queued",
             detail: None,
+            progress: None,
         },
     );
     state
@@ -1087,7 +1108,7 @@ async fn command_status(
     headers: HeaderMap,
 ) -> Result<Json<CommandStatus>, StatusCode> {
     authorize_control(&state, &headers)?;
-    let status = state
+    let mut status = state
         .command_statuses
         .lock()
         .await
@@ -1096,6 +1117,17 @@ async fn command_status(
         .ok_or(StatusCode::NOT_FOUND)?;
     if status.agent_id != agent_id {
         return Err(StatusCode::NOT_FOUND);
+    }
+    if status.status == "queued"
+        && let Some(trap_id) = status.trap_id
+    {
+        status.progress = state
+            .agent_high_trap_progress
+            .lock()
+            .await
+            .get(&agent_id)
+            .and_then(|traps| traps.iter().find(|item| item.trap_id == trap_id))
+            .map(|item| item.state);
     }
     Ok(Json(status))
 }
@@ -1353,6 +1385,11 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
                 .lock()
                 .await
                 .insert(envelope.agent_id, status.capabilities.clone());
+            state
+                .agent_high_trap_progress
+                .lock()
+                .await
+                .insert(envelope.agent_id, status.high_trap_progress.clone());
         }
         let mut unregistered_telemetry = false;
         if let KazikBody::Telemetry { events } = &envelope.body {
@@ -1429,6 +1466,7 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
                         "applied"
                     };
                     status.detail = ack.detail.clone();
+                    status.progress = None;
                 }
                 info!(agent_id=%envelope.agent_id, message_id=%ack.acknowledged_message_id,
                     disposition=?ack.disposition, "agent command result received");
@@ -1536,7 +1574,20 @@ async fn kazik_udp_receiver(listen: SocketAddr, state: AppState) {
                     AckDisposition::Accepted
                 }
             }
-            KazikBody::Heartbeat { .. } => AckDisposition::Accepted,
+            KazikBody::Heartbeat { status } => {
+                if let (Some(registry), Some(inventory)) =
+                    (&state.backend_registry, &status.host_inventory)
+                    && let Err(error) = registry
+                        .update_inventory(envelope.agent_id, inventory)
+                        .await
+                {
+                    // Inventory is refreshed on every heartbeat.  A backend outage must not
+                    // block command delivery or accumulate unbounded heartbeat retries.
+                    tracing::warn!(%error, agent_id=%envelope.agent_id,
+                        "host inventory was not persisted by backend");
+                }
+                AckDisposition::Accepted
+            }
             KazikBody::Register(_) | KazikBody::Command { .. } | KazikBody::Error { .. } => {
                 AckDisposition::Rejected
             }
@@ -1810,7 +1861,9 @@ fn run_ssh_install(
             CoreError::Transport(format!("cannot upload initial trap command: {error}"))
         })?;
         remote.send_eof().map_err(|error| {
-            CoreError::Transport(format!("cannot finish initial trap command upload: {error}"))
+            CoreError::Transport(format!(
+                "cannot finish initial trap command upload: {error}"
+            ))
         })?;
         remote.wait_eof().map_err(|error| {
             CoreError::Transport(format!("initial trap command did not reach EOF: {error}"))
@@ -1841,7 +1894,9 @@ fn run_ssh_install(
         }
         channel
             .write_all(script.contents.as_bytes())
-            .map_err(|error| CoreError::Transport(format!("cannot stream installer over SSH: {error}")))?;
+            .map_err(|error| {
+                CoreError::Transport(format!("cannot stream installer over SSH: {error}"))
+            })?;
         channel.send_eof().map_err(|error| {
             CoreError::Transport(format!("cannot finish installer input: {error}"))
         })?;
@@ -1860,7 +1915,8 @@ fn run_ssh_install(
         42 => return Err(CoreError::Transport(EXISTING_AGENT_ERROR.into())),
         43 => {
             return Err(CoreError::Transport(
-                "agent registration timed out; inspect /tmp/hf-agent-bootstrap.log on target".into(),
+                "agent registration timed out; inspect /tmp/hf-agent-bootstrap.log on target"
+                    .into(),
             ));
         }
         status => {

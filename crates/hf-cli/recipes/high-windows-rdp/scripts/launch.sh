@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+base_iso=${1:?verified Windows ISO}; instance_id=${2:?instance UUID}; _external_port=${3:-0}
+root_dir=${HF_HIGH_ROOT:-/var/lib/honeyforge/high}; instance_dir="$root_dir/$instance_id"; vm_name="hf-high-$instance_id"
+script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+. "$script_dir/../../high-ubuntu-ssh/scripts/firewall-common.sh"
+validate_instance_id "$instance_id"
+command -v virsh >/dev/null; command -v virt-install >/dev/null
+sh "$script_dir/create-network.sh"
+high_virt_type=${HF_HIGH_VIRT_TYPE:-kvm}
+case "$high_virt_type" in kvm|qemu) ;; *) echo "invalid High libvirt domain type: $high_virt_type" >&2; exit 1 ;; esac
+sh "$script_dir/verify-windows-media.sh" "$base_iso" "$instance_dir"
+if ! virsh dominfo "$vm_name" >/dev/null 2>&1; then
+  sh "$script_dir/create-overlay.sh" "$base_iso" "$instance_dir" "$instance_id"
+  libvirt_user=${HF_HIGH_LIBVIRT_USER:-libvirt-qemu}
+  getent passwd "$libvirt_user" >/dev/null || { echo "libvirt user does not exist: $libvirt_user" >&2; exit 1; }
+  setfacl -m "u:$libvirt_user:--x" "$(dirname "$root_dir")" "$root_dir"
+  base_parent=$(dirname "$base_iso")
+  while [ "$base_parent" != / ]; do
+    setfacl -m "u:$libvirt_user:--x" "$base_parent"
+    base_parent=$(dirname "$base_parent")
+  done
+  setfacl -m "u:$libvirt_user:r--" "$base_iso" "$instance_dir/seed.iso"
+  setfacl -m "u:$libvirt_user:rw-" "$instance_dir/disk.qcow2"
+  setfacl -m "u:$libvirt_user:rwx" "$instance_dir"
+  virt-install --virt-type "$high_virt_type" --name "$vm_name" --memory 4096 --vcpus 2 --os-variant win2k22 --disk "path=$instance_dir/disk.qcow2,format=qcow2,bus=sata" --cdrom "$base_iso" --disk "path=$instance_dir/seed.iso,device=cdrom,readonly=on" --boot cdrom,hd --network "network=$HF_HIGH_NETWORK_NAME,model=e1000e" --channel "unix,target.type=virtio,target.name=org.qemu.guest_agent.0" --graphics spice,listen=127.0.0.1 --noautoconsole
+fi
+sh "$script_dir/install-windows.sh" "$instance_id"
+rm -f "$instance_dir/external-ssh-port" "$instance_dir/publish-interface"

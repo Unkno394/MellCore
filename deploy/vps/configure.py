@@ -86,6 +86,7 @@ def main():
         f"CENTER_INGEST_TOKEN={config['center_graph_token']}\n"
         f"CENTER_CONTROL_TOKEN={config['control_token']}\n"
         f"TELEMETRY_PUBLIC_ENDPOINT=https://{DOMAIN}/internal/v1/telemetry/batches\n"
+        "HIGH_ISO_STORAGE_DIR=/var/lib/honeyforge/high-iso\n"
         "REQUIRE_EMAIL_VERIFICATION=false\nRUST_LOG=honeyforge_backend=info\n"
     )
     write(CONFIG / "backend.env", backend_env)

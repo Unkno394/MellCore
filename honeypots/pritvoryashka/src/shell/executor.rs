@@ -3431,9 +3431,15 @@ impl Shell {
             || host == "::1"
             || host == "[::1]")
         {
-            return failure("redis-cli: outbound network access is disabled in the virtual SSH shell; test the public listener from an external client\n");
+            return failure(
+                "redis-cli: outbound network access is disabled in the virtual SSH shell; test the public listener from an external client\n",
+            );
         }
-        if port != 6379 || !self.vulnerability_profiles.contains("redis_unauthenticated_access") {
+        if port != 6379
+            || !self
+                .vulnerability_profiles
+                .contains("redis_unauthenticated_access")
+        {
             return failure(format!(
                 "Could not connect to Redis at {host}:{port}: Connection refused\n"
             ));
@@ -3680,7 +3686,9 @@ impl Shell {
                 || host.starts_with("127.0.0.1")
                 || host.starts_with("[::1]");
             if !is_loopback {
-                return failure("curl: (7) Outbound network access is disabled in the virtual SSH shell; test the public listener from an external client.\n");
+                return failure(
+                    "curl: (7) Outbound network access is disabled in the virtual SSH shell; test the public listener from an external client.\n",
+                );
             }
             if port != 2121 || !self.vulnerability_profiles.contains("ftp_anonymous_login") {
                 return failure(format!(
@@ -3708,7 +3716,10 @@ impl Shell {
         let target = if args.iter().any(|arg| arg == "--get")
             && let Some(parameter) = get_parameter
         {
-            format!("{target}{}{parameter}", if target.contains('?') { "&" } else { "?" })
+            format!(
+                "{target}{}{parameter}",
+                if target.contains('?') { "&" } else { "?" }
+            )
         } else {
             target
         };
@@ -3887,7 +3898,9 @@ impl Shell {
             );
         }
         if !is_loopback && !host_port.is_empty() {
-            return failure("curl: (7) Outbound network access is disabled in the virtual SSH shell; test the public listener from an external client.\n");
+            return failure(
+                "curl: (7) Outbound network access is disabled in the virtual SSH shell; test the public listener from an external client.\n",
+            );
         }
         failure("curl: (6) Could not resolve host\n")
     }
@@ -5502,9 +5515,8 @@ fn classify_vulnerability_probe(
         "curl" if lower.contains("ftp://") => add("ftp_anonymous_login"),
         "curl" if lower.contains("http://") || lower.contains("https://") => {
             let docker_route = lower.contains(":2375") || lower.contains("/containers/json");
-            let traversal_route = lower.contains("../")
-                || lower.contains("%2e%2e")
-                || lower.contains("..%2f");
+            let traversal_route =
+                lower.contains("../") || lower.contains("%2e%2e") || lower.contains("..%2f");
             let injection_route = (lower.contains("cmd=") || lower.contains("host="))
                 && (lower.contains(';')
                     || lower.contains('|')
@@ -5523,10 +5535,9 @@ fn classify_vulnerability_probe(
             if injection_route {
                 add("web_command_injection");
             }
-            let admin_route = lower.contains(":8080")
-                && (lower.ends_with("/") || lower.contains("/admin"));
-            if (!docker_route && !traversal_route && !injection_route) || admin_route
-            {
+            let admin_route =
+                lower.contains(":8080") && (lower.ends_with("/") || lower.contains("/admin"));
+            if (!docker_route && !traversal_route && !injection_route) || admin_route {
                 add("http_admin_panel_exposure");
             }
         }

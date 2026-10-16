@@ -77,6 +77,7 @@ for binary in hf-center hf-agent hf-dispatcher honeyforge-backend; do
     fi
     install -m 0755 "$artifact_dir/bin/$binary" "/usr/local/bin/$binary"
 done
+ln -sfn /usr/local/bin/hf-agent /usr/local/bin/hf
 install -m 0600 "$artifact_dir/low.tar" /opt/mellcore/artifacts/low.tar
 install -m 0600 "$artifact_dir/middle.tar" /opt/mellcore/artifacts/middle.tar
 install -m 0644 "$artifact_dir/hf-high-ubuntu-ssh.tar.gz" /opt/mellcore/artifacts/hf-high-ubuntu-ssh.tar.gz
@@ -88,7 +89,8 @@ for binary in hf-center hf-agent hf-dispatcher honeyforge-backend; do
 done
 install -d -m 0755 /usr/local/lib/honeyforge
 tar --no-same-owner -xzf /opt/mellcore/artifacts/hf-high-ubuntu-ssh.tar.gz -C /usr/local/lib/honeyforge
-chmod 0755 /usr/local/lib/honeyforge/hf-image-builder/hf-image-builder
+chmod 0755 /usr/local/lib/honeyforge/hf-image-builder/hf-image-builder \
+    /usr/local/lib/honeyforge/hf-image-builder/builder.py
 install -d -m 0700 /root/mellcore-backups
 cp -p /etc/hysteria/config.yaml "/root/mellcore-backups/hysteria-$(date +%Y%m%d-%H%M%S).yaml"
 systemctl stop hf-agent hf-center 2>/dev/null || true
@@ -109,6 +111,7 @@ temporary.chmod(0o600)
 temporary.replace(snippet)
 PY
 getent passwd honeyforge >/dev/null || useradd --system --home-dir /var/lib/honeyforge/backend --create-home --shell /usr/sbin/nologin honeyforge
+install -d -o honeyforge -g honeyforge -m 0700 /var/lib/honeyforge/high-iso
 install -d -m 0755 /etc/honeyforge
 chown root:honeyforge /etc/honeyforge/backend.env
 chmod 0640 /etc/honeyforge/backend.env
@@ -163,6 +166,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+ReadWritePaths=/var/lib/honeyforge/high-iso
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -192,6 +196,27 @@ server {
     auth_basic "MellCore operators";
     auth_basic_user_file /etc/honeyforge/panel.htpasswd;
     location = /v1/hysteria/auth { return 404; }
+    location = /api/v1/high-iso-upload {
+        auth_basic off;
+        client_max_body_size 8g;
+        client_body_timeout 2h;
+        proxy_request_buffering off;
+        proxy_send_timeout 2h;
+        proxy_read_timeout 2h;
+        proxy_pass http://127.0.0.1:18080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+    location ^~ /api/v1/high-iso/ {
+        auth_basic off;
+        access_log off;
+        proxy_buffering off;
+        proxy_send_timeout 2h;
+        proxy_read_timeout 2h;
+        proxy_pass http://127.0.0.1:18080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+    }
     location = /v1/agents/register {
         auth_basic off;
         proxy_pass http://127.0.0.1:18081;

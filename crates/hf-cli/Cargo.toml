@@ -1,0 +1,28 @@
+[package]
+name = "hf-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local HoneyForge honeypot lifecycle CLI"
+repository = "https://github.com/Unkno394/MellCore"
+readme = "README.md"
+
+[[bin]]
+name = "hf"
+path = "src/main.rs"
+
+[[bin]]
+name = "hf-local-dispatcher"
+path = "src/dispatcher.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

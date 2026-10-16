@@ -31,6 +31,8 @@ media and trusted checksums before deployment. The archive installs the builder 
 it does not invent source URLs, checksums or license approval. Existing approved prepared images can
 be used without Packer.
 
-The original ISO/Unattend scripts remain for manifests carrying the legacy
-`InstallMediaAndDisk + UnattendedInstall` profile. Guest event telemetry still requires a reviewed
-Windows sensor; this recipe does not synthesize it.
+The ISO/Unattend path validates that index 2 is a supported Windows Server 2022 evaluation image,
+waits for installed-system RDP, ejects all installation media, cold-boots the disk and requires RDP
+again before writing `installed-disk-verified`. Guest event telemetry still requires a reviewed
+Windows sensor; this recipe does not synthesize it. Like the prepared-image path, legacy ISO RDP
+remains host-only and never creates DNAT automatically.

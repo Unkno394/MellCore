@@ -14,6 +14,8 @@ use crate::{
     errors::AppError,
 };
 
+const MAX_HOST_INVENTORY_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegisterTrap {
@@ -39,6 +41,69 @@ pub struct RegisteredTrap {
 pub struct RemoveTrapRegistration {
     pub agent_id: Uuid,
     pub trap_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostInventoryUpdate {
+    pub agent_id: Uuid,
+    pub inventory: hf_core::HostInventory,
+}
+
+fn valid_inventory(inventory: &hf_core::HostInventory) -> bool {
+    inventory.schema_version == 1
+        && !inventory.static_info.cpu.architecture.is_empty()
+        && inventory.static_info.cpu.architecture.len() <= 32
+        && inventory.static_info.cpu.flags.len() <= 256
+        && inventory.static_info.disks.len() <= 64
+        && inventory.static_info.gpus.len() <= 64
+        && inventory.static_info.network.len() <= 64
+        && serde_json::to_vec(inventory).is_ok_and(|json| json.len() <= MAX_HOST_INVENTORY_BYTES)
+}
+
+pub async fn update_inventory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<HostInventoryUpdate>,
+) -> Result<StatusCode, AppError> {
+    authorize_center(&state, &headers)?;
+    if input.agent_id.is_nil() || !valid_inventory(&input.inventory) {
+        return Err(AppError::invalid("Invalid or oversized host inventory"));
+    }
+    let updated = sqlx::query(
+        "UPDATE servers s SET host_inventory=$2,inventory_updated_at=now(),status='online' \
+         FROM center_agent_servers cas WHERE cas.agent_id=$1 AND cas.server_id=s.server_id",
+    )
+    .bind(input.agent_id)
+    .bind(sqlx::types::Json(input.inventory))
+    .execute(state.pool()?)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(AppError::not_found());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inventory_validation_is_bounded_and_versioned() {
+        let mut inventory = hf_core::HostInventory {
+            schema_version: 1,
+            collected_at_unix_ms: 1,
+            static_info: hf_core::HostStaticInventory::default(),
+            dynamic: hf_core::HostDynamicMetrics::default(),
+        };
+        inventory.static_info.cpu.architecture = "x86_64".into();
+        assert!(valid_inventory(&inventory));
+        inventory.static_info.cpu.flags = (0..257).map(|index| format!("f{index}")).collect();
+        assert!(!valid_inventory(&inventory));
+        inventory.static_info.cpu.flags.clear();
+        inventory.schema_version = 2;
+        assert!(!valid_inventory(&inventory));
+    }
 }
 
 pub async fn mark_removed(
@@ -87,9 +152,9 @@ pub async fn register_trap(
     {
         return Err(AppError::invalid("Invalid Center trap registration"));
     }
-    let kind = match input.tier.as_str() {
-        "low" => "kozyavka",
-        "middle" => "pritvoryashka",
+    let (kind, target_port) = match input.tier.as_str() {
+        "low" => ("kozyavka", 2222),
+        "middle" => ("pritvoryashka", 2222),
         _ => {
             return Err(AppError::invalid(
                 "Only Low and Middle traps may be registered",
@@ -215,8 +280,8 @@ pub async fn register_trap(
         return Err(AppError::conflict("Trap already reserves a different port"));
     }
     if previous_port.is_none() {
-        sqlx::query("INSERT INTO server_ports(server_id,user_id,transport,host_port,purpose,trap_id,target_port,route_mode) VALUES($1,$2,'tcp',$3,'trap',$4,2222,'direct')")
-            .bind(server_id).bind(owner).bind(i32::from(input.host_port)).bind(input.trap_id)
+        sqlx::query("INSERT INTO server_ports(server_id,user_id,transport,host_port,purpose,trap_id,target_port,route_mode) VALUES($1,$2,'tcp',$3,'trap',$4,$5,'direct')")
+            .bind(server_id).bind(owner).bind(i32::from(input.host_port)).bind(input.trap_id).bind(target_port)
             .execute(&mut *tx).await?;
     }
     sqlx::query("INSERT INTO center_agent_traps(trap_id,agent_id) VALUES($1,$2) ON CONFLICT (trap_id) DO NOTHING")

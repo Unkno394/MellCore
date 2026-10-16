@@ -138,11 +138,15 @@ fn sync_scenario_packages(
     if profiles.contains("redis_unauthenticated_access") {
         ensure_scenario_package(&mut virtual_filesystem, "redis-server", now)?;
         let profile = virtual_filesystem.distribution().linux_profile();
-        let redis_cli = profile.map_or("/usr/bin/redis-cli", |profile| profile.redis_cli_executable);
-        let redis_config = profile.map_or("/etc/redis/redis.conf", |profile| profile.redis_config_file);
+        let redis_cli =
+            profile.map_or("/usr/bin/redis-cli", |profile| profile.redis_cli_executable);
+        let redis_config =
+            profile.map_or("/etc/redis/redis.conf", |profile| profile.redis_config_file);
         let redis_pid = profile.map_or("/run/redis-server.pid", |profile| profile.redis_pid_file);
         let redis_data_dir = profile.map_or("/var/lib/redis", |profile| profile.redis_data_dir);
-        let redis_store = profile.map_or("/var/lib/redis/virtual-store.json", |profile| profile.redis_store_file);
+        let redis_store = profile.map_or("/var/lib/redis/virtual-store.json", |profile| {
+            profile.redis_store_file
+        });
         ensure_scenario_directory(&mut virtual_filesystem, redis_data_dir, now)?;
         ensure_scenario_directory(&mut virtual_filesystem, "/etc/redis", now)?;
         ensure_scenario_directory(&mut virtual_filesystem, "/run", now)?;
@@ -263,9 +267,11 @@ fn ensure_scenario_directory(
     let mut current = path;
     while !filesystem.exists(current) {
         pending.push(current.to_owned());
-        current = current
-            .rsplit_once('/')
-            .map_or("/", |(parent, _)| if parent.is_empty() { "/" } else { parent });
+        current =
+            current.rsplit_once('/').map_or(
+                "/",
+                |(parent, _)| if parent.is_empty() { "/" } else { parent },
+            );
         if current == "/" {
             break;
         }

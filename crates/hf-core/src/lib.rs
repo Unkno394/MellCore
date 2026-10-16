@@ -1,10 +1,13 @@
 //! Stable domain contracts. Network transports and infrastructure live outside this crate.
 
+pub mod host_inventory;
 pub mod math;
 pub mod security;
 
 /// SSH identification shared by Low and Middle backends behind one Dispatcher listener.
 pub const SHARED_SSH_IDENTIFICATION: &str = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.10";
+
+pub use host_inventory::*;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -353,9 +356,7 @@ pub fn pritvoryashka_service_endpoints_for_os(
     let endpoints = pritvoryashka_service_endpoints(profiles)?;
     if profiles
         .iter()
-        .any(|profile| {
-            profile != "ssh_weak_credentials" && profile.starts_with("win_") != windows
-        })
+        .any(|profile| profile != "ssh_weak_credentials" && profile.starts_with("win_") != windows)
     {
         return Err("Vulnerability profiles must match the Middle operating system");
     }
@@ -954,6 +955,20 @@ pub enum HighImagePreparation {
     BestEffortInstall,
 }
 
+/// Durable deployment progress for long-running High VM installation workflows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HighLifecycleState {
+    Downloading,
+    VmCreated,
+    Installing,
+    Rebooting,
+    Configuring,
+    #[default]
+    Ready,
+    Failed,
+}
+
 /// The service published externally by a High guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -1026,6 +1041,33 @@ impl HighOsProfile {
             image_kind: HighImageKind::InstallMediaAndDisk,
             image_preparation: HighImagePreparation::UnattendedInstall,
             connection: HighGuestConnection::Rdp { guest_port: 3389 },
+        }
+    }
+
+    pub const fn ubuntu_iso_ssh() -> Self {
+        Self {
+            guest_os: HighGuestOs::Ubuntu,
+            image_kind: HighImageKind::InstallMediaAndDisk,
+            image_preparation: HighImagePreparation::UnattendedInstall,
+            connection: HighGuestConnection::Ssh { guest_port: 22 },
+        }
+    }
+
+    pub const fn debian_iso_ssh() -> Self {
+        Self {
+            guest_os: HighGuestOs::Debian,
+            image_kind: HighImageKind::InstallMediaAndDisk,
+            image_preparation: HighImagePreparation::UnattendedInstall,
+            connection: HighGuestConnection::Ssh { guest_port: 22 },
+        }
+    }
+
+    pub const fn arch_linux_iso_ssh() -> Self {
+        Self {
+            guest_os: HighGuestOs::ArchLinux,
+            image_kind: HighImageKind::InstallMediaAndDisk,
+            image_preparation: HighImagePreparation::UnattendedInstall,
+            connection: HighGuestConnection::Ssh { guest_port: 22 },
         }
     }
 
@@ -1303,6 +1345,9 @@ mod tests {
             HighOsProfile::arch_linux_ssh(),
             HighOsProfile::windows_rdp(),
             HighOsProfile::windows_rdp_legacy_iso(),
+            HighOsProfile::ubuntu_iso_ssh(),
+            HighOsProfile::debian_iso_ssh(),
+            HighOsProfile::arch_linux_iso_ssh(),
             HighOsProfile::custom_linux_qcow2_ssh(),
             HighOsProfile::custom_linux_iso_ssh(),
         ] {
@@ -1312,6 +1357,22 @@ mod tests {
                 profile
             );
         }
+    }
+
+    #[test]
+    fn high_lifecycle_states_use_backend_facing_names() {
+        assert_eq!(
+            serde_json::to_string(&HighLifecycleState::Downloading).unwrap(),
+            "\"DOWNLOADING\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HighLifecycleState::VmCreated).unwrap(),
+            "\"VM_CREATED\""
+        );
+        assert_eq!(
+            serde_json::from_str::<HighLifecycleState>("\"REBOOTING\"").unwrap(),
+            HighLifecycleState::Rebooting
+        );
     }
 
     #[test]
@@ -1352,8 +1413,7 @@ mod tests {
         assert_eq!(decoded.image_source, deployment.image_source);
         assert_eq!(decoded.profile, HighOsProfile::debian_ssh());
 
-        let unsupported: HighImageArchitecture =
-            serde_json::from_str("\"sparc64\"").unwrap();
+        let unsupported: HighImageArchitecture = serde_json::from_str("\"sparc64\"").unwrap();
         assert_eq!(unsupported, HighImageArchitecture::Unknown);
     }
 }

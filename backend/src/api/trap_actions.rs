@@ -10,12 +10,26 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
-use hf_core::{AgentCommand, PritvoryashkaDeployment, SharedTcpTrapKind, TcpPortGroup};
+use hf_core::{
+    AgentCommand, HighLifecycleState, PritvoryashkaDeployment, SharedTcpTrapKind, TcpPortGroup,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, types::Json as SqlxJson};
 use std::collections::{HashMap, HashSet};
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+fn lifecycle_progress_name(state: HighLifecycleState) -> &'static str {
+    match state {
+        HighLifecycleState::Downloading => "DOWNLOADING",
+        HighLifecycleState::VmCreated => "VM_CREATED",
+        HighLifecycleState::Installing => "INSTALLING",
+        HighLifecycleState::Rebooting => "REBOOTING",
+        HighLifecycleState::Configuring => "CONFIGURING",
+        HighLifecycleState::Ready => "READY",
+        HighLifecycleState::Failed => "FAILED",
+    }
+}
 
 #[derive(Clone, Copy, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -25,7 +39,6 @@ pub enum TrapAction {
     Restart,
     Remove,
 }
-
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TrapActionRequest {
@@ -37,6 +50,8 @@ pub struct TrapActionProgress {
     pub action_id: Uuid,
     pub status: String,
     pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +63,8 @@ struct QueuedCommand {
 struct CenterCommandStatus {
     status: String,
     detail: Option<String>,
+    #[serde(default)]
+    progress: Option<HighLifecycleState>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -245,6 +262,7 @@ pub async fn share_port(
             action_id,
             status: "queued".into(),
             detail: None,
+            progress: None,
         }),
     ))
 }
@@ -469,7 +487,6 @@ pub async fn reconcile_shared_jobs(state: AppState) {
         }
     }
 }
-
 async fn shared_start_plan(
     state: &AppState,
     principal: &Principal,
@@ -664,6 +681,7 @@ pub async fn start(
             action_id,
             status: "queued".into(),
             detail: None,
+            progress: None,
         }),
     ))
 }
@@ -690,6 +708,7 @@ pub async fn status(
             action_id,
             status: previous,
             detail: row.get("detail"),
+            progress: None,
         }));
     }
 
@@ -711,6 +730,7 @@ pub async fn status(
                     action_id,
                     status: "failed".into(),
                     detail: Some(LOST_CENTER_COMMAND.into()),
+                    progress: None,
                 }));
             }
             Err(error) => return Err(error),
@@ -730,6 +750,11 @@ pub async fn status(
         "queued"
     };
     let detail = rejected.and_then(|item| item.detail.clone());
+    let progress = statuses.iter().find_map(|item| {
+        item.progress
+            .map(lifecycle_progress_name)
+            .map(|value| value.to_owned())
+    });
     if status != "queued" {
         if status == "succeeded"
             && !row
@@ -793,6 +818,7 @@ pub async fn status(
         action_id,
         status: status.into(),
         detail,
+        progress,
     }))
 }
 

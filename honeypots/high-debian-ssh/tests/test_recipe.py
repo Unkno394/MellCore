@@ -50,6 +50,7 @@ class DebianRecipeTests(unittest.TestCase):
             for name, body in {
                 "qemu-img": '#!/bin/sh\n: > "$8"\n',
                 "cloud-localds": '#!/bin/sh\nprintf "%s\\n" "$@" > "$HF_TEST_CLOUD_ARGS"\n: > "$2"\n',
+                "virt-customize": '#!/bin/sh\nprintf "%s\\n" "$@" > "$HF_TEST_VIRT_ARGS"\n',
             }.items():
                 tool = tools / name
                 tool.write_text(body)
@@ -59,9 +60,11 @@ class DebianRecipeTests(unittest.TestCase):
             base.write_bytes(b"immutable Debian base")
             instance = root / "instance"
             cloud_args = root / "cloud-localds.args"
+            virt_args = root / "virt-customize.args"
             env = os.environ.copy()
             env["PATH"] = f"{tools}:{env['PATH']}"
             env["HF_TEST_CLOUD_ARGS"] = str(cloud_args)
+            env["HF_TEST_VIRT_ARGS"] = str(virt_args)
             subprocess.run(
                 [
                     "sh",
@@ -85,6 +88,25 @@ class DebianRecipeTests(unittest.TestCase):
                 f"--network-config={instance / 'network-config'}",
                 cloud_args.read_text().splitlines(),
             )
+            customization = virt_args.read_text().splitlines()
+            self.assertIn(str(instance / "disk.qcow2"), customization)
+            self.assertNotIn(str(base), customization)
+            self.assertIn("--network", customization)
+            self.assertIn("qemu-guest-agent,auditd", customization)
+
+    def test_guest_agent_and_audit_telemetry_are_required_at_first_boot(self):
+        user_data = (RECIPE / "cloud-init" / "user-data").read_text()
+        self.assertIn("test -x /usr/sbin/qemu-ga", user_data)
+        self.assertIn("systemctl restart qemu-guest-agent.service", user_data)
+        self.assertIn("systemctl is-active --quiet qemu-guest-agent.service", user_data)
+        self.assertIn("test -x /usr/sbin/auditd", user_data)
+        self.assertIn("augenrules --load", user_data)
+        self.assertIn("systemctl enable --now auditd", user_data)
+
+    def test_repeated_publication_keeps_existing_dnat(self):
+        wrapper = (RECIPE / "scripts" / "publish-service.sh").read_text()
+        self.assertLess(wrapper.index("check-publication.sh"), wrapper.index("publish-ssh.sh"))
+        self.assertIn("exit 0", wrapper)
 
     def test_debian_opts_into_distinct_dhcp_timeout_diagnostic(self):
         wrapper = (RECIPE / "scripts" / "publish-service.sh").read_text()

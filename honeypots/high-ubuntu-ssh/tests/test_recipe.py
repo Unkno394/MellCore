@@ -249,6 +249,7 @@ class MultiOsRecipeTests(unittest.TestCase):
                     "high-arch-ssh",
                     "high-windows-rdp",
                     "high-custom-iso",
+                    "hf-image-builder",
                 },
             )
 
@@ -340,6 +341,26 @@ for chain, rules in state.get("iptables:nat", {}).items():
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_iso_e2e_scope_uses_separate_network_bridge_subnet_and_chains(self):
+        environment = dict(self.environment, HF_HIGH_NETWORK_SCOPE="e2e")
+        result = subprocess.run(
+            [
+                "sh",
+                "-c",
+                '. "$1"; printf "%s\\n" "$HF_HIGH_NETWORK_NAME|$HF_HIGH_BRIDGE|$HF_HIGH_DHCP_START|$HF_HIGH_INPUT_CHAIN|$HF_HIGH_FORWARD_CHAIN|$HF_HIGH_DNAT_CHAIN"',
+                "sh",
+                str(SCRIPTS / "firewall-common.sh"),
+            ],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            result.stdout.strip(),
+            "hf-high-iso-e2e|virbr-hfiso|192.168.251.100|HF_E2E_INPUT|HF_E2E_FORWARD|HF_E2E_DNAT",
+        )
 
     def run_script(self, name, *arguments, check=True):
         return subprocess.run(

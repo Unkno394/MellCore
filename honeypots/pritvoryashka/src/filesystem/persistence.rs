@@ -167,7 +167,7 @@ mod tests {
         serialized["filesystem"]["nodes"]
             .as_object_mut()
             .unwrap()
-            .remove("/etc/ssh");
+            .remove("/etc/apt");
         fs::write(&path, serde_json::to_vec(&serialized).unwrap()).unwrap();
 
         let loaded = PersistentVirtualFileSystem::open(
@@ -175,14 +175,14 @@ mod tests {
             VirtualFileSystem::linux("matrix-host", Utc::now()),
         )
         .unwrap();
-        assert!(loaded.filesystem().is_dir("/etc/ssh"));
-        assert!(loaded.filesystem().exists("/etc/ssh/sshd_config"));
+        assert!(loaded.filesystem().is_dir("/etc/apt"));
+        assert!(loaded.filesystem().is_dir("/etc/apt/apt.conf.d"));
 
         let reopened = PersistentVirtualFileSystem::open(
             &path,
             VirtualFileSystem::linux("matrix-host", Utc::now()),
         )
         .unwrap();
-        assert!(reopened.filesystem().is_dir("/etc/ssh"));
+        assert!(reopened.filesystem().is_dir("/etc/apt"));
     }
 }

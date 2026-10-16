@@ -1,7 +1,8 @@
 //! Control-plane adapter for agent-managed High virtual machines.
 
 use hf_core::{
-    AgentCommand, HighGuestConnection, HighOsProfile, HighVmDeployment, HighVmRuntimeMode,
+    AgentCommand, HighGuestConnection, HighImageArchitecture, HighImageFormat, HighImageSource,
+    HighOsProfile, HighVmDeployment, HighVmRuntimeMode,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -37,12 +38,12 @@ pub fn validate_profile(
     if level != TrapLevel::High {
         return Err(AppError::invalid("high_vm requires high interaction"));
     }
-    if config.get("base_image").is_some() || config.get("image_source").is_some() {
+    if config.get("base_image").is_some() {
         return Err(AppError::invalid(
-            "High VM images are managed by the agent and cannot be overridden in profile config",
+            "High VM base images are managed by the agent and cannot be overridden in profile config",
         ));
     }
-    let profile = os_profile(config)?;
+    let profile = deployment_profile(config)?;
     let service_matches = match profile.connection {
         HighGuestConnection::Ssh { .. } => service == "ssh",
         HighGuestConnection::Rdp { .. } => service == "rdp",
@@ -52,7 +53,71 @@ pub fn validate_profile(
             "selected High OS profile requires its matching SSH or RDP service",
         ));
     }
+    if config.get("high_image_mode").and_then(Value::as_str) == Some("custom_iso")
+        && runtime_mode(config)? == HighVmRuntimeMode::PrivateTcgTest
+    {
+        return Err(AppError::invalid(
+            "A user-supplied ISO requires public KVM mode",
+        ));
+    }
     Ok(profile)
+}
+
+fn deployment_profile(config: &Value) -> Result<HighOsProfile, AppError> {
+    match config.get("high_image_mode").and_then(Value::as_str) {
+        None | Some("prepared") => {
+            if config.get("image_source").is_some() || config.get("custom_iso_os").is_some() {
+                return Err(AppError::invalid(
+                    "Prepared High images cannot include a custom ISO source",
+                ));
+            }
+            os_profile(config)
+        }
+        Some("custom_iso") => {
+            let selected = config
+                .get("custom_iso_os")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AppError::invalid("Choose the operating system contained in the ISO")
+                })?;
+            let profile = match selected {
+                "ubuntu" => HighOsProfile::ubuntu_iso_ssh(),
+                "debian" => HighOsProfile::debian_iso_ssh(),
+                "arch" => HighOsProfile::arch_linux_iso_ssh(),
+                "windows" => HighOsProfile::windows_rdp_legacy_iso(),
+                _ => {
+                    return Err(AppError::invalid(
+                        "Unsupported operating system in custom ISO",
+                    ));
+                }
+            };
+            let base_profile = os_profile(config)?;
+            if base_profile.guest_os != profile.guest_os {
+                return Err(AppError::invalid(
+                    "The selected trap profile must match the operating system in the ISO",
+                ));
+            }
+            let source: HighImageSource = config
+                .get("image_source")
+                .cloned()
+                .and_then(|source| serde_json::from_value(source).ok())
+                .ok_or_else(|| AppError::invalid("Upload an ISO before starting this High trap"))?;
+            if source.format != HighImageFormat::Iso
+                || source.architecture != HighImageArchitecture::X86_64
+                || source.sha256.len() != 64
+                || !source.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || !source.url.starts_with("https://")
+            {
+                return Err(AppError::invalid(
+                    "Custom ISO must be an uploaded x86_64 ISO with a valid SHA-256",
+                ));
+            }
+            Ok(profile)
+        }
+        Some(_) => Err(AppError::invalid(
+            "high_image_mode must be prepared or custom_iso",
+        )),
+    }
 }
 
 pub fn validate_ports(trap: &Trap) -> Result<(), AppError> {
@@ -91,7 +156,7 @@ pub fn validate_port_bindings(
             "Public High traps need one direct TCP port and cannot join a Dispatcher group",
         ));
     }
-    let profile = os_profile(config)?;
+    let profile = deployment_profile(config)?;
     let expected_target_port = match profile.connection {
         HighGuestConnection::Ssh { guest_port } => guest_port,
         HighGuestConnection::Rdp { guest_port } => guest_port,
@@ -115,7 +180,17 @@ pub fn deployment_command(trap: &Trap) -> Result<AgentCommand, AppError> {
         &trap.profile_snapshot.service_type,
         &trap.effective_config,
     )?;
-    if profile != effective_profile {
+    let selected_iso = trap
+        .effective_config
+        .get("high_image_mode")
+        .and_then(Value::as_str)
+        == Some("custom_iso");
+    if if selected_iso {
+        profile.guest_os != effective_profile.guest_os
+            || profile.connection != effective_profile.connection
+    } else {
+        profile != effective_profile
+    } {
         return Err(AppError::conflict(
             "High trap OS no longer matches its selected profile",
         ));
@@ -129,6 +204,26 @@ pub fn deployment_command(trap: &Trap) -> Result<AgentCommand, AppError> {
         _ => return Err(AppError::invalid("Unsupported High VM operating system")),
     };
     let runtime_mode = runtime_mode(&trap.effective_config)?;
+    let image_source = if selected_iso {
+        Some(
+            serde_json::from_value(
+                trap.effective_config
+                    .get("image_source")
+                    .cloned()
+                    .ok_or_else(|| {
+                        AppError::invalid("Upload an ISO before starting this High trap")
+                    })?,
+            )
+            .map_err(|_| AppError::invalid("Invalid uploaded ISO metadata"))?,
+        )
+    } else {
+        None
+    };
+    let deployment_profile = if selected_iso {
+        effective_profile
+    } else {
+        profile
+    };
     Ok(AgentCommand::DeployHighVm(HighVmDeployment {
         command_id: Uuid::new_v4(),
         trap_id: trap.trap_id,
@@ -138,8 +233,8 @@ pub fn deployment_command(trap: &Trap) -> Result<AgentCommand, AppError> {
         } else {
             trap.ports[0].host_port
         },
-        profile,
-        image_source: None,
+        profile: deployment_profile,
+        image_source,
         runtime_mode,
     }))
 }
