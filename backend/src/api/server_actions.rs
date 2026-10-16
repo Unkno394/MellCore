@@ -70,7 +70,7 @@ pub async fn start(
             "Для перезагрузки нужно обновить hf-agent на сервере.",
         ));
     }
-    let mut tx = resources::owned_tx(state.pool()?, &principal).await?;
+    let mut tx = resources::owned_tx(state.pool()?, &principal, "servers.manage").await?;
     // Center may register a Middle/Low trap through a backend callback while
     // processing commands. Serialize operations with an advisory lock, but let
     // that callback acquire the server row lock.

@@ -51,8 +51,9 @@ pub async fn create(
     request: Uuid,
     mut input: ServerInput,
 ) -> Result<Server, AppError> {
+    principal.require("servers.connect")?;
     input.validate()?;
-    let mut tx = owned_tx(pool, principal).await?;
+    let mut tx = owned_tx(pool, principal, "servers.connect").await?;
     let server:Server=sqlx::query_as("INSERT INTO servers(server_id,user_id,name,host,ssh_port,ssh_user,credential_ref,dispatcher_port,settings) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *")
         .bind(Uuid::new_v4()).bind(principal.user.id).bind(input.name).bind(input.host).bind(i32::from(input.ssh_port)).bind(input.ssh_user).bind(input.credential_ref).bind(input.dispatcher_port.map(i32::from)).bind(Json(input.settings)).fetch_one(&mut *tx).await?;
     reserve_management(&mut tx, &server).await?;
@@ -68,6 +69,7 @@ pub async fn create(
     Ok(server)
 }
 pub async fn get(pool: &PgPool, principal: &Principal, id: Uuid) -> Result<Server, AppError> {
+    principal.require("servers.view")?;
     Ok(
         sqlx::query_as("SELECT * FROM servers WHERE server_id=$1 AND user_id=$2")
             .bind(id)
@@ -81,6 +83,7 @@ pub async fn list(
     principal: &Principal,
     page: Page,
 ) -> Result<ServerPage, AppError> {
+    principal.require("servers.view")?;
     let limit = page.size()?;
     let mut items:Vec<Server>=sqlx::query_as("SELECT * FROM servers WHERE user_id=$1 AND ($2::uuid IS NULL OR server_id>$2) ORDER BY server_id LIMIT $3").bind(principal.user.id).bind(page.after).bind((limit+1) as i64).fetch_all(pool).await?;
     let next_cursor = if items.len() > limit {
@@ -98,8 +101,9 @@ pub async fn update(
     request: Uuid,
     mut input: UpdateServer,
 ) -> Result<Server, AppError> {
+    principal.require("servers.manage")?;
     input.server.validate()?;
-    let mut tx = owned_tx(pool, principal).await?;
+    let mut tx = owned_tx(pool, principal, "servers.manage").await?;
     let previous = lock(&mut tx, principal.user.id, id).await?;
     let deletion_pending: bool =
         sqlx::query_scalar("SELECT deletion_pending FROM servers WHERE server_id=$1")
@@ -130,7 +134,8 @@ pub async fn delete(
     id: Uuid,
     request: Uuid,
 ) -> Result<(), AppError> {
-    let mut tx = owned_tx(pool, principal).await?;
+    principal.require("servers.disconnect")?;
+    let mut tx = owned_tx(pool, principal, "servers.disconnect").await?;
     lock(&mut tx, principal.user.id, id).await?;
     // FK RESTRICT prevents implicit deletion of traps and external resources.
     sqlx::query("DELETE FROM servers WHERE server_id=$1 AND user_id=$2")
@@ -147,6 +152,7 @@ pub async fn ports(
     principal: &Principal,
     id: Uuid,
 ) -> Result<Vec<PortReservation>, AppError> {
+    principal.require("servers.view")?;
     get(pool, principal, id).await?;
     Ok(sqlx::query_as("SELECT server_id,transport,host_port,purpose,trap_id,target_port,route_mode,weight FROM server_ports WHERE server_id=$1 AND user_id=$2 ORDER BY transport,host_port").bind(id).bind(principal.user.id).fetch_all(pool).await?)
 }

@@ -1,6 +1,8 @@
 pub mod auth;
+pub mod access_admin;
 pub mod center_registry;
 pub mod profiles;
+pub mod roles;
 pub mod server_actions;
 pub mod server_bootstrap;
 pub mod servers;
@@ -120,9 +122,9 @@ pub struct HealthResponse {
     info(
         title = "HoneyForge Backend",
         version = "0.1.0",
-        description = "Management API and internal telemetry ingestion. Public registration always grants user role. Email login uses Bearer JWT. Profiles are shared templates; only administrators modify them. Servers and traps are owner-scoped. The server bootstrap endpoint installs an agent through Center over SSH; ordinary server registration and desired trap state do not deploy anything. A shared public endpoint uses one application protocol; the current TCP Dispatcher accepts compatible SSH Low/Middle traps and assigns each a distinct loopback backend port. Pritvoryashka telemetry uses an independent opaque bearer token, validates trap/server ownership and is stored idempotently in PostgreSQL."
+        description = "Management API and internal telemetry ingestion. Email login uses Bearer JWT; current RBAC permissions are resolved from PostgreSQL on every request. Built-in and custom roles are supported, while servers and traps remain strictly owner-scoped. The server bootstrap endpoint installs an agent through Center over SSH; ordinary server registration and desired trap state do not deploy anything. A shared public endpoint uses one application protocol; the current TCP Dispatcher accepts compatible SSH Low/Middle traps and assigns each a distinct loopback backend port. Agent telemetry uses an independent opaque bearer token, validates trap/server ownership and is stored idempotently in PostgreSQL."
     ),
-    paths(live, ready, auth::register, auth::verify_email, auth::resend_verification, auth::forgot_password, auth::reset_password, auth::change_password, auth::change_email, auth::login, auth::refresh, auth::me, auth::logout, users::create, users::list, users::get, users::update, users::delete, profiles::create, profiles::list, profiles::get, profiles::update, profiles::delete, servers::create, servers::list, servers::get, servers::update, servers::delete, servers::presence, servers::ports, server_bootstrap::start, server_bootstrap::status, server_actions::start, server_actions::status, traps::create, traps::list, traps::get, traps::update, traps::delete, traps::runtime_config, trap_actions::start, trap_actions::status, trap_actions::share_port, telemetry::ingest, telemetry::ingest_from_center, telemetry::list, telemetry::get_event, telemetry::list_bait_engagement, telemetry::list_attack_matches, telemetry::list_graph_proposals, telemetry::review_graph_proposal),
+    paths(live, ready, auth::register, access_admin::accept_invitation, auth::verify_email, auth::resend_verification, auth::forgot_password, auth::reset_password, auth::change_password, auth::change_email, auth::login, auth::refresh, auth::me, auth::logout, users::create, users::list, users::get, users::update, users::delete, roles::permissions, roles::list, roles::create, roles::update, roles::copy, roles::delete, roles::user_access, roles::assign_user, access_admin::create_invitation, access_admin::list_invitations, access_admin::revoke_invitation, access_admin::role_audit, profiles::create, profiles::list, profiles::get, profiles::update, profiles::delete, servers::create, servers::list, servers::get, servers::update, servers::delete, servers::presence, servers::ports, server_bootstrap::start, server_bootstrap::status, server_actions::start, server_actions::status, traps::create, traps::list, traps::get, traps::update, traps::delete, traps::runtime_config, trap_actions::start, trap_actions::status, trap_actions::share_port, telemetry::ingest, telemetry::ingest_from_center, telemetry::list, telemetry::get_event, telemetry::list_bait_engagement, telemetry::list_attack_matches, telemetry::list_graph_proposals, telemetry::review_graph_proposal),
     modifiers(&SecuritySchemes),
     components(schemas(
         trap_actions::TrapActionRequest,
@@ -212,6 +214,10 @@ pub fn router_with_state(state: AppState) -> Router {
             post(center_registry::mark_removed),
         )
         .route("/api/v1/auth/register", post(auth::register))
+        .route(
+            "/api/v1/auth/accept-invitation",
+            post(access_admin::accept_invitation),
+        )
         .route("/api/v1/auth/verify-email", post(auth::verify_email))
         .route(
             "/api/v1/auth/resend-verification",
@@ -290,6 +296,27 @@ pub fn router_with_state(state: AppState) -> Router {
             get(traps::get).put(traps::update).delete(traps::delete),
         )
         .route("/api/v1/users", get(users::list).post(users::create))
+        .route("/api/v1/permissions", get(roles::permissions))
+        .route("/api/v1/roles", get(roles::list).post(roles::create))
+        .route(
+            "/api/v1/roles/{id}",
+            axum::routing::put(roles::update).delete(roles::delete),
+        )
+        .route("/api/v1/roles/{id}/copy", post(roles::copy))
+        .route(
+            "/api/v1/invitations",
+            get(access_admin::list_invitations).post(access_admin::create_invitation),
+        )
+        .route(
+            "/api/v1/invitations/{id}",
+            axum::routing::delete(access_admin::revoke_invitation),
+        )
+        .route("/api/v1/audit/roles", get(access_admin::role_audit))
+        .route("/api/v1/users/{id}/permissions", get(roles::user_access))
+        .route(
+            "/api/v1/users/{id}/roles",
+            axum::routing::put(roles::assign_user),
+        )
         .route(
             "/api/v1/users/{id}",
             get(users::get).put(users::update).delete(users::delete),

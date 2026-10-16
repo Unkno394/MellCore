@@ -81,6 +81,8 @@ pub struct TokenResponse {
 #[derive(Serialize, ToSchema)]
 pub struct MeResponse {
     pub user: User,
+    pub roles: Vec<crate::rbac::RbacRole>,
+    pub permissions: Vec<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -244,6 +246,8 @@ pub async fn register(
     // Public clients cannot choose a role, ID or legacy username.
     let user = sqlx::query_as::<_, User>("INSERT INTO users(id,username,name,email,password_hash,role) VALUES ($1,$2,$3,$4,$5,'user') RETURNING id,username,name,email,email_verified_at,role,is_active,created_at,updated_at")
         .bind(user_id).bind(user_id.simple().to_string()).bind(name).bind(email).bind(hash).fetch_one(&mut *tx).await?;
+    sqlx::query("INSERT INTO user_role_assignments(user_id,role_id,assigned_by) VALUES($1,'00000000-0000-4000-8000-000000000004',$1)")
+        .bind(user.id).execute(&mut *tx).await?;
     management::audit(&mut tx, user.id, "auth.register", user.id, id.0).await?;
     tx.commit().await?;
     if let Some(queue) = &state.email_verifications
@@ -395,10 +399,13 @@ pub async fn refresh(
 }
 
 #[utoipa::path(get,path="/api/v1/auth/me",tag="auth",security(("bearer"=[])),responses((status=200,body=MeResponse),(status=403,body=crate::errors::ErrorResponse),(status=401,body=crate::errors::ErrorResponse)))]
-pub async fn me(principal: Principal) -> Json<MeResponse> {
-    Json(MeResponse {
+pub async fn me(State(state): State<AppState>, principal: Principal) -> Result<Json<MeResponse>, AppError> {
+    let access = crate::rbac::effective_access(state.pool()?, &principal, principal.user.id).await?;
+    Ok(Json(MeResponse {
         user: principal.user,
-    })
+        roles: access.roles,
+        permissions: access.permissions,
+    }))
 }
 
 #[utoipa::path(post,path="/api/v1/auth/logout",tag="auth",responses((status=204,description="Refresh session and its JWTs revoked")))]
