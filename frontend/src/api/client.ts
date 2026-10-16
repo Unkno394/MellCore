@@ -109,6 +109,54 @@ export class ApiClient {
       options.signal?.removeEventListener('abort', abortFromCaller)
     }
   }
+
+  async uploadFile<T>(path: string, file: File, timeoutMs = 2 * 60 * 60_000): Promise<T> {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort('timeout'), timeoutMs)
+    const headers = new Headers({
+      Accept: 'application/json',
+      'Content-Type': 'application/octet-stream',
+    })
+    const token = this.getToken()
+    if (token) headers.set('Authorization', `Bearer ${token}`)
+    try {
+      const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers,
+        body: file,
+        signal: controller.signal,
+      })
+      const headerRequestId = response.headers.get('x-request-id')
+      const text = await response.text()
+      const payload = text ? safelyParseJson(text) : undefined
+      if (!response.ok) {
+        const error = payload as ErrorResponse | undefined
+        const requestId = error?.error?.request_id ?? headerRequestId
+        if (response.status === 401 && token) this.onUnauthorized()
+        throw new ApiError(error?.error?.message ?? `Ошибка запроса (${response.status})`, {
+          status: response.status,
+          code: error?.error?.code ?? 'http_error',
+          requestId,
+        })
+      }
+      return payload as T
+    } catch (error) {
+      if (error instanceof ApiError) throw error
+      if (controller.signal.aborted) {
+        throw new ApiError('Загрузка ISO прервана или превысила 2 часа.', {
+          status: 0,
+          code: controller.signal.reason === 'timeout' ? 'request_timeout' : 'request_cancelled',
+        })
+      }
+      throw new ApiError('Не удалось загрузить ISO в Центр MellCore.', {
+        status: 0,
+        code: 'network_error',
+      })
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
 }
 
 function safelyParseJson(text: string): unknown {

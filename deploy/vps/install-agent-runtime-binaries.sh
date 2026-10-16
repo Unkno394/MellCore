@@ -52,6 +52,7 @@ if (( dispatcher_was_active )) && ! systemctl restart hf-dispatcher.service; the
     systemctl status hf-dispatcher.service --no-pager -l || true
     exit 1
 fi
+ln -sfn /usr/local/bin/hf-agent /usr/local/bin/hf
 
 echo "hf-agent и hf-dispatcher обновлены. Резервные копии: $backup"
 systemctl status hf-agent.service --no-pager -l || true

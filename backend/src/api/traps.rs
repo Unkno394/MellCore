@@ -96,6 +96,8 @@ pub async fn delete(
     Path(id): Path<Uuid>,
     Extension(request): Extension<RequestId>,
 ) -> Result<StatusCode, AppError> {
+    let trap = resources::traps::get(state.pool()?, &principal, id).await?;
     resources::traps::delete(state.pool()?, &principal, id, request.0).await?;
+    crate::high_iso::remove_unreferenced_for_trap(&state, &principal, &trap).await;
     Ok(StatusCode::NO_CONTENT)
 }

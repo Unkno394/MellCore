@@ -1,14 +1,18 @@
 import {
   Activity,
+  ArrowUpRight,
   Bug,
   Crosshair,
   LayoutDashboard,
   Server,
   Settings,
   ShieldCheck,
+  Terminal,
   type LucideIcon,
 } from 'lucide-react'
+import { useState } from 'react'
 import FuzzyText from '../FuzzyText'
+import LocalCliPanel from './LocalCliPanel'
 
 export type PageName =
   | 'Dashboard'
@@ -36,6 +40,8 @@ export default function Sidebar({
   activePage,
   onNavigate,
 }: SidebarProps) {
+  const [isCliPanelOpen, setIsCliPanelOpen] = useState(false)
+
   return (
     <aside className="flex w-60 shrink-0 flex-col border-r border-white/10 bg-[#100a09]/85 p-5 backdrop-blur-xl">
       <div className="mb-10 flex items-center gap-3">
@@ -101,20 +107,32 @@ export default function Sidebar({
         })}
       </nav>
 
-      <div className="mt-auto rounded-xl border border-white/10 bg-black/20 p-4">
-        <div className="mb-2 flex items-center gap-2 text-xs text-white/60">
-          <span className="h-2 w-2 rounded-full bg-emerald-400" />
-          Состояние системы
+      <button
+        type="button"
+        onClick={() => setIsCliPanelOpen(true)}
+        aria-haspopup="dialog"
+        aria-expanded={isCliPanelOpen}
+        className="mt-auto rounded-xl border border-orange-500/25 bg-orange-500/[0.07] p-4 text-left transition hover:border-orange-400/50 hover:bg-orange-500/[0.12] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-400"
+      >
+        <div className="flex items-start justify-between gap-3">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-orange-400/20 bg-orange-400/10 text-orange-300">
+            <Terminal aria-hidden="true" className="h-[18px] w-[18px]" />
+          </span>
+          <ArrowUpRight aria-hidden="true" className="mt-1 h-4 w-4 text-white/35" />
         </div>
 
-        <div className="text-sm font-medium text-white">
-          API управления
+        <div className="mt-3 text-sm font-semibold text-white">
+          Попробуйте CLI-агента
         </div>
+        <div className="mt-1 text-xs leading-relaxed text-white/45">
+          Разверните ловушки прямо на своём сервере
+        </div>
+      </button>
 
-        <div className="mt-1 text-xs text-white/40">
-          Сеанс авторизован
-        </div>
-      </div>
+      <LocalCliPanel
+        open={isCliPanelOpen}
+        onClose={() => setIsCliPanelOpen(false)}
+      />
     </aside>
   )
 }

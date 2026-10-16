@@ -7,6 +7,7 @@ import type {
   BootstrapServerInput,
   CursorPage,
   IncomingEvent,
+  HighIsoUploadResponse,
   PortReservation,
   Profile,
   ProfileInput,
@@ -115,6 +116,8 @@ export function createApi(client: ApiClient) {
           method: 'POST',
           body: { server_id: serverId, trap },
         }),
+      uploadHighIso: (file: File) =>
+        client.uploadFile<HighIsoUploadResponse>('/high-iso-upload', file),
       update: (trap: Trap, input: TrapInput) =>
         client.request<Trap>(`/traps/${trap.trap_id}`, {
           method: 'PUT',

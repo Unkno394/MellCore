@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 argon2 = { version = "0.6", features = ["getrandom"] }
 axum = { version = "0.8.9", features = ["json"] }
+futures-util = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15.7"
 serde = { version = "1", features = ["derive"] }
@@ -17,7 +18,7 @@ jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_c
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls", "ring", "webpki-roots"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs", "io-util"] }
 tower-http = { version = "0.6", features = ["limit", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

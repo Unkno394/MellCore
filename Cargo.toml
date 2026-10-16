@@ -4,6 +4,7 @@ members = [
     "crates/hf-services",
     "crates/hf-center",
     "crates/hf-agent",
+    "crates/hf-cli",
     "crates/hf-dispatcher",
     "crates/kazik-protocol",
     "honeypots/pritvoryashka",

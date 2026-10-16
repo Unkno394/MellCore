@@ -5,7 +5,8 @@ export type TrapDesiredState = 'running' | 'stopped'
 export type MiddleSshAuthMode = 'realistic' | 'adaptive'
 export type SshCredential = { username: string; password: string }
 export type TrapAction = 'start' | 'stop' | 'restart' | 'remove'
-export type TrapActionProgress = { action_id: string; status: 'queued' | 'succeeded' | 'failed'; detail: string | null }
+export type HighTrapProgressState = 'DOWNLOADING' | 'VM_CREATED' | 'INSTALLING' | 'REBOOTING' | 'CONFIGURING' | 'READY' | 'FAILED'
+export type TrapActionProgress = { action_id: string; status: 'queued' | 'succeeded' | 'failed'; detail: string | null; progress?: HighTrapProgressState }
 export type BaitKind =
   | 'account' | 'file' | 'credential' | 'database' | 'backup'
   | 'network_service' | 'web_interface' | 'process' | 'system_config'
@@ -220,6 +221,18 @@ export type TrapInput = {
   resources?: ContainerResourceLimits
   desired_state: TrapDesiredState
   ports: PortBinding[]
+}
+
+export type HighImageSource = {
+  url: string
+  sha256: string
+  format: 'iso'
+  architecture: 'x86_64'
+}
+
+export type HighIsoUploadResponse = {
+  image_source: HighImageSource
+  size_bytes: number
 }
 
 export type Trap = {

@@ -34,7 +34,8 @@ use hf_services::{
     kazik_outbox::{SqliteKazikOutbox, send_pending_once},
 };
 use kazik_protocol::{
-    AckDisposition, Acknowledgement, AgentStatus, DurableOutbox, KazikBody, KazikEnvelope,
+    AckDisposition, Acknowledgement, AgentStatus, DurableOutbox, HighTrapProgress, KazikBody,
+    KazikEnvelope,
 };
 use sandbox::{
     HighAcceleration, HighDomainState, HighVm, LibvirtSandboxManager, default_image_for,
@@ -146,6 +147,7 @@ struct ComposeProjectStore {
     mutation_lock: Arc<std::sync::Mutex<()>>,
     high_acceleration: HighAcceleration,
     allow_tcg_test_mode: bool,
+    local_mode: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -426,7 +428,13 @@ impl ComposeProjectStore {
             mutation_lock: Arc::new(std::sync::Mutex::new(())),
             high_acceleration: HighAcceleration::Auto,
             allow_tcg_test_mode: false,
+            local_mode: false,
         }
+    }
+
+    fn with_local_mode(mut self) -> Self {
+        self.local_mode = true;
+        self
     }
 
     fn with_high_runtime(
@@ -1365,6 +1373,25 @@ impl ComposeProjectStore {
             .min(u32::MAX as usize) as u32
     }
 
+    fn high_trap_progress(&self) -> Vec<HighTrapProgress> {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| {
+                let trap_id = Uuid::parse_str(&entry.file_name().to_string_lossy()).ok()?;
+                let manifest = self.load_high_manifest(trap_id).ok().flatten()?;
+                Some(HighTrapProgress {
+                    trap_id,
+                    state: manifest.lifecycle_state,
+                })
+            })
+            .take(64)
+            .collect()
+    }
+
     /// Prepares one isolated Compose project. Applying it is intentionally deferred until a
     /// trusted recipe exists for the requested tier/protocol.
     #[allow(dead_code)] // Invoked by the forthcoming authenticated HFSP control adapter.
@@ -1733,10 +1760,16 @@ impl ComposeProjectStore {
             ),
             None => "      - ./runtime:/var/lib/honeyforge-low\n".into(),
         };
+        let logging = if self.local_mode {
+            "    pull_policy: never\n    logging:\n      driver: \"none\"\n"
+        } else {
+            ""
+        };
         let compose = format!(
-            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    command: [\"--config\", \"/etc/honeyforge/config.json\"]\n    ports:\n      - \"{}:{}:{}/tcp\"\n    volumes:\n      - ./config.json:/etc/honeyforge/config.json:ro\n{}    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: {}m\n    cpus: {:.3}\n    pids_limit: {}\n    ulimits:\n      nofile:\n        soft: 256\n        hard: 256\n    init: true\n",
+            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n{}    command: [\"--config\", \"/etc/honeyforge/config.json\"]\n    ports:\n      - \"{}:{}:{}/tcp\"\n    volumes:\n      - ./config.json:/etc/honeyforge/config.json:ro\n{}    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: {}m\n    cpus: {:.3}\n    pids_limit: {}\n    ulimits:\n      nofile:\n        soft: 256\n        hard: 256\n    init: true\n",
             deployment.trap_id.simple(),
             image,
+            logging,
             deployment.publish_address,
             deployment.host_port,
             deployment.container_port,
@@ -1897,7 +1930,11 @@ impl ComposeProjectStore {
             .map_err(anyhow::Error::msg)?;
         let new_project = !project_dir.exists();
         fs::create_dir_all(project_dir.join("runtime"))?;
-        let telemetry_endpoint = std::env::var("HF_TELEMETRY_PUBLIC_ENDPOINT").ok();
+        let telemetry_endpoint = if self.local_mode {
+            None
+        } else {
+            std::env::var("HF_TELEMETRY_PUBLIC_ENDPOINT").ok()
+        };
         let telemetry_enabled = telemetry_endpoint.is_some();
         if telemetry_enabled && std::env::var("HF_TELEMETRY_INGEST_TOKEN").is_err() {
             anyhow::bail!("HF_TELEMETRY_INGEST_TOKEN is required with telemetry endpoint");
@@ -1947,7 +1984,7 @@ impl ComposeProjectStore {
             "telemetry": {
                 "endpoint": telemetry_endpoint,
                 "token_env": if telemetry_enabled { Some("HF_TELEMETRY_INGEST_TOKEN") } else { None },
-                "jsonl_path": "/var/lib/pritvoryashka/events.jsonl",
+                "jsonl_path": if self.local_mode { "/dev/null" } else { "/var/lib/pritvoryashka/events.jsonl" },
                 "queue_capacity": 1024,
                 "batch_size": 50,
                 "flush_interval_ms": 500,
@@ -1987,10 +2024,16 @@ impl ComposeProjectStore {
                 )
             })
             .collect::<String>();
+        let logging = if self.local_mode {
+            "    pull_policy: never\n    logging:\n      driver: \"none\"\n"
+        } else {
+            ""
+        };
         let mut compose = format!(
-            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n    ports:\n      - \"{}:{}:2222/tcp\"\n{}    volumes:\n      - ./pritvoryashka.json:/etc/honeyforge/pritvoryashka.json:ro\n      - ./runtime:/var/lib/pritvoryashka\n{}    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: {}m\n    cpus: {:.3}\n    pids_limit: {}\n    ulimits:\n      nofile:\n        soft: 1024\n        hard: 1024\n    init: true\n",
+            "name: hf-{}\nservices:\n  honeypot:\n    image: {}\n    restart: unless-stopped\n{}    ports:\n      - \"{}:{}:2222/tcp\"\n{}    volumes:\n      - ./pritvoryashka.json:/etc/honeyforge/pritvoryashka.json:ro\n      - ./runtime:/var/lib/pritvoryashka\n{}    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: {}m\n    cpus: {:.3}\n    pids_limit: {}\n    ulimits:\n      nofile:\n        soft: 1024\n        hard: 1024\n    init: true\n",
             deployment.trap_id.simple(),
             image,
+            logging,
             deployment.publish_address,
             deployment.host_port,
             additional_ports,
@@ -3087,6 +3130,7 @@ async fn run_kazik_hysteria_loop(
                             capabilities
                         },
                         host_inventory: current_host_inventory,
+                        high_trap_progress: projects.high_trap_progress(),
                     }},
                 );
                 outbox.enqueue_heartbeat(heartbeat)?;
@@ -4239,6 +4283,7 @@ mod tests {
                             active_trap_count: 0,
                             capabilities: vec![],
                             host_inventory: None,
+                            high_trap_progress: vec![],
                         },
                     },
                 ))

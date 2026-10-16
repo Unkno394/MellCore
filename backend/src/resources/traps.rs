@@ -73,7 +73,14 @@ async fn snapshot(
         )?;
         let requested_os =
             crate::high_vm::validate_profile(profile.level, &profile.service_type, &effective)?;
-        if configured_os != requested_os {
+        let custom_iso =
+            effective.get("high_image_mode").and_then(Value::as_str) == Some("custom_iso");
+        if if custom_iso {
+            configured_os.guest_os != requested_os.guest_os
+                || configured_os.connection != requested_os.connection
+        } else {
+            configured_os != requested_os
+        } {
             return Err(AppError::invalid(
                 "A trap cannot override the operating system selected by its High profile",
             ));

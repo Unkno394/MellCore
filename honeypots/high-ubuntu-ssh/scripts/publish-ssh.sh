@@ -111,9 +111,12 @@ if nat_port_is_claimed_elsewhere "$external_port"; then
   exit 1
 fi
 
-ipt -t nat -I "$HF_HIGH_DNAT_CHAIN" 1 -i "$publish_interface" -m addrtype --dst-type LOCAL -p tcp --dport "$external_port" -j DNAT --to-destination "$guest_ip:$guest_port"
-ipt -I "$HF_HIGH_FORWARD_CHAIN" 1 -i "$publish_interface" -o "$bridge" -p tcp -d "$guest_ip" --dport "$guest_port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
-ipt -I "$HF_HIGH_FORWARD_CHAIN" 1 -i "$bridge" -o "$publish_interface" -p tcp -s "$guest_ip" --sport "$guest_port" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+# Persist enough exact rule data before adding any firewall rules. If a later rule insertion
+# fails, the caller's cleanup path can remove the subset that was already installed.
 printf '%s\n' "$guest_ip" > "$root_dir/$instance_id/guest-ip"
 printf '%s\n' "$guest_port" > "$root_dir/$instance_id/guest-service-port"
 printf '%s\n' "$publish_interface" > "$root_dir/$instance_id/publish-interface"
+
+ipt -t nat -I "$HF_HIGH_DNAT_CHAIN" 1 -i "$publish_interface" -m addrtype --dst-type LOCAL -p tcp --dport "$external_port" -j DNAT --to-destination "$guest_ip:$guest_port"
+ipt -I "$HF_HIGH_FORWARD_CHAIN" 1 -i "$publish_interface" -o "$bridge" -p tcp -d "$guest_ip" --dport "$guest_port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
+ipt -I "$HF_HIGH_FORWARD_CHAIN" 1 -i "$bridge" -o "$publish_interface" -p tcp -s "$guest_ip" --sport "$guest_port" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT

@@ -469,6 +469,11 @@ pub async fn send_pending_once(
             .envelope
             .encode_hfsp(item.sequence, 0)
             .map_err(|error| DeliveryPumpError::Codec(error.to_string()))?;
+        // Older agents may have persisted packets larger than Hysteria can relay.
+        // Keep those rows for later recovery, but let heartbeats and command ACKs pass.
+        if packet.len() > MAX_TELEMETRY_PACKET_BYTES {
+            continue;
+        }
         sender
             .send(&packet)
             .await
@@ -493,6 +498,7 @@ mod tests {
                     active_trap_count: 2,
                     capabilities: vec![],
                     host_inventory: None,
+                    high_trap_progress: vec![],
                 },
             },
         )

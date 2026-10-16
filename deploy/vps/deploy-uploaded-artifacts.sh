@@ -107,6 +107,7 @@ for name in hf-center hf-agent hf-dispatcher honeyforge-backend; do
     install -m 0755 "$artifacts/$name" "/usr/local/bin/.$name.new"
     mv -f "/usr/local/bin/.$name.new" "/usr/local/bin/$name"
 done
+ln -sfn /usr/local/bin/hf-agent /usr/local/bin/hf
 systemctl reload nginx
 systemctl restart honeyforge-backend hf-center hf-agent
 if [[ -s /etc/honeyforge/dispatcher.json ]]; then

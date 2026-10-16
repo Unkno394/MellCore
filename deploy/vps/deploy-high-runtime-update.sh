@@ -119,6 +119,7 @@ allowed = {
 expected = {f'{name}/scripts/launch.sh' for name in allowed if name in {
     'high-ubuntu-ssh', 'high-debian-ssh', 'high-arch-ssh', 'high-windows-rdp'
 }}
+expected.add('high-ubuntu-ssh/scripts/launch-local.sh')
 expected.add('high-custom-iso/scripts/launch-iso.sh')
 expected.update({
     'hf-image-builder/hf-image-builder',
@@ -185,6 +186,7 @@ systemctl restart hf-center.service
 systemctl is-active --quiet hf-center.service
 systemctl restart hf-agent.service
 systemctl is-active --quiet hf-agent.service
+ln -sfn /usr/local/bin/hf-agent /usr/local/bin/hf
 
 changed=0
 trap - ERR

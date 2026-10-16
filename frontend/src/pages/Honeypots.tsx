@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
-import { profileNameLabel, statusLabel } from '../i18n/labels'
+import { highProgressDescription, highProgressLabel, profileNameLabel, statusLabel } from '../i18n/labels'
 import { apiErrorMessage } from '../api/client'
 import type { MellCoreApi } from '../api/services'
-import type { Server, Trap, TrapAction } from '../api/types'
+import type { HighTrapProgressState, Server, Trap, TrapAction } from '../api/types'
 
 type Props = {
   api: MellCoreApi
@@ -39,6 +39,7 @@ export default function Honeypots({ api, traps, servers, readOnly, onChanged, on
   const [busyAction, setBusyAction] = useState<TrapAction | null>(null)
   const [deletingRegistration, setDeletingRegistration] = useState(false)
   const [pending, setPending] = useState<{ trapId: string; actionId: string; action: TrapAction } | null>(null)
+  const [pendingProgress, setPendingProgress] = useState<HighTrapProgressState | null>(null)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const serverNames = useMemo(() => new Map(servers.map((server) => [server.server_id, server])), [servers])
@@ -63,11 +64,13 @@ export default function Honeypots({ api, traps, servers, readOnly, onChanged, on
         const result = await api.traps.actionStatus(pending!.trapId, pending!.actionId)
         if (cancelled) return
         if (result.status === 'queued') {
+          setPendingProgress(result.progress ?? null)
           timer = window.setTimeout(() => { void poll() }, 2000)
           return
         }
         const action = pending!.action
         setPending(null)
+        setPendingProgress(null)
         setBusyAction(null)
         if (result.status === 'succeeded') {
           setError('')
@@ -92,6 +95,7 @@ export default function Honeypots({ api, traps, servers, readOnly, onChanged, on
     if (action === 'remove' && !window.confirm(`Остановить и удалить ловушку «${selected.name}» с сервера?`)) return
     setError('')
     setMessage('')
+    setPendingProgress(null)
     setBusyAction(action)
     try {
       const result = await api.traps.action(selected.trap_id, action)
@@ -100,6 +104,7 @@ export default function Honeypots({ api, traps, servers, readOnly, onChanged, on
     } catch (requestError) {
       setBusyAction(null)
       setError(apiErrorMessage(requestError))
+      setPendingProgress(null)
     }
   }
 
@@ -111,6 +116,7 @@ export default function Honeypots({ api, traps, servers, readOnly, onChanged, on
     if (!window.confirm(warning)) return
     setError('')
     setMessage('')
+    setPendingProgress(null)
     setDeletingRegistration(true)
     try {
       await api.traps.delete(selected.trap_id)
@@ -172,7 +178,9 @@ export default function Honeypots({ api, traps, servers, readOnly, onChanged, on
                     : <ActionButton label="Удалить" disabled={actionsDisabled} onClick={() => void runAction('remove')} tone="red"/>}
                 </>}
               </div>
-              {busyAction && <p role="status" className="mt-3 text-xs text-orange-200/70">{pending ? `Ожидаю подтверждение: ${actionText[busyAction].toLowerCase()}…` : 'Отправляю команду агенту…'}</p>}
+              {busyAction && pendingProgress && pending?.action === 'start' && pending.trapId === selected.trap_id && selected.profile_snapshot.level === 'high'
+                ? <div role="status" className="mt-3 rounded-lg border border-orange-300/15 bg-orange-300/[0.04] p-3"><p className="text-xs font-medium text-orange-200/80">High · {highProgressLabel(pendingProgress)}</p><p className="mt-1.5 text-xs leading-5 text-white/45">{highProgressDescription(pendingProgress)}</p></div>
+                : busyAction && <p role="status" className="mt-3 text-xs text-orange-200/70">{pending ? `Ожидаю подтверждение: ${actionText[busyAction].toLowerCase()}…` : 'Отправляю команду агенту…'}</p>}
               {error && <p role="alert" className="mt-3 text-xs text-red-300">{error}</p>}
               {message && !error && <p role="status" className="mt-3 text-xs text-emerald-200/75">{message}</p>}
               {readOnly && <p className="mt-3 text-xs text-white/35">У вас доступ только для просмотра.</p>}

@@ -66,6 +66,7 @@ with tarfile.open(root / 'hf-high-ubuntu-ssh.tar.gz') as archive:
         raise SystemExit('High archive содержит неожиданные пути или типы файлов')
     required_recipe = {
         'high-ubuntu-ssh/scripts/launch.sh', 'high-ubuntu-ssh/scripts/reset.sh',
+        'high-ubuntu-ssh/scripts/launch-local.sh',
         'high-ubuntu-ssh/scripts/create-overlay.sh', 'high-ubuntu-ssh/cloud-init/user-data',
         'high-arch-ssh/scripts/launch.sh', 'high-arch-ssh/scripts/download-base-image.sh',
         'high-arch-ssh/cloud-init/user-data',

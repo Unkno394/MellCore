@@ -62,6 +62,7 @@ if ! systemctl restart hf-agent.service || ! systemctl is-active --quiet hf-agen
     echo 'hf-agent did not start; its previous binary was restored.' >&2
     exit 1
 fi
+ln -sfn /usr/local/bin/hf-agent /usr/local/bin/hf
 curl --fail --silent --show-error --resolve yourpasswordforemail.ru:443:127.0.0.1 \
     https://yourpasswordforemail.ru/ >/dev/null
 echo 'Native backend, frontend and local agent deployed successfully.'

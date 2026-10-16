@@ -19,7 +19,8 @@ use hf_core::{
 const MAX_ITEMS: usize = 64;
 const MAX_CPU_FLAGS: usize = 256;
 const MAX_TEXT: usize = 256;
-const MAX_TRANSPORT_BYTES: usize = 56 * 1024;
+// Keep the complete heartbeat, including its HFSP envelope, below Hysteria's UDP limit.
+const MAX_TRANSPORT_BYTES: usize = 2 * 1024;
 
 pub struct HostInventoryCollector {
     static_info: HostStaticInventory,

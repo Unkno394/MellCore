@@ -1,4 +1,32 @@
 // API values remain unchanged; only their presentation is localized.
+import type { HighTrapProgressState } from '../api/types'
+
+export function highProgressLabel(value: HighTrapProgressState): string {
+  const labels: Record<HighTrapProgressState, string> = {
+    DOWNLOADING: 'Скачивание и проверка ISO',
+    VM_CREATED: 'Создание виртуальной машины',
+    INSTALLING: 'Установка операционной системы',
+    REBOOTING: 'Перезагрузка виртуальной машины',
+    CONFIGURING: 'Настройка и проверка доступа',
+    READY: 'Готово',
+    FAILED: 'Ошибка установки',
+  }
+  return labels[value]
+}
+
+export function highProgressDescription(value: HighTrapProgressState): string {
+  const descriptions: Record<HighTrapProgressState, string> = {
+    DOWNLOADING: 'Агент скачивает ISO и сверяет его SHA-256. Размер файла и скорость соединения влияют на длительность этапа.',
+    VM_CREATED: 'ISO проверен. Агент создаёт и запускает виртуальную машину.',
+    INSTALLING: 'Гостевая операционная система устанавливается внутри виртуальной машины.',
+    REBOOTING: 'Виртуальная машина перезагружается после установки системы.',
+    CONFIGURING: 'Агент настраивает гостевую систему и проверяет подключение к её службе.',
+    READY: 'Виртуальная машина настроена и отвечает на проверку агента.',
+    FAILED: 'Агент не смог завершить установку.',
+  }
+  return descriptions[value]
+}
+
 export function statusLabel(value: string): string {
   const labels: Record<string, string> = {
     running: 'Работает', installing: 'Устанавливается', failed: 'Ошибка',

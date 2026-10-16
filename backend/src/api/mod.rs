@@ -20,7 +20,6 @@ use axum::{
     routing::{get, post},
 };
 use serde::Serialize;
-use tower_http::limit::RequestBodyLimitLayer;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
@@ -255,6 +254,11 @@ pub fn router_with_state(state: AppState) -> Router {
             get(servers::presence),
         )
         .route("/api/v1/traps", get(traps::list).post(traps::create))
+        .route("/api/v1/high-iso-upload", post(crate::high_iso::upload))
+        .route(
+            "/api/v1/high-iso/{artifact_id}",
+            get(crate::high_iso::download),
+        )
         .route(
             "/api/v1/traps/{trap_id}/runtime-config",
             get(traps::runtime_config),
@@ -334,7 +338,6 @@ pub fn router_with_state(state: AppState) -> Router {
     app.fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(config.http_max_body_bytes))
-        .layer(RequestBodyLimitLayer::new(config.http_max_body_bytes))
         .layer(middleware::from_fn(request_context))
         .layer(cors)
         .with_state(state)

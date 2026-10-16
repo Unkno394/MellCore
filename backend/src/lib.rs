@@ -15,6 +15,7 @@ pub mod resources;
 
 pub mod dispatcher;
 pub mod email_verification;
+pub mod high_iso;
 pub mod high_ubuntu;
 pub mod high_vm;
 pub mod kozyavka;
