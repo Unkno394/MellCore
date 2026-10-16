@@ -16,21 +16,22 @@ type LocalCliPanelProps = {
   onClose: () => void
 }
 
-const buildCommands = `cargo build --release --locked -p hf-cli
-scp target/release/hf target/release/hf-local-dispatcher root@SERVER:/tmp/`
-
-const installCommands = `sudo install -m 0755 /tmp/hf /usr/local/bin/hf
-sudo install -m 0755 /tmp/hf-local-dispatcher /usr/local/bin/hf-local-dispatcher
+const installCommands = `cargo install hf-cli --version 0.1.0 --root "$HOME/.local"
+sudo install -m 0755 "$HOME/.local/bin/hf" /usr/local/bin/hf
+sudo install -m 0755 "$HOME/.local/bin/hf-local-dispatcher" /usr/local/bin/hf-local-dispatcher
 hf --help`
 
 const deployCommands = `sudo hf deploy low --port 2222
 sudo hf deploy low --port 2225 --shared --auth-mode configured --username admin --password-file /root/low-password
 sudo hf deploy medium --port 2225 --shared --os debian --hostname srv-app-01 --username admin --ssh-auth-mode realistic --password-file /root/middle-password
 sudo hf deploy high --os ubuntu --port 2224 --hostname web-01 --username admin --shell bash --password-file /root/high-password
+sudo hf deploy high --os debian --port 2227 --shared --hostname high-debian-1 --username admin --shell bash --password-file /root/high-password
+sudo hf deploy high --os debian --port 2227 --shared --weight 50 --hostname high-debian-2 --username admin --shell bash --password-file /root/high-password
 sudo hf deploy high --os windows --port 3389
 sudo hf deploy high --os debian --iso /srv/iso/debian.iso --port 2226
 
 sudo hf list
+sudo hf logs high-1 --lines 50
 sudo hf stop high-1
 sudo hf remove high-1`
 
@@ -135,7 +136,7 @@ export default function LocalCliPanel({ open, onClose }: LocalCliPanelProps) {
 
         <div className="min-h-0 flex-1 space-y-7 overflow-y-auto px-6 py-6 sm:px-8">
           <div className="rounded-xl border border-orange-400/15 bg-orange-400/[0.05] p-4 text-sm leading-relaxed text-white/65">
-            Это отдельный бинарник hf-cli для локальных операций. Он не устанавливает hf-agent, не
+            Это отдельная команда hf из пакета hf-cli для локальных операций. Она не устанавливает hf-agent, не
             подключается к Центру, не использует протоколы управления, SSH-туннели или веб-панель.
             Список ловушек хранится локально на сервере.
           </div>
@@ -150,15 +151,11 @@ export default function LocalCliPanel({ open, onClose }: LocalCliPanelProps) {
                   Установка команды
                 </h3>
                 <p className="mt-0.5 text-xs text-white/40">
-                  Соберите отдельный hf-cli из корня репозитория и скопируйте его на Linux-сервер.
+                  На Linux-сервере с Rust/Cargo установите hf-cli из crates.io. Пакет содержит hf и hf-local-dispatcher.
                 </p>
               </div>
             </div>
-            <CodeSnippet label="Сборка и передача" value={buildCommands} />
-            <div className="mb-3 mt-4 text-xs text-white/40">
-              Затем на сервере установите команду:
-            </div>
-            <CodeSnippet label="На Linux-сервере" value={installCommands} />
+            <CodeSnippet label="Установка на Linux-сервере" value={installCommands} />
           </section>
 
           <section aria-labelledby="local-cli-requirements-title">
@@ -181,8 +178,13 @@ export default function LocalCliPanel({ open, onClose }: LocalCliPanelProps) {
                   <code className="text-orange-200/80">/dev/kvm</code>, libvirt/QEMU и утилиты{' '}
                   <code className="text-orange-200/80">qemu-img</code>,{' '}
                   <code className="text-orange-200/80">virsh</code>,{' '}
-                  <code className="text-orange-200/80">virt-install</code>,{' '}
-                  <code className="text-orange-200/80">setfacl</code>. Готовые образы Ubuntu, Debian, Arch и Windows выбираются через <code>--os</code>; собственный ISO нужно заранее положить на этот же сервер и передать через <code>--iso</code>. CLI устанавливает ОС из ISO до открытия порта.
+                  <code className="text-orange-200/80">virt-install</code> и{' '}
+                  <code className="text-orange-200/80">setfacl</code>. Для Ubuntu, Debian и Arch CLI
+                  загружает и подготавливает базовый образ; серверу нужен доступ к зеркалам пакетов.
+                  Для Windows заранее нужен подготовленный QCOW2 с файлом контрольной суммы либо
+                  установленный <code>hf-image-builder</code> с утверждённым каталогом источников.
+                  Можно установить ОС из ISO: положите ISO на этот сервер и укажите{' '}
+                  <code>--iso</code>. CLI проверяет образ и готовность гостевой службы до публикации порта.
                 </p>
               </div>
             </div>
@@ -203,12 +205,18 @@ export default function LocalCliPanel({ open, onClose }: LocalCliPanelProps) {
                   Развёртывание и управление
                 </h3>
                 <p className="mt-0.5 text-xs text-white/40">
-                  Low и Middle могут делить порт через локальный Dispatcher; High получает отдельный порт.
+                  Low, Middle и Linux High могут делить SSH-порт через локальный Dispatcher. Windows High
+                  публикует RDP отдельно.
                 </p>
               </div>
             </div>
             <CodeSnippet label="Примеры команд" value={deployCommands} />
-            <p className="mt-2 text-xs leading-5 text-white/45">Перед запуском создайте файлы паролей на целевом сервере и задайте им права <code>0600</code>. CLI читает пароль из файла и не принимает его аргументом команды.</p>
+            <p className="mt-2 text-xs leading-5 text-white/45">
+              Перед запуском создайте файлы паролей на целевом сервере и задайте им права{' '}
+              <code>0600</code>. CLI читает пароль из файла и не принимает его аргументом команды.
+              Команда <code>hf logs ID --lines 50</code> показывает локальные журналы ловушки;
+              логи не отправляются в Центр.
+            </p>
           </section>
 
           <div className="flex gap-3 rounded-xl border border-white/[0.07] bg-white/[0.025] p-4">

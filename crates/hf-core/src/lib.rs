@@ -238,7 +238,7 @@ impl std::fmt::Debug for PritvoryashkaDeployment {
             .field("dispatcher_proxy_secret", &"[REDACTED]")
             .field("resources", &self.resources)
             .field("max_connections", &self.max_connections)
-            .field("baits", &self.baits)
+            .field("baits", &format_args!("{} files [contents redacted]", self.baits.len()))
             .field("virtual_processes", &self.virtual_processes)
             .field("vulnerability_profiles", &self.vulnerability_profiles)
             .field("endpoints", &self.endpoints)
@@ -1105,6 +1105,32 @@ pub struct HighVmDeployment {
     pub image_source: Option<HighImageSource>,
     #[serde(default)]
     pub runtime_mode: HighVmRuntimeMode,
+    #[serde(default)]
+    pub guest: HighGuestConfig,
+}
+
+/// Settings applied inside a Linux High guest after QEMU Guest Agent connects.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HighGuestConfig {
+    pub hostname: Option<String>,
+    pub username: Option<String>,
+    pub ssh_credentials: Vec<MiddleSshCredential>,
+    pub vulnerability_profiles: Vec<String>,
+    pub baits: Vec<BaitFile>,
+}
+
+impl std::fmt::Debug for HighGuestConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HighGuestConfig")
+            .field("hostname", &self.hostname)
+            .field("username", &self.username)
+            .field("ssh_credentials", &"[REDACTED]")
+            .field("vulnerability_profiles", &self.vulnerability_profiles)
+            .field("baits", &self.baits)
+            .finish()
+    }
 }
 
 impl From<HighUbuntuDeployment> for HighVmDeployment {
@@ -1117,6 +1143,7 @@ impl From<HighUbuntuDeployment> for HighVmDeployment {
             profile: HighOsProfile::ubuntu_ssh(),
             image_source: None,
             runtime_mode: HighVmRuntimeMode::PublicKvm,
+            guest: HighGuestConfig::default(),
         }
     }
 }
@@ -1407,6 +1434,7 @@ mod tests {
                 architecture: HighImageArchitecture::X86_64,
             }),
             runtime_mode: HighVmRuntimeMode::PublicKvm,
+            guest: Default::default(),
         };
         let encoded = serde_json::to_vec(&deployment).unwrap();
         let decoded: HighVmDeployment = serde_json::from_slice(&encoded).unwrap();

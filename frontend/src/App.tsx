@@ -44,7 +44,7 @@ function renewSession(): Promise<AuthSession> {
 function App() {
   const [session, setSession] = useState<AuthSession | null>(null)
   const [user, setUser] = useState<User | null>(null)
-  const [permissions, setPermissions] = useState<string[]>([])
+  const [permissions, setPermissions] = useState<string[] | null>(null)
   const [authChecking, setAuthChecking] = useState(true)
   const [authNotice, setAuthNotice] = useState('')
   const [profiles, setProfiles] = useState<Profile[]>([])
@@ -144,7 +144,7 @@ function App() {
       clearSession()
       setSession(null)
       setUser(null)
-      setPermissions([])
+      setPermissions(null)
       setProfiles([])
       setServers([])
       setTraps([])
@@ -187,7 +187,7 @@ function App() {
     void api.auth.me().then(async ({ user: currentUser, permissions: currentPermissions }) => {
       if (!active) return
       setUser(currentUser)
-      setPermissions(currentPermissions)
+      setPermissions(Array.isArray(currentPermissions) ? currentPermissions : null)
       saveSession({ ...session, user: currentUser })
       await refreshInventory()
     }).catch((error: unknown) => {
@@ -208,7 +208,7 @@ function App() {
     clearSession()
     setSession(null)
     setUser(null)
-    setPermissions([])
+    setPermissions(null)
     setProfiles([]); setServers([]); setTraps([]); setEvents([]); setGraphMatches([])
     setAuthNotice('Вы вышли из аккаунта.')
   }
@@ -216,7 +216,8 @@ function App() {
   const path = window.location.pathname.replace(/\/$/, '') || '/'
   const trapNames = useMemo(() => new Map(traps.map((trap) => [trap.trap_id, trap.name])), [traps])
   const incidentRows = useMemo(() => graphMatches.map((match) => {
-    const evidence = events.filter((item) => item.event.trap_id === match.trap_id && match.evidence_event_ids.includes(item.event.event_id))
+    const evidenceEventIds = Array.isArray(match.evidence_event_ids) ? match.evidence_event_ids : []
+    const evidence = events.filter((item) => item.event.trap_id === match.trap_id && evidenceEventIds.includes(item.event.event_id))
       .sort((a, b) => b.event.occurred_at.localeCompare(a.event.occurred_at))
     return { match, event: evidence[0] ?? null }
   }).sort((a, b) => b.match.updated_at.localeCompare(a.match.updated_at)), [events, graphMatches])
@@ -235,12 +236,13 @@ function App() {
     { label: 'Работают', value: String(traps.filter((trap) => trap.actual_state === 'running').length).padStart(2, '0'), detail: 'По данным API управления' },
     { label: 'Загружено событий', value: String(events.length), detail: 'События атакующих' },
   ]
-  const can = (permission: string) => permissions.includes(permission)
+  const safePermissions = permissions ?? []
+  const can = (permission: string) => safePermissions.includes(permission)
 
   return <main className={`app-root relative min-h-screen overflow-hidden ${isLightTheme ? 'light-theme' : 'dark-theme'} bg-[#100a09] text-[#e8dfda]`}>
     <div className="pointer-events-none fixed inset-0 z-0"><CRTWarp color="#d4810a" backgroundColor="#100a09" speed={0.5} curvature={0.25} scanlineStrength={0.25} scanlineFrequency={200} waveAmplitude={0.3} waveFrequency={2.5} bloom={0.9} bloomRadius={1} noise={0.1} vignette={0} brightness={0.85} pixelation={1} rgbShift={0.015} mouseReact mouseStrength={0.5} dpr={1} fps={30} paused={false}/></div>
     <div className="relative z-10">
-      {path === '/invite' ? <AcceptInvitation api={api}/> : path === '/reset-password' ? <ResetPassword api={api}/> : path === '/verify-email' ? <VerifyEmail api={api}/> : authChecking ? <div className="flex min-h-screen items-center justify-center text-sm text-white/50">Проверяем сеанс MellCore…</div> : session && user ? <div className="flex min-h-screen"><Sidebar activePage={currentPage} permissions={permissions} onNavigate={(page) => { setCurrentPage(page); if (page !== 'LiveFeed') setAttackTrapId(null) }}/><div className="min-w-0 flex-1"><Topbar currentPage={currentPage} user={user} onLogout={() => void logout()}/>
+      {path === '/invite' ? <AcceptInvitation api={api}/> : path === '/reset-password' ? <ResetPassword api={api}/> : path === '/verify-email' ? <VerifyEmail api={api}/> : authChecking ? <div className="flex min-h-screen items-center justify-center text-sm text-white/50">Проверяем сеанс MellCore…</div> : session && user ? <div className="flex min-h-screen"><Sidebar activePage={currentPage} onNavigate={(page) => { setCurrentPage(page); if (page !== 'LiveFeed') setAttackTrapId(null) }}/><div className="min-w-0 flex-1"><Topbar currentPage={currentPage} user={user} onLogout={() => void logout()}/>
         {loading && <div className="mx-6 mt-5 rounded-lg border border-white/10 bg-white/5 p-3 text-sm text-white/45">Обновляем данные управления…</div>}
         {resourceError && <div role="alert" className="mx-6 mt-5 rounded-lg border border-red-500/20 bg-red-500/5 p-4 text-sm text-red-300">Ошибка API управления: {resourceError}</div>}
         {currentPage === 'Dashboard' ? <section className="space-y-6 p-6"><div><p className="text-sm text-white/45">С возвращением, {user.name}</p><h2 className="mt-1 text-2xl font-semibold">Обзор безопасности</h2><p className="mt-2 text-sm text-white/45">Состояние ловушек и загруженная выборка событий.</p></div>
@@ -248,7 +250,7 @@ function App() {
           <section className="mt-4 rounded-xl border border-white/10 bg-[#160e0c]/80 p-5"><div className="flex items-center justify-between gap-3"><div><h3 className="font-semibold">Ошибки инфраструктуры</h3><p className="mt-1 text-xs text-white/40">Состояние подключённых серверов, установки и загрузки телеметрии</p></div><span className={`rounded-md border px-2 py-1 text-xs ${infrastructureIssues.length ? 'border-red-400/20 bg-red-400/5 text-red-200' : 'border-emerald-400/20 bg-emerald-400/5 text-emerald-200'}`}>{infrastructureIssues.length}</span></div><div className="mt-4 space-y-2">{infrastructureIssues.map((issue) => <div key={issue.key} className="flex items-start gap-3 rounded-lg border border-red-400/10 bg-red-400/[0.025] px-3 py-2.5"><span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-red-300"/><div className="min-w-0"><p className="text-xs font-medium text-white/80">{issue.title}</p><p className="mt-1 break-words text-xs text-red-200/65">{issue.detail}</p></div></div>)}{infrastructureIssues.length === 0 && <p className="py-3 text-sm text-white/40">Ошибок инфраструктуры нет.</p>}</div></section>
           <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-[1.15fr_0.85fr]"><section className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5"><div className="flex items-start justify-between gap-3"><div><h3 className="font-semibold">Активные инциденты</h3><p className="mt-1 text-xs text-white/40">Незавершённые совпадения графа за последние 24 часа</p></div><span className="rounded-md border border-orange-400/20 bg-orange-400/5 px-2 py-1 text-xs text-orange-200">{activeIncidents.length}</span></div><div className="mt-5 space-y-3">{activeIncidents.map(({ match, event }) => <button type="button" key={`${match.trap_id}:${match.session_key}:${match.technique_key}`} onClick={() => { setAttackTrapId(match.trap_id); setCurrentPage('LiveFeed') }} className="flex w-full items-center gap-3 rounded-lg border border-white/5 bg-black/10 p-3 text-left transition hover:border-orange-400/20 hover:bg-white/[0.03]"><span className="h-2 w-2 shrink-0 rounded-full bg-amber-300 shadow-[0_0_10px_rgba(252,211,77,0.35)]"/><span className="min-w-0 flex-1"><span className="block truncate text-sm text-white/85">{match.technique_name}</span><span className="mt-1 block truncate text-xs text-white/40">{trapNames.get(match.trap_id) ?? 'Ловушка'} · {event?.event.source_ip ?? 'источник неизвестен'}</span></span><span className="shrink-0 text-xs text-violet-200">{Math.round(match.similarity * 100)}%</span></button>)}{activeIncidents.length === 0 && <p className="py-8 text-center text-sm text-white/40">Активных подозрений нет.</p>}</div></section>
             <section className="rounded-xl border border-white/10 bg-[#160e0c]/80 p-5"><div className="flex items-start justify-between gap-3"><div><h3 className="font-semibold">Последние инциденты</h3><p className="mt-1 text-xs text-white/40">Совпадения с известными сценариями</p></div><button type="button" onClick={() => setCurrentPage('LiveFeed')} className="text-xs text-orange-200/70 transition hover:text-orange-100">Все события →</button></div><div className="mt-5 space-y-4">{latestIncidents.map(({ match, event }) => <button type="button" key={`${match.trap_id}:${match.session_key}:${match.technique_key}`} onClick={() => { setAttackTrapId(match.trap_id); setCurrentPage('LiveFeed') }} className="flex w-full items-start gap-3 text-left"><span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${match.status === 'confirmed' ? 'bg-red-400' : 'bg-violet-300'}`}/><span className="min-w-0 flex-1"><span className="block truncate text-sm">{match.technique_name}</span><span className="mt-1 block truncate text-xs text-white/40">{trapNames.get(match.trap_id) ?? 'Ловушка'} · {event?.event.source_ip ?? 'источник неизвестен'}</span></span><span className="shrink-0 text-[10px] text-white/35">{new Date(match.updated_at).toLocaleTimeString('ru-RU')}</span></button>)}{latestIncidents.length === 0 && <p className="py-8 text-center text-sm text-white/40">Совпадений с известными сценариями пока нет.</p>}</div></section></div>
-        </section> : currentPage === 'Infrastructure' ? <Infrastructure api={api} profiles={profiles} servers={servers} traps={traps} permissions={permissions} onChanged={refreshInventory} onShowAttacks={(trapId) => { setAttackTrapId(trapId); setCurrentPage('LiveFeed') }} notify={notify} dismissToast={dismissToast}/> : currentPage === 'Baits' ? <Baits api={api} traps={traps} readOnly={!can('traps.edit')} onChanged={refreshInventory} onShowEvents={(trapId) => { setAttackTrapId(trapId); setCurrentPage('LiveFeed') }}/> : currentPage === 'Vulnerabilities' ? <Vulnerabilities api={api} traps={traps} readOnly={!can('traps.edit')} onChanged={refreshInventory}/> : currentPage === 'LiveFeed' ? <LiveFeed api={api} events={events} traps={traps} initialTrapId={attackTrapId} loading={eventsLoading} error={eventError} onRefresh={() => refreshEvents(traps)}/> : <Settings api={api} user={user} permissions={permissions} notify={notify} onPasswordChanged={logout}/>}</div></div> : (
+        </section> : currentPage === 'Infrastructure' ? <Infrastructure api={api} profiles={profiles} servers={servers} traps={traps} permissions={safePermissions} onChanged={refreshInventory} onShowAttacks={(trapId) => { setAttackTrapId(trapId); setCurrentPage('LiveFeed') }} notify={notify} dismissToast={dismissToast}/> : currentPage === 'Baits' ? <Baits api={api} traps={traps} readOnly={!can('traps.edit')} onChanged={refreshInventory} onShowEvents={(trapId) => { setAttackTrapId(trapId); setCurrentPage('LiveFeed') }}/> : currentPage === 'Vulnerabilities' ? <Vulnerabilities api={api} traps={traps} readOnly={!can('traps.edit')} onChanged={refreshInventory}/> : currentPage === 'LiveFeed' ? <LiveFeed api={api} events={events} traps={traps} initialTrapId={attackTrapId} loading={eventsLoading} error={eventError} onRefresh={() => refreshEvents(traps)}/> : <Settings api={api} user={user} permissions={safePermissions} notify={notify} onPasswordChanged={logout}/>}</div></div> : (
         <Auth api={api} notice={authNotice} onAuthenticated={(nextSession) => { authEpoch += 1; setAuthNotice(''); setAuthChecking(true); setSession(nextSession); setUser(nextSession.user) }}/>
       )}
     </div>

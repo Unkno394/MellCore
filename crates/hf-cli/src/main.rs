@@ -3,7 +3,10 @@ use std::{
     env, fs,
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
-    os::unix::fs::PermissionsExt,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -35,6 +38,12 @@ enum Action {
         kind: DeployKind,
     },
     List,
+    Logs {
+        id: String,
+        /// Number of recent log lines to show (1..200).
+        #[arg(long, default_value_t = 100)]
+        lines: u16,
+    },
     Stop {
         id: String,
     },
@@ -223,6 +232,8 @@ struct HighArgs {
     /// Decoy file as GUEST_PATH=HOST_FILE; can be repeated.
     #[arg(long = "bait")]
     baits: Vec<String>,
+    #[command(flatten)]
+    shared: SharedArgs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -304,6 +315,7 @@ struct Trap {
 struct State {
     root: PathBuf,
     traps: Vec<Trap>,
+    _lock: fs::File,
 }
 
 impl State {
@@ -330,6 +342,30 @@ impl State {
             "local CLI state must be separate from hf-agent service state"
         );
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        let lock_path = root.join("state.lock");
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .with_context(|| format!("cannot open local state lock {}", lock_path.display()))?;
+        anyhow::ensure!(
+            lock.metadata()?.file_type().is_file(),
+            "local state lock must be a regular file"
+        );
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))?;
+        let lock_result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if lock_result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::bail!(
+                    "another hf command is using local state; wait for it to finish and retry"
+                );
+            }
+            return Err(error).context("cannot lock local HoneyForge state");
+        }
         let path = root.join("traps.json");
         let traps = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -337,7 +373,11 @@ impl State {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error.into()),
         };
-        Ok(Self { root, traps })
+        Ok(Self {
+            root,
+            traps,
+            _lock: lock,
+        })
     }
 
     fn save(&self) -> anyhow::Result<()> {
@@ -375,6 +415,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Action::Deploy { kind } => deploy(&mut state, kind),
         Action::List => list(&mut state),
+        Action::Logs { id, lines } => logs(&state, &id, lines),
         Action::Stop { id } => stop(&mut state, &id),
         Action::Remove { id } => remove(&mut state, &id),
     }
@@ -390,12 +431,18 @@ fn deploy(state: &mut State, kind: DeployKind) -> anyhow::Result<()> {
     let shared = match &kind {
         DeployKind::Low(args) => args.shared.shared,
         DeployKind::Medium(args) => args.shared.shared,
-        DeployKind::High(_) => false,
+        DeployKind::High(args) => args.shared.shared,
     };
     anyhow::ensure!(
         trap_kind != TrapKind::High || port != 2222,
         "High SSH publication cannot use reserved management port 2222"
     );
+    if let DeployKind::High(args) = &kind {
+        anyhow::ensure!(
+            !args.shared.shared || args.os != HighOs::Windows,
+            "shared High currently supports Linux SSH guests, not Windows RDP"
+        );
+    }
     if shared {
         anyhow::ensure!(
             shared::has_listener(state, port)? || !state.traps.iter().any(|trap| trap.port == port),
@@ -559,7 +606,7 @@ fn deploy_low(state: &State, trap_id: Uuid, args: &LowArgs) -> anyhow::Result<()
     set_owner_and_mode(&project.join("config.json"), 65_532, 0o600)?;
     let port = backend_port;
     let compose_yaml = format!(
-        "name: hf-{name}\nservices:\n  honeypot:\n    image: {image}\n    restart: unless-stopped\n    pull_policy: never\n    logging:\n      driver: \"none\"\n    command: [\"--config\", \"/etc/honeyforge/config.json\"]\n    ports:\n      - \"{bind_ip}:{port}:22/tcp\"\n    volumes:\n      - ./config.json:/etc/honeyforge/config.json:ro\n      - {identity_mount}\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: {memory_mb}m\n    cpus: {cpu:.3}\n    pids_limit: {pids}\n    ulimits:\n      nofile:\n        soft: 256\n        hard: 256\n    init: true\n",
+        "name: hf-{name}\nservices:\n  honeypot:\n    image: {image}\n    restart: unless-stopped\n    pull_policy: never\n    logging:\n      driver: \"local\"\n      options:\n        max-size: \"10m\"\n        max-file: \"5\"\n    command: [\"--config\", \"/etc/honeyforge/config.json\"]\n    ports:\n      - \"{bind_ip}:{port}:22/tcp\"\n    volumes:\n      - ./config.json:/etc/honeyforge/config.json:ro\n      - {identity_mount}\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: {memory_mb}m\n    cpus: {cpu:.3}\n    pids_limit: {pids}\n    ulimits:\n      nofile:\n        soft: 256\n        hard: 256\n    init: true\n",
         name = trap_id.simple(),
     );
     atomic_write(
@@ -677,7 +724,7 @@ fn deploy_medium(state: &State, trap_id: Uuid, args: &MediumArgs) -> anyhow::Res
         "telemetry": {
             "endpoint": null,
             "token_env": null,
-            "jsonl_path": "/dev/null",
+            "jsonl_path": "/dev/stdout",
             "queue_capacity": 1024,
             "batch_size": 50,
             "flush_interval_ms": 500,
@@ -693,7 +740,7 @@ fn deploy_medium(state: &State, trap_id: Uuid, args: &MediumArgs) -> anyhow::Res
     atomic_write(&config_path, &serde_json::to_vec_pretty(&config)?, 0o600)?;
     check_middle_config(&image, &config_path)?;
     let compose_yaml = format!(
-        "name: hf-{name}\nservices:\n  honeypot:\n    image: {image}\n    restart: unless-stopped\n    pull_policy: never\n    logging:\n      driver: \"none\"\n    ports:\n      - \"{bind_ip}:{backend_port}:2222/tcp\"\n{additional_ports}    volumes:\n      - ./pritvoryashka.json:/etc/honeyforge/pritvoryashka.json:ro\n      - {identity_mount}\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: {memory_mb}m\n    cpus: {cpu:.3}\n    pids_limit: {pids}\n    ulimits:\n      nofile:\n        soft: 1024\n        hard: 1024\n    init: true\n",
+        "name: hf-{name}\nservices:\n  honeypot:\n    image: {image}\n    restart: unless-stopped\n    pull_policy: never\n    logging:\n      driver: \"local\"\n      options:\n        max-size: \"10m\"\n        max-file: \"5\"\n    ports:\n      - \"{bind_ip}:{backend_port}:2222/tcp\"\n{additional_ports}    volumes:\n      - ./pritvoryashka.json:/etc/honeyforge/pritvoryashka.json:ro\n      - {identity_mount}\n    read_only: true\n    cap_drop: [ALL]\n    security_opt: [no-new-privileges:true]\n    mem_limit: {memory_mb}m\n    cpus: {cpu:.3}\n    pids_limit: {pids}\n    ulimits:\n      nofile:\n        soft: 1024\n        hard: 1024\n    init: true\n",
         name = trap_id.simple(),
     );
     atomic_write(
@@ -982,6 +1029,12 @@ fn check_middle_config(image: &str, config_path: &Path) -> anyhow::Result<()> {
 }
 
 fn deploy_high(state: &State, id: &str, trap_id: Uuid, args: &HighArgs) -> anyhow::Result<()> {
+    let shared_host_key = if args.shared.shared {
+        let identity = shared::identity(state, args.port)?;
+        Some(fs::read_to_string(identity.join("host_ed25519"))?)
+    } else {
+        None
+    };
     let settings = if args.os == HighOs::Windows {
         anyhow::ensure!(
             args.shell.is_none() && args.vulnerabilities.is_empty() && args.baits.is_empty(),
@@ -989,7 +1042,7 @@ fn deploy_high(state: &State, id: &str, trap_id: Uuid, args: &HighArgs) -> anyho
         );
         None
     } else {
-        high_guest_settings(args)?
+        high_guest_settings(args, shared_host_key)?
     };
     let device = fs::OpenOptions::new()
         .read(true)
@@ -1027,6 +1080,7 @@ fn deploy_high(state: &State, id: &str, trap_id: Uuid, args: &HighArgs) -> anyho
             HighOs::Arch => "arch",
             HighOs::Windows => "windows",
         };
+        eprintln!("High: creating isolated {os} VM");
         high_local::run_launch(state, &recipe, &high_root, image, &trap_id, &port, os)
             .with_context(|| format!("could not start High VM {id}"))?;
     }
@@ -1034,23 +1088,49 @@ fn deploy_high(state: &State, id: &str, trap_id: Uuid, args: &HighArgs) -> anyho
         guest::apply(trap_id.as_str(), &settings)
             .with_context(|| format!("could not customize High guest {id}"))?;
     }
-    high_local::wait_guest_service(&trap_id, args.os.service_port().parse()?)?;
-    run_high_script(
-        &recipe,
-        &high_root,
-        "publish-ssh.sh",
-        &[&trap_id, &port, args.os.service_port()],
-    )
-    .with_context(|| format!("could not publish SSH for High VM {id}"))
+    eprintln!("High: guest settings applied; checking SSH inside the isolated network");
+    let guest_ip = high_local::wait_guest_service(&trap_id, args.os.service_port().parse()?)?;
+    eprintln!("High: guest service answered on {guest_ip}");
+    if args.shared.shared {
+        let guest_ip = match guest_ip {
+            IpAddr::V4(address) => address,
+            IpAddr::V6(_) => bail!("High SSH backend unexpectedly has an IPv6 address"),
+        };
+        shared::add_high(
+            state,
+            args.port,
+            trap_id.parse()?,
+            guest_ip,
+            args.shared.weight,
+        )
+        .with_context(|| format!("could not add High VM {id} to the shared port"))
+    } else {
+        run_high_script(
+            &recipe,
+            &high_root,
+            "publish-ssh.sh",
+            &[
+                &trap_id,
+                &port,
+                args.os.service_port(),
+                &guest_ip.to_string(),
+            ],
+        )
+        .with_context(|| format!("could not publish SSH for High VM {id}"))
+    }
 }
 
-fn high_guest_settings(args: &HighArgs) -> anyhow::Result<Option<guest::Settings>> {
+fn high_guest_settings(
+    args: &HighArgs,
+    ssh_host_key: Option<String>,
+) -> anyhow::Result<Option<guest::Settings>> {
     if args.hostname.is_none()
         && args.username.is_none()
         && args.shell.is_none()
         && args.password_file.is_none()
         && args.vulnerabilities.is_empty()
         && args.baits.is_empty()
+        && ssh_host_key.is_none()
     {
         return Ok(None);
     }
@@ -1105,6 +1185,7 @@ fn high_guest_settings(args: &HighArgs) -> anyhow::Result<Option<guest::Settings
         username: args.username.clone(),
         shell: args.shell.map(|shell| shell.as_path().to_owned()),
         password_hash,
+        ssh_host_key,
         vulnerabilities: args.vulnerabilities.clone(),
         baits,
     }))
@@ -1251,6 +1332,64 @@ fn list(state: &mut State) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn logs(state: &State, id: &str, lines: u16) -> anyhow::Result<()> {
+    anyhow::ensure!((1..=200).contains(&lines), "--lines must be in 1..200");
+    let trap = &state.traps[state.find(id)?];
+    let instance_id = trap_uuid(id);
+    match trap.kind {
+        TrapKind::Low | TrapKind::Medium => {
+            let project = project_dir(state, instance_id);
+            anyhow::ensure!(
+                project.join("compose.yaml").is_file(),
+                "trap {id} has no Docker project"
+            );
+            let output = Command::new("docker")
+                .args([
+                    "compose",
+                    "--project-name",
+                    &format!("hf-{}", instance_id.simple()),
+                    "--file",
+                ])
+                .arg(project.join("compose.yaml"))
+                .args(["ps", "--all", "--quiet", "honeypot"])
+                .output()
+                .context("could not find local trap container")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "could not find local trap container: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            let container = String::from_utf8(output.stdout)?.trim().to_owned();
+            anyhow::ensure!(
+                !container.is_empty(),
+                "trap {id} has no container to read logs from"
+            );
+            let output = Command::new("docker")
+                .args([
+                    "logs",
+                    "--timestamps",
+                    "--tail",
+                    &lines.to_string(),
+                    &container,
+                ])
+                .output()
+                .context("could not read local trap logs")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "could not read local trap logs: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            std::io::stdout().write_all(&output.stdout)?;
+            std::io::stderr().write_all(&output.stderr)?;
+        }
+        TrapKind::High => {
+            let journal = guest::read_ssh_journal(&instance_id.to_string(), lines)?;
+            print!("{journal}");
+        }
+    }
+    Ok(())
+}
+
 fn runtime_status(state: &State, trap: &Trap) -> anyhow::Result<Status> {
     let id = trap_uuid(&trap.id);
     match trap.kind {
@@ -1287,6 +1426,7 @@ fn runtime_status(state: &State, trap: &Trap) -> anyhow::Result<Status> {
             })
         }
         TrapKind::High => {
+            let routed = shared::is_member(state, id)?;
             let output = Command::new("virsh")
                 .env("LIBVIRT_DEFAULT_URI", "qemu:///system")
                 .args(["domstate", &format!("hf-high-{id}")])
@@ -1294,7 +1434,12 @@ fn runtime_status(state: &State, trap: &Trap) -> anyhow::Result<Status> {
             Ok(match output {
                 Ok(output) if output.status.success() => {
                     let value = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-                    if value.contains("running") || value.contains("idle") {
+                    if (value.contains("running") || value.contains("idle"))
+                        && routed
+                        && !shared::service_active()
+                    {
+                        Status::Failed
+                    } else if value.contains("running") || value.contains("idle") {
                         Status::Running
                     } else {
                         Status::Stopped
@@ -1371,11 +1516,38 @@ fn set_owner_and_mode(path: &Path, uid: u32, mode: u32) -> anyhow::Result<()> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes)?;
-    fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
-    fs::rename(temporary, path)?;
-    Ok(())
+    let parent = path
+        .parent()
+        .context("atomic-write destination has no parent directory")?;
+    let name = path
+        .file_name()
+        .context("atomic-write destination has no filename")?
+        .to_string_lossy();
+    let temporary = parent.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let mut options = fs::OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut file = options.open(&temporary)?;
+    let result = (|| -> anyhow::Result<()> {
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn recipe_dir(state: &State) -> anyhow::Result<PathBuf> {
@@ -1532,6 +1704,10 @@ fn run_high_script(
         .env("HF_HIGH_NETWORK_SCOPE", "local")
         .env("HF_HIGH_VIRT_TYPE", "kvm")
         .env("HF_HIGH_DHCP_ATTEMPTS", "12")
+        .env(
+            "HF_HIGH_NETWORK_READY",
+            if script == "publish-ssh.sh" { "1" } else { "0" },
+        )
         .env("LIBVIRT_DEFAULT_URI", "qemu:///system")
         .env("LC_ALL", "C")
         .output()

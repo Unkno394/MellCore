@@ -24,6 +24,8 @@ sudo hf deploy high --os windows --port 3389
 sudo hf deploy high --os ubuntu --iso /srv/iso/ubuntu-server.iso --port 2227
 
 sudo hf list
+sudo hf logs high-1
+sudo hf logs high-1 --lines 50
 sudo hf stop high-1
 sudo hf remove high-1
 ```
@@ -37,6 +39,18 @@ Low и Medium используют предварительно загружен
 Перед High CLI проверяет `/dev/kvm`, libvirt/QEMU и команды, нужные выбранной ОС и способу установки. Если на Debian/Ubuntu чего-то не хватает, CLI сам устанавливает недостающие пакеты через `apt-get`, запускает `libvirtd` и повторно проверяет готовность до создания VM. Для этого запускайте `sudo hf deploy high ...`; серверу нужен доступ к репозиториям пакетов. При создании подготовленных Ubuntu и Debian образов CLI заранее устанавливает и включает `qemu-guest-agent` в отдельной базовой копии до запуска VM. Установка пакета выполняется `virt-customize` внутри отдельного libguestfs appliance с ограниченным исходящим сетевым доступом. CLI устанавливает `dhcpcd-base` на хосте, чтобы libguestfs мог включить DHCP-клиент в appliance; сетевые запросы при этом идут из appliance, а не из будущей VM. Для Arch CLI включает уже установленный агент и `systemd-networkd` в копии диска и использует DHCP-конфигурацию для интерфейса с любым именем, включая `eth0`. Если зеркало, DNS или DHCP в appliance недоступны, CLI завершает подготовку с ошибкой до запуска VM. Пользовательский `--image` должен уже содержать пакет `qemu-guest-agent`, иначе CLI завершится с диагностикой до запуска. На других host-дистрибутивах зависимости пока нужно установить вручную. Сеть High задаётся в libvirt с `forward mode=none`; фильтры IPv4 и IPv6 запрещают гостю доступ к хосту и маршрутизацию наружу, а публикация добавляет только проверенные правила для SSH или RDP. CLI проверяет, что SSH banner отвечает из гостевой сети и что точные правила проброса установлены. Доступность внешнего порта через firewall провайдера или внешнюю NAT-сеть нужно проверить с другой машины.
 
 CLI хранит только локальную запись о ловушке (`id`, `kind`, `port`, `status`) в `/var/lib/honeyforge/local/traps.json`. Другой абсолютный каталог можно задать через `HF_LOCAL_STATE_DIR`.
+
+`hf logs ID` показывает до 100 последних строк (через `--lines` можно выбрать 1–200). Для Low и Middle события подключений, авторизации и действий сохраняются локально в Docker с ограничением 50 МБ на контейнер; Middle пишет пакеты событий в JSON на stdout. Для Linux High команда читает журнал SSH гостевой VM через QEMU Guest Agent. На уже созданных Low и Middle ловушках, где Docker logging driver был `none`, прошлые события недоступны; новые ловушки сохраняют их автоматически. Команда не отправляет логи в Центр.
+
+CLI берёт неблокирующую межпроцессную блокировку `state.lock` на всё время команды, чтобы два одновременных запуска не выбрали один ID или не перезаписали состояние друг друга. Пока длится установка High из ISO, второй запуск `hf` с тем же каталогом состояния завершится сообщением о занятом состоянии.
+
+После публикации High SSH отдельно проверьте вход и выполнение команды с другой машины, вне VPS. Скрипт попросит подтвердить ключ хоста при первом подключении и пароль пользователя гостя:
+
+```sh
+sh crates/hf-cli/scripts/verify-high-ssh.sh PUBLIC_HOST PUBLIC_PORT USERNAME
+```
+
+Успешная проверка печатает `HF_HIGH_E2E_OK`, пользователя и ОС. Она проверяет вход и живую SSH-сессию через опубликованный порт; для сетевой проверки запускайте её именно с внешней машины.
 
 ## Параметры ловушек
 
@@ -62,7 +76,7 @@ sudo hf deploy high --os debian --image /srv/images/debian.qcow2 --port 2228
 sudo hf deploy high --os debian --iso /srv/iso/debian-12-amd64-DVD-1.iso --port 2229
 ```
 
-При `--shared` CLI запускает `hf-local-dispatcher` как отдельный systemd-сервис. Участники общего порта используют один SSH-ключ; Middle получает клиентский IP через аутентифицированный PROXYv2. Без `--shared` ловушка слушает свой порт напрямую. `--weight` задаёт долю новой ловушки при добавлении к существующему общему порту.
+При `--shared` CLI запускает `hf-local-dispatcher` как отдельный systemd-сервис. Участники общего порта используют один SSH-ключ; Middle получает клиентский IP через аутентифицированный PROXYv2. Linux High также может присоединиться к общему SSH-порту; Windows High пока не поддерживается. Диспетчер маршрутизирует High напрямую к изолированному гостю, поэтому в журналах гостя клиентский IP будет адресом моста libvirt. Без `--shared` ловушка слушает свой порт напрямую. `--weight` задаёт долю новой ловушки при добавлении к существующему общему порту.
 
 Middle поддерживает профили `ssh_weak_credentials`, `ssh_root_login_enabled`, `redis_unauthenticated_access`, `docker_api_exposed`, `http_admin_panel_exposure`, `web_path_traversal`, `web_command_injection`, `sql_database_weak_credentials`, `ftp_anonymous_login`; для Windows: `win_autologon_credentials`, `win_always_install_elevated`, `win_writable_service_binary`, `win_guest_share`. Сервисные порты можно задать через `--service-port redis=16379` или `--service-port docker=2375` (также принимается `docker_api`); без этого CLI выбирает свободный порт начиная с 30000. Приманки можно размещать в домашнем каталоге указанного `--username`, например `/home/testuser/notes.txt`.
 

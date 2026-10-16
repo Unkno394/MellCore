@@ -206,13 +206,13 @@ export default function Infrastructure(props: Props) {
     {subview !== 'list' && <button type="button" onClick={() => setSubview('list')} className="text-sm text-white/50 hover:text-orange-100">← К инфраструктуре</button>}
 
     {subview === 'list' && <div className="flex flex-wrap items-center gap-2">
-      <button type="button" disabled={!can('servers.connect')} onClick={() => setSubview('add-server')} className="rounded-lg border border-orange-500/30 bg-orange-500/10 px-4 py-2 text-sm text-orange-100 disabled:opacity-40"><span className="mr-2 inline-block whitespace-nowrap font-mono">＋</span>Добавить сервер</button>
-      <button type="button" disabled={!can('traps.create')} onClick={() => setSubview('add-trap')} className="rounded-lg border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/75 hover:border-orange-500/30 disabled:opacity-40"><span className="mr-2 inline-block whitespace-nowrap font-mono">＋</span>Добавить ловушку</button>
+      <button type="button" onClick={() => setSubview('add-server')} className="rounded-lg border border-orange-500/30 bg-orange-500/10 px-4 py-2 text-sm text-orange-100"><span className="mr-2 inline-block whitespace-nowrap font-mono">＋</span>Добавить сервер</button>
+      <button type="button" onClick={() => setSubview('add-trap')} className="rounded-lg border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-white/75 hover:border-orange-500/30"><span className="mr-2 inline-block whitespace-nowrap font-mono">＋</span>Добавить ловушку</button>
       {tab === 'servers' && failedServers.length > 0 && <button type="button" disabled={!can('servers.disconnect') || busy || Boolean(pending)} onClick={() => void removeFailed()} className="rounded-lg border border-red-400/20 px-4 py-2 text-sm text-red-200/80 hover:bg-red-400/5 disabled:opacity-40">Удалить неподключённые · {failedServers.length}</button>}
     </div>}
 
-    {subview === 'add-server' && <ConnectServer api={props.api} readOnly={!can('servers.connect')} onChanged={props.onChanged} notify={props.notify}/>}
-    {subview === 'add-trap' && <CreateHoneypot api={props.api} profiles={props.profiles} servers={props.servers.filter((server) => presence[server.server_id]?.connected === true)} traps={props.traps} readOnly={!can('traps.create')} onCreated={props.onChanged} notify={props.notify} dismissToast={props.dismissToast}/>}
+    {subview === 'add-server' && <ConnectServer api={props.api} readOnly={false} onChanged={props.onChanged} notify={props.notify}/>}
+    {subview === 'add-trap' && <CreateHoneypot api={props.api} profiles={props.profiles} servers={props.servers.filter((server) => presence[server.server_id]?.connected === true)} traps={props.traps} readOnly={false} onCreated={props.onChanged} notify={props.notify} dismissToast={props.dismissToast}/>}
     {subview === 'list' && tab === 'traps' && <Honeypots api={props.api} traps={props.traps} servers={props.servers} permissions={props.permissions} onChanged={props.onChanged} onShowAttacks={props.onShowAttacks} initialServerFilter={selectedServer}/>}
     {subview === 'list' && tab === 'servers' && <section className="overflow-hidden rounded-xl border border-white/10 bg-[#160e0c]/75">
       {props.servers.length === 0 ? <div className="p-8 text-center text-sm text-white/45">Подключённых серверов пока нет. Добавьте сервер, чтобы установить агент.</div> : <div className="divide-y divide-white/5">

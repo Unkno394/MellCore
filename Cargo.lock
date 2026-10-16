@@ -1067,6 +1067,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "hf-core",
@@ -1114,6 +1115,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.10.9",

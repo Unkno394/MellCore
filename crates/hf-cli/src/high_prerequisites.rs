@@ -71,6 +71,7 @@ pub(super) fn ensure(args: &HighArgs) -> anyhow::Result<()> {
             "could not enable and start libvirtd.service"
         );
     }
+    eprintln!("High: libvirt service is ready");
 
     Ok(())
 }
@@ -119,6 +120,11 @@ fn requirements(args: &HighArgs) -> (Vec<&'static str>, Vec<&'static str>) {
         (false, HighOs::Ubuntu | HighOs::Debian) => {
             tools.extend(["cloud-localds", "virt-customize", "dhcpcd"]);
             packages.extend(["cloud-image-utils", "libguestfs-tools", "dhcpcd-base"]);
+            tools.extend(["virt-cat", "apt-get"]);
+            if args.os == HighOs::Ubuntu {
+                tools.push("dpkg-deb");
+                packages.push("dpkg");
+            }
         }
         (false, HighOs::Arch) => {
             tools.extend(["cloud-localds", "virt-customize"]);
@@ -206,6 +212,10 @@ mod tests {
             password_file: None,
             vulnerabilities: Vec::new(),
             baits: Vec::new(),
+            shared: crate::SharedArgs {
+                shared: false,
+                weight: None,
+            },
         }
     }
 

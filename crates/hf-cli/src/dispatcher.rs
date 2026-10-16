@@ -6,7 +6,9 @@ use std::{
     hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
+    pin::Pin,
     sync::Arc,
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
 
@@ -15,16 +17,120 @@ use clap::Parser;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncWriteExt, copy_bidirectional},
+    io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional},
     net::{TcpListener, TcpStream},
-    sync::RwLock,
+    sync::{Notify, RwLock, Semaphore},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const HASH_KEY_0: u64 = 0x4846_4453_5041_5443;
 const HASH_KEY_1: u64 = 0x4f4e_455f_504f_5254;
+const MAX_ACTIVE_CONNECTIONS: usize = 256;
+const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+struct Activity {
+    last_seen: std::sync::Mutex<tokio::time::Instant>,
+    changed: Notify,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            last_seen: std::sync::Mutex::new(tokio::time::Instant::now()),
+            changed: Notify::new(),
+        }
+    }
+
+    fn touch(&self) {
+        if let Ok(mut last_seen) = self.last_seen.lock() {
+            *last_seen = tokio::time::Instant::now();
+        }
+        self.changed.notify_one();
+    }
+
+    fn last_seen(&self) -> tokio::time::Instant {
+        self.last_seen
+            .lock()
+            .map(|last_seen| *last_seen)
+            .unwrap_or_else(|poisoned| *poisoned.into_inner())
+    }
+}
+
+struct ActivityStream<'a> {
+    stream: &'a mut TcpStream,
+    activity: Arc<Activity>,
+}
+
+impl AsyncRead for ActivityStream<'_> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let previous_length = buffer.filled().len();
+        let result = Pin::new(&mut *this.stream).poll_read(context, buffer);
+        if matches!(&result, Poll::Ready(Ok(()))) && buffer.filled().len() > previous_length {
+            this.activity.touch();
+        }
+        result
+    }
+}
+
+impl AsyncWrite for ActivityStream<'_> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut *this.stream).poll_write(context, bytes);
+        if matches!(&result, Poll::Ready(Ok(length)) if *length > 0) {
+            this.activity.touch();
+        }
+        result
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().stream).poll_shutdown(context)
+    }
+}
+
+async fn copy_with_idle_timeout(
+    inbound: &mut TcpStream,
+    outbound: &mut TcpStream,
+) -> io::Result<(u64, u64)> {
+    let activity = Arc::new(Activity::new());
+    let mut inbound = ActivityStream {
+        stream: inbound,
+        activity: Arc::clone(&activity),
+    };
+    let mut outbound = ActivityStream {
+        stream: outbound,
+        activity: Arc::clone(&activity),
+    };
+    let transfer = copy_bidirectional(&mut inbound, &mut outbound);
+    tokio::pin!(transfer);
+    loop {
+        let deadline = activity.last_seen() + SESSION_IDLE_TIMEOUT;
+        tokio::select! {
+            result = &mut transfer => return result,
+            _ = tokio::time::sleep_until(deadline) => {
+                if tokio::time::Instant::now() >= activity.last_seen() + SESSION_IDLE_TIMEOUT {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "dispatcher session was idle for 600 seconds"));
+                }
+            }
+            _ = activity.changed.notified() => {}
+        }
+    }
+}
 
 #[derive(Parser)]
 struct Args {
@@ -62,6 +168,8 @@ struct TargetConfig {
     proxy_protocol: bool,
     #[serde(default)]
     proxy_secret: Option<String>,
+    #[serde(default)]
+    high_backend: bool,
 }
 
 type Routing = HashMap<SocketAddr, Vec<TargetConfig>>;
@@ -96,10 +204,26 @@ fn parse_config(bytes: &[u8]) -> anyhow::Result<DispatcherConfig> {
             anyhow::ensure!(target.weight > 0, "target weight must be positive");
             anyhow::ensure!(traps.insert(target.trap_id), "duplicate target trap");
             anyhow::ensure!(addresses.insert(target.address), "duplicate target address");
-            anyhow::ensure!(
-                target.address.ip().is_loopback(),
-                "target address must be loopback"
-            );
+            if target.high_backend {
+                let valid_high_backend = match target.address {
+                    SocketAddr::V4(address) => {
+                        let octets = address.ip().octets();
+                        octets[..3] == [192, 168, 252]
+                            && (100..=200).contains(&octets[3])
+                            && address.port() == 22
+                    }
+                    SocketAddr::V6(_) => false,
+                };
+                anyhow::ensure!(
+                    valid_high_backend && !target.proxy_protocol && target.proxy_secret.is_none(),
+                    "High backends must be isolated guest IPv4 SSH targets without PROXY protocol"
+                );
+            } else {
+                anyhow::ensure!(
+                    target.address.ip().is_loopback(),
+                    "non-High target address must be loopback"
+                );
+            }
             anyhow::ensure!(
                 target.proxy_protocol == target.proxy_secret.is_some(),
                 "PROXY protocol targets require exactly one shared secret"
@@ -223,7 +347,12 @@ fn proxy_v2_header(
     Ok(header)
 }
 
-async fn serve_listener(listener: TcpListener, address: SocketAddr, routes: Arc<RwLock<Routing>>) {
+async fn serve_listener(
+    listener: TcpListener,
+    address: SocketAddr,
+    routes: Arc<RwLock<Routing>>,
+    connections: Arc<Semaphore>,
+) {
     loop {
         let (mut inbound, peer) = match listener.accept().await {
             Ok(connection) => connection,
@@ -232,8 +361,18 @@ async fn serve_listener(listener: TcpListener, address: SocketAddr, routes: Arc<
                 continue;
             }
         };
+        let connection_permit = match Arc::clone(&connections).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                debug!(listen = %address, peer = %peer, "dispatcher connection limit reached; rejecting connection");
+                drop(inbound);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            }
+        };
         let routes = Arc::clone(&routes);
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             let target = {
                 let table = routes.read().await;
                 table
@@ -243,9 +382,21 @@ async fn serve_listener(listener: TcpListener, address: SocketAddr, routes: Arc<
             let Some(target) = target else {
                 return;
             };
-            let mut outbound = match TcpStream::connect(target.address).await {
-                Ok(stream) => stream,
-                Err(_) => return,
+            let mut outbound = match tokio::time::timeout(
+                BACKEND_CONNECT_TIMEOUT,
+                TcpStream::connect(target.address),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    warn!(%error, peer = %peer, trap_id = %target.trap_id, target = %target.address, "trap backend unavailable");
+                    return;
+                }
+                Err(_) => {
+                    warn!(peer = %peer, trap_id = %target.trap_id, target = %target.address, "trap backend connection timed out");
+                    return;
+                }
             };
             if target.proxy_protocol {
                 let destination = match inbound.local_addr() {
@@ -264,14 +415,16 @@ async fn serve_listener(listener: TcpListener, address: SocketAddr, routes: Arc<
                     return;
                 }
             }
-            let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+            if let Err(error) = copy_with_idle_timeout(&mut inbound, &mut outbound).await {
+                warn!(%error, peer = %peer, trap_id = %target.trap_id, "dispatch stream failed");
+            }
         });
     }
 }
 
 async fn reload_loop(
     path: PathBuf,
-    expected: Vec<SocketAddr>,
+    expected: std::collections::HashSet<SocketAddr>,
     routes: Arc<RwLock<Routing>>,
     every: Duration,
 ) {
@@ -280,7 +433,7 @@ async fn reload_loop(
         match tokio::fs::read(&path).await {
             Ok(bytes) if bytes != previous => match parse_config(&bytes) {
                 Ok(config) => {
-                    let listeners: Vec<_> =
+                    let listeners: std::collections::HashSet<_> =
                         config.listeners.iter().map(|item| item.listen).collect();
                     if listeners != expected {
                         warn!(
@@ -316,20 +469,70 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("cannot read {}", args.config.display()))?;
     let config = parse_config(&bytes)?;
     let addresses: Vec<_> = config.listeners.iter().map(|item| item.listen).collect();
+    let expected: std::collections::HashSet<_> = addresses.iter().copied().collect();
     let routes = Arc::new(RwLock::new(routing(&config)));
+    let connections = Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS));
     for address in &addresses {
         let listener = TcpListener::bind(address)
             .await
             .with_context(|| format!("cannot bind dispatcher {address}"))?;
         info!(%address, "dispatcher listening");
-        tokio::spawn(serve_listener(listener, *address, Arc::clone(&routes)));
+        tokio::spawn(serve_listener(
+            listener,
+            *address,
+            Arc::clone(&routes),
+            Arc::clone(&connections),
+        ));
     }
     tokio::spawn(reload_loop(
         args.config,
-        addresses,
+        expected,
         routes,
         Duration::from_secs(args.reload_seconds.max(1)),
     ));
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_config;
+
+    #[test]
+    fn accepts_loopback_middle_and_isolated_high_backends_together() {
+        let config = br#"{
+            "version": 1,
+            "listeners": [{
+                "listen": "0.0.0.0:25222",
+                "targets": [
+                    {"trap_id":"00000000-0000-0000-0000-000000000001","address":"127.0.0.1:45917","weight":50,"proxy_protocol":true,"proxy_secret":"0123456789abcdef0123456789abcdef"},
+                    {"trap_id":"00000000-0000-0000-0000-000000000002","address":"192.168.252.123:22","weight":50,"high_backend":true}
+                ]
+            }]
+        }"#;
+
+        parse_config(config).unwrap();
+    }
+
+    #[test]
+    fn rejects_high_backend_outside_guest_pool_or_with_proxy_protocol() {
+        for (address, proxy) in [
+            ("192.168.252.99:22", "false"),
+            ("192.168.252.123:2222", "false"),
+            ("192.168.252.123:22", "true"),
+        ] {
+            let config = format!(
+                r#"{{"version":1,"listeners":[{{"listen":"0.0.0.0:25222","targets":[{{"trap_id":"00000000-0000-0000-0000-000000000001","address":"{address}","weight":100,"high_backend":true,"proxy_protocol":{proxy},"proxy_secret":{}}}]}}]}}"#,
+                if proxy == "true" {
+                    "\"secret\""
+                } else {
+                    "null"
+                }
+            );
+            assert!(
+                parse_config(config.as_bytes()).is_err(),
+                "accepted {address}"
+            );
+        }
+    }
 }

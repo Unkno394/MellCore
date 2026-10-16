@@ -18,7 +18,7 @@ if [ -f "$destination" ]; then
     exit 1
   }
   LIBGUESTFS_BACKEND=direct virt-customize -a "$destination" --no-network \
-    --run-command 'test -x /usr/bin/qemu-ga' || {
+    --run-command 'test -x /usr/sbin/qemu-ga || test -x /usr/bin/qemu-ga' || {
     echo 'cached HoneyForge Debian image does not contain qemu-guest-agent' >&2
     exit 1
   }
@@ -65,10 +65,45 @@ verify_image "$tmpdir/$image_name" || {
   echo 'downloaded Debian image failed checksum or QCOW2 integrity verification' >&2
   exit 1
 }
-if ! LIBGUESTFS_BACKEND=direct virt-customize -a "$tmpdir/$image_name" --network \
-  --install qemu-guest-agent \
-  --run-command 'systemctl --root=/ enable qemu-guest-agent.service'; then
-  echo 'could not prepare Debian base image with qemu-guest-agent; check DHCP and DNS in the libguestfs appliance and access to Debian package mirrors; VM was not started' >&2
+keyring="$tmpdir/debian-archive-keyring.gpg"
+LIBGUESTFS_BACKEND=direct virt-cat -a "$tmpdir/$image_name" \
+  /usr/share/keyrings/debian-archive-keyring.gpg > "$keyring" || {
+  echo 'verified Debian cloud image has no archive keyring' >&2
+  exit 1
+}
+mkdir -p "$tmpdir/apt/lists/partial" "$tmpdir/apt/archives/partial" "$tmpdir/qemu-guest-agent-bundle"
+: > "$tmpdir/apt/status"
+cat > "$tmpdir/apt/sources.list" <<EOF
+deb [arch=amd64 signed-by=$keyring] https://deb.debian.org/debian bookworm main
+deb [arch=amd64 signed-by=$keyring] https://deb.debian.org/debian bookworm-updates main
+deb [arch=amd64 signed-by=$keyring] https://security.debian.org/debian-security bookworm-security main
+EOF
+apt_target() {
+  apt-get \
+    -o "Dir::Etc::sourcelist=$tmpdir/apt/sources.list" \
+    -o Dir::Etc::sourceparts=- \
+    -o "Dir::State::status=$tmpdir/apt/status" \
+    -o "Dir::State::lists=$tmpdir/apt/lists" \
+    -o "Dir::Cache::archives=$tmpdir/apt/archives" \
+    -o APT::Architecture=amd64 \
+    -o Acquire::Languages=none \
+    "$@"
+}
+apt_target update
+apt_target --download-only -y --no-install-recommends install qemu-guest-agent
+cp "$tmpdir"/apt/archives/*.deb "$tmpdir/qemu-guest-agent-bundle/"
+(cd "$tmpdir/qemu-guest-agent-bundle" && sha256sum ./*.deb > SHA256SUMS)
+
+if ! LIBGUESTFS_BACKEND=direct virt-customize -a "$tmpdir/$image_name" --no-network \
+  --mkdir /opt/honeyforge-offline \
+  --copy-in "$tmpdir/qemu-guest-agent-bundle:/opt/honeyforge-offline" \
+  --run-command 'cd /opt/honeyforge-offline/qemu-guest-agent-bundle && sha256sum -c SHA256SUMS' \
+  --run-command 'DEBIAN_FRONTEND=noninteractive dpkg -i /opt/honeyforge-offline/qemu-guest-agent-bundle/*.deb || true' \
+  --run-command 'DEBIAN_FRONTEND=noninteractive dpkg -i /opt/honeyforge-offline/qemu-guest-agent-bundle/*.deb' \
+  --run-command 'test -x /usr/sbin/qemu-ga || test -x /usr/bin/qemu-ga' \
+  --run-command 'systemctl --root=/ enable qemu-guest-agent.service' \
+  --run-command 'rm -rf /opt/honeyforge-offline'; then
+  echo 'could not install qemu-guest-agent from verified offline packages; VM was not started' >&2
   exit 1
 fi
 verify_prepared_image "$tmpdir/$image_name" || {

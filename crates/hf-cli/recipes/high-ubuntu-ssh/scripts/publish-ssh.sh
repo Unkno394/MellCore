@@ -4,6 +4,7 @@ set -eu
 instance_id=${1:?instance UUID}
 external_port=${2:?external TCP port}
 guest_port=${3:-22}
+verified_guest_ip=${4:-}
 vm_name="hf-high-$instance_id"
 root_dir=${HF_HIGH_ROOT:-/var/lib/honeyforge/high}
 script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
@@ -31,8 +32,11 @@ if is_protected_tcp_port "$external_port"; then
   echo "external SSH port is reserved for host management: $external_port" >&2
   exit 1
 fi
-# Re-assert the isolated network and guest-to-host firewall policy after host/agent restarts.
-sh "$script_dir/create-network.sh"
+# The CLI has already created the network and confirmed guest SSH immediately before publication.
+# Reapplying the network here can interrupt the route during the backend check.
+if [ "${HF_HIGH_NETWORK_READY:-0}" != 1 ]; then
+  sh "$script_dir/create-network.sh"
+fi
 publish_interface=$(resolve_high_publish_interface)
 # A host listener means this port is already occupied by SSH, the agent, or another service.
 # Do not steal it with a NAT rule.
@@ -42,7 +46,7 @@ if ss -H -ltn "( sport = :$external_port )" 2>/dev/null | grep -q .; then
   exit 1
 fi
 
-guest_ip=
+guest_ip=$verified_guest_ip
 dhcp_attempts=${HF_HIGH_DHCP_ATTEMPTS:-12}
 case "$dhcp_attempts" in
   ''|*[!0-9]*) echo "DHCP attempt limit must be numeric" >&2; exit 1 ;;
@@ -52,7 +56,7 @@ esac
   exit 1
 }
 attempt=1
-while [ "$attempt" -le "$dhcp_attempts" ]; do
+while [ -z "$guest_ip" ] && [ "$attempt" -le "$dhcp_attempts" ]; do
   guest_ip=$(virsh domifaddr "$vm_name" --source lease 2>/dev/null | awk '/ipv4/ {print $4}' | cut -d/ -f1 | head -n1 || true)
   [ -n "$guest_ip" ] && break
   sleep 5
@@ -124,14 +128,15 @@ nat_port_has_only_expected_claim "$external_port" "$HF_HIGH_DNAT_CHAIN" "$publis
 ipt -t nat -C "$HF_HIGH_DNAT_CHAIN" -i "$publish_interface" -m addrtype --dst-type LOCAL -p tcp --dport "$external_port" -j DNAT --to-destination "$guest_ip:$guest_port"
 ipt -C "$HF_HIGH_FORWARD_CHAIN" -i "$publish_interface" -o "$bridge" -p tcp -d "$guest_ip" --dport "$guest_port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
 ipt -C "$HF_HIGH_FORWARD_CHAIN" -i "$bridge" -o "$publish_interface" -p tcp -s "$guest_ip" --sport "$guest_port" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-python3 - "$guest_ip" "$guest_port" <<'PY'
+check_backend() {
+python3 - "$guest_ip" "$guest_port" "$1" <<'PY'
 import socket
 import sys
 import time
 
-host, port = sys.argv[1], int(sys.argv[2])
+host, port, attempts = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 last_error = None
-for _ in range(5):
+for _ in range(attempts):
     try:
         with socket.create_connection((host, port), timeout=2) as connection:
             connection.settimeout(2)
@@ -144,5 +149,20 @@ for _ in range(5):
         time.sleep(1)
 raise SystemExit(f"published High service backend did not answer on {host}:{port}: {last_error}")
 PY
+}
+
+if ! check_backend 5; then
+  echo "High backend check failed; restoring isolated network rules and retrying" >&2
+  sh "$script_dir/create-network.sh"
+  if ! check_backend 20; then
+    echo "High network diagnostics before VM cleanup:" >&2
+    virsh domstate "$vm_name" >&2 || true
+    virsh domifaddr "$vm_name" --source lease >&2 || true
+    ip -4 route get "$guest_ip" >&2 || true
+    ip -4 neigh show to "$guest_ip" dev "$bridge" >&2 || true
+    ip -o link show dev "$bridge" >&2 || true
+    exit 1
+  fi
+fi
 
 echo "High published-port NAT and forwarding rules are installed; guest service answered on $guest_ip:$guest_port"

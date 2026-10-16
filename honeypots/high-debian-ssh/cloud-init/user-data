@@ -45,7 +45,7 @@ write_files:
 runcmd:
   - test -x /usr/bin/python3
   - test -x /usr/sbin/sshd
-  - test -x /usr/sbin/qemu-ga
+  - sh -c 'test -x /usr/sbin/qemu-ga || test -x /usr/bin/qemu-ga'
   - test -x /usr/sbin/auditd
   - systemctl daemon-reload
   - augenrules --load

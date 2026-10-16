@@ -28,7 +28,7 @@ for command in apt-get dpkg; do command -v "$command" >/dev/null; done
   echo 'HF_HIGH_ERROR code=OFFLINE_BUNDLE_ARCH_UNSUPPORTED stage=installation: Ubuntu offline packages require an amd64 host' >&2
   exit 1
 }
-keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+keyring=${HF_UBUNTU_ARCHIVE_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}
 [ -r "$keyring" ] || {
   echo "HF_HIGH_ERROR code=OFFLINE_BUNDLE_TRUST_MISSING stage=installation: trusted Ubuntu archive keyring is unavailable at $keyring" >&2
   exit 1
@@ -89,7 +89,7 @@ apt_target() {
 # are downloaded by the host, never by the isolated guest.
 apt_target update
 apt_target --download-only -y --no-install-recommends install \
-  auditd audispd-plugins qemu-guest-agent
+  qemu-guest-agent auditd
 cp "$work_dir"/apt/archives/*.deb "$work_dir/bundle/"
 set -- "$work_dir/bundle"/*.deb
 [ -f "$1" ] || {

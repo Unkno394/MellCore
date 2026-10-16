@@ -3,6 +3,8 @@ name = "hf-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Shared HoneyForge agent and control-plane data types."
 
 [dependencies]
 async-trait.workspace = true

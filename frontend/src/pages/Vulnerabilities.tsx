@@ -3,6 +3,7 @@ import type { MellCoreApi } from '../api/services'
 import type { Trap } from '../api/types'
 import { linuxScenarioOptions, windowsScenarioOptions } from '../vulnerabilities/scenarioCatalog'
 import ScenarioAssignmentPanel from './ScenarioAssignmentPanel'
+import HighGuestSettings from './HighGuestSettings'
 
 type Props = { api: MellCoreApi; traps: Trap[]; readOnly: boolean; onChanged: () => Promise<void> }
 
@@ -12,7 +13,7 @@ export default function Vulnerabilities({ api, traps, readOnly, onChanged }: Pro
   return <section className="space-y-5 p-6">
     <header>
       <h2 className="text-2xl font-semibold">Настроить уязвимости ловушки</h2>
-      <p className="mt-2 max-w-2xl text-sm leading-6 text-white/55">Выбери операционную систему и существующую Middle-ловушку. Отметь сценарии, которые она должна отыгрывать.</p>
+      <p className="mt-2 max-w-2xl text-sm leading-6 text-white/55">Настрой сценарии для Middle или SSH-уязвимости внутри Linux High.</p>
     </header>
 
     <div role="tablist" aria-label="Операционная система ловушки" className="inline-flex rounded-lg border border-white/10 bg-black/20 p-1">
@@ -34,5 +35,6 @@ export default function Vulnerabilities({ api, traps, readOnly, onChanged }: Pro
       readOnly={readOnly}
       onChanged={onChanged}
     />
+    <HighGuestSettings api={api} traps={traps} readOnly={readOnly} onChanged={onChanged} mode="vulnerabilities" />
   </section>
 }

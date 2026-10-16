@@ -4,6 +4,7 @@ import type { MellCoreApi } from '../api/services'
 import type { BaitEngagement, BaitFile, BaitFileConfig, BaitKind, Trap, TrapActionProgress, TrapInput, VirtualProcess } from '../api/types'
 import { dateTime, statusLabel } from '../i18n/labels'
 import BaitEditor, { baitCategories, draftFromFile, draftFromProcess, newBaitDraft, type BaitDraft } from './BaitEditor'
+import HighGuestSettings from './HighGuestSettings'
 
 type Props = {
   api: MellCoreApi
@@ -290,5 +291,6 @@ export default function Baits({ api, traps, readOnly, onChanged, onShowEvents }:
         {editor && !readOnly && <BaitEditor draft={editor} windows={windows} busy={busy} error={error} onChange={setEditor} onSave={() => void saveDraft(editor)} onCancel={resetEditor} />}
       </div>
     </div>}
+    <HighGuestSettings api={api} traps={traps} readOnly={readOnly} onChanged={onChanged} mode="baits" />
   </section>
 }

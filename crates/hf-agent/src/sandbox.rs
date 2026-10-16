@@ -7,17 +7,18 @@ use std::{
 };
 
 use hf_core::{
-    HighGuestConnection, HighGuestOs, HighImageKind, HighImagePreparation, HighImageSource,
-    HighOsProfile,
+    HighGuestConfig, HighGuestConnection, HighGuestOs, HighImageKind, HighImagePreparation,
+    HighImageSource, HighOsProfile,
 };
 use uuid::Uuid;
 
 pub const DEFAULT_UBUNTU_24_04_IMAGE: &str =
-    "/var/lib/honeyforge/images/noble-server-cloudimg-amd64.img";
+    "/var/lib/honeyforge/images/noble-server-cloudimg-amd64-hf-prepared.img";
 
 const DEFAULT_ARCH_LINUX_IMAGE: &str =
     "/var/lib/honeyforge/images/arch-linux-x86_64-cloudimg.qcow2";
-const DEFAULT_DEBIAN_IMAGE: &str = "/var/lib/honeyforge/images/debian-12-genericcloud-amd64.qcow2";
+const DEFAULT_DEBIAN_IMAGE: &str =
+    "/var/lib/honeyforge/images/debian-12-genericcloud-amd64-hf-prepared.qcow2";
 const DEFAULT_WINDOWS_PREPARED_IMAGE: &str =
     "/var/lib/honeyforge/images/windows-server-prepared.qcow2";
 const DEFAULT_WINDOWS_SERVER_ISO: &str = "/var/lib/honeyforge/images/windows-server-eval.iso";
@@ -57,6 +58,7 @@ pub struct HighVm {
     pub external_service_port: u16,
     pub profile: HighOsProfile,
     pub image_source: Option<HighImageSource>,
+    pub guest: HighGuestConfig,
 }
 
 impl HighVm {
@@ -72,6 +74,7 @@ impl HighVm {
             external_service_port,
             profile,
             image_source: None,
+            guest: HighGuestConfig::default(),
         }
     }
 
@@ -88,6 +91,7 @@ impl HighVm {
             external_service_port,
             profile,
             image_source,
+            guest: HighGuestConfig::default(),
         }
     }
 
@@ -371,9 +375,9 @@ impl LibvirtSandboxManager {
                     default_image: default_image_for(HighOsProfile::ubuntu_ssh()),
                     readiness_timeout: Duration::from_secs(60),
                     dhcp_wait_attempts: 12,
-                    verify_cached_managed_image: false,
-                    require_guest_agent: false,
-                    publication: HighPublication::Disabled,
+                    verify_cached_managed_image: true,
+                    require_guest_agent: true,
+                    publication: HighPublication::Required,
                     scripts: UBUNTU_SCRIPTS,
                 },
                 HighOsAdapter {
@@ -599,7 +603,13 @@ impl LibvirtSandboxManager {
             };
             lifecycle_error(code, stage, failure)
         })?;
-        if let Err(error) = self.prepare_access_and_wait(vm) {
+        let prepare_result = (|| {
+            if vm.profile.guest_os != HighGuestOs::Windows {
+                crate::high_guest::apply(vm)?;
+            }
+            self.prepare_access_and_wait(vm)
+        })();
+        if let Err(error) = prepare_result {
             if preserve_installation_on_readiness_failure(vm.profile) {
                 // Preserve a completed or partially completed installation so an explicit retry
                 // or startup reconciliation can resume it.  Resetting here would destroy the
@@ -1688,8 +1698,9 @@ mod tests {
         assert!(arch.verify_cached_managed_image);
         assert!(debian.verify_cached_managed_image);
         assert!(debian.require_guest_agent);
-        assert!(!ubuntu.verify_cached_managed_image);
-        assert!(!ubuntu.require_guest_agent);
+        assert!(ubuntu.verify_cached_managed_image);
+        assert!(ubuntu.require_guest_agent);
+        assert_eq!(ubuntu.publication, HighPublication::Required);
         assert!(windows.verify_cached_managed_image);
         assert_eq!(windows.publication, HighPublication::Required);
         assert!(!legacy.verify_cached_managed_image);

@@ -1,8 +1,9 @@
 //! Control-plane adapter for agent-managed High virtual machines.
 
 use hf_core::{
-    AgentCommand, HighGuestConnection, HighImageArchitecture, HighImageFormat, HighImageSource,
-    HighOsProfile, HighVmDeployment, HighVmRuntimeMode,
+    AgentCommand, BaitFile, BaitImplementation, BaitKind, HighGuestConfig, HighGuestConnection,
+    HighGuestOs, HighImageArchitecture, HighImageFormat, HighImageSource, HighOsProfile,
+    HighVmDeployment, HighVmRuntimeMode, MiddleSshCredential,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -13,8 +14,8 @@ use crate::{
     resources::{RouteMode, Transport, Trap},
 };
 
-pub const UBUNTU_BASE_IMAGE: &str = "/var/lib/honeyforge/images/noble-server-cloudimg-amd64.img";
-pub const DEBIAN_BASE_IMAGE: &str = "/var/lib/honeyforge/images/debian-12-genericcloud-amd64.qcow2";
+pub const UBUNTU_BASE_IMAGE: &str = "/var/lib/honeyforge/images/noble-server-cloudimg-amd64-hf-prepared.img";
+pub const DEBIAN_BASE_IMAGE: &str = "/var/lib/honeyforge/images/debian-12-genericcloud-amd64-hf-prepared.qcow2";
 pub const ARCH_BASE_IMAGE: &str = "/var/lib/honeyforge/images/arch-linux-x86_64-cloudimg.qcow2";
 pub const WINDOWS_BASE_IMAGE: &str = "/var/lib/honeyforge/images/windows-server-prepared.qcow2";
 
@@ -60,7 +61,93 @@ pub fn validate_profile(
             "A user-supplied ISO requires public KVM mode",
         ));
     }
+    guest_config(config, profile)?;
     Ok(profile)
+}
+
+fn guest_config(config: &Value, profile: HighOsProfile) -> Result<HighGuestConfig, AppError> {
+    let hostname = config.get("hostname").and_then(Value::as_str).map(str::to_owned);
+    let username = config.get("username").and_then(Value::as_str).map(str::to_owned);
+    let credentials: Vec<MiddleSshCredential> = serde_json::from_value(
+        config.get("ssh_credentials").cloned().unwrap_or_else(|| Value::Array(vec![])),
+    ).map_err(|_| AppError::invalid("Invalid High SSH credentials"))?;
+    let vulnerabilities: Vec<String> = serde_json::from_value(
+        config.get("vulnerability_profiles").cloned().unwrap_or_else(|| Value::Array(vec![])),
+    ).map_err(|_| AppError::invalid("Invalid High vulnerability profiles"))?;
+    let baits: Vec<BaitFile> = serde_json::from_value(
+        config.get("baits").cloned().unwrap_or_else(|| Value::Array(vec![])),
+    ).map_err(|_| AppError::invalid("Invalid High bait files"))?;
+    if profile.guest_os == HighGuestOs::Windows {
+        if !credentials.is_empty() || !vulnerabilities.is_empty() || !baits.is_empty() {
+            return Err(AppError::invalid("High SSH credentials, baits and vulnerability profiles currently require a Linux guest"));
+        }
+        return Ok(HighGuestConfig { hostname, username: None, ssh_credentials: vec![], vulnerability_profiles: vec![], baits: vec![] });
+    }
+    if let Some(name) = &hostname {
+        if name.is_empty() || name.len() > 63 || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
+            return Err(AppError::invalid("High hostname must be a DNS label of at most 63 characters"));
+        }
+    }
+    if let Some(name) = &username {
+        if !valid_login(name) || name == "root" {
+            return Err(AppError::invalid("High SSH username must be a non-root Unix login"));
+        }
+    }
+    if config.get("ssh_auth_mode").and_then(Value::as_str).is_some_and(|mode| mode != "realistic") {
+        return Err(AppError::invalid("High VM SSH supports realistic credentials only"));
+    }
+    if credentials.len() > 1 || (!credentials.is_empty() && username.is_none()) {
+        return Err(AppError::invalid("High SSH requires one primary username and at most one credential"));
+    }
+    let mut seen_users = std::collections::HashSet::new();
+    for credential in &credentials {
+        if !valid_login(&credential.username)
+            || !seen_users.insert(credential.username.to_ascii_lowercase())
+            || credential.password.is_empty()
+            || credential.password.len() > 128
+            || credential.password.chars().any(char::is_control)
+        {
+            return Err(AppError::invalid("Invalid or duplicate High SSH credential"));
+        }
+    }
+    if let Some(name) = &username {
+        if !credentials.is_empty() && credentials[0].username != *name {
+            return Err(AppError::invalid("The first High SSH credential must match the selected username"));
+        }
+    }
+    let mut seen_profiles = std::collections::HashSet::new();
+    for profile in &vulnerabilities {
+        if !matches!(profile.as_str(), "ssh_weak_credentials" | "ssh_root_login_enabled" | "sudo_nopasswd")
+            || !seen_profiles.insert(profile.as_str())
+        {
+            return Err(AppError::invalid("Unsupported or duplicate Linux High vulnerability profile"));
+        }
+    }
+    if vulnerabilities.iter().any(|profile| profile == "ssh_root_login_enabled" || profile == "sudo_nopasswd")
+        && (username.is_none() || credentials.is_empty())
+    {
+        return Err(AppError::invalid("High root login and sudo_nopasswd require SSH credentials"));
+    }
+    hf_core::validate_bait_files(&baits).map_err(AppError::invalid)?;
+    for bait in &baits {
+        let path = bait.path.as_deref().ok_or_else(|| AppError::invalid("High bait needs a file path"))?;
+        let allowed = path.starts_with("/srv/") || path.starts_with("/opt/")
+            || path.starts_with("/var/backups/")
+            || username.as_ref().is_some_and(|name| path.starts_with(&format!("/home/{name}/")));
+        if bait.kind == BaitKind::Account || bait.implementation.is_some_and(|kind| kind != BaitImplementation::VirtualFile)
+            || !allowed
+        {
+            return Err(AppError::invalid("Linux High supports file baits under /srv, /opt, /var/backups or its SSH user's home"));
+        }
+    }
+    Ok(HighGuestConfig { hostname, username, ssh_credentials: credentials, vulnerability_profiles: vulnerabilities, baits })
+}
+
+fn valid_login(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes.next().is_some_and(|first| first.is_ascii_lowercase() || first == b'_')
+        && value.len() <= 32
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-')
 }
 
 fn deployment_profile(config: &Value) -> Result<HighOsProfile, AppError> {
@@ -236,5 +323,6 @@ pub fn deployment_command(trap: &Trap) -> Result<AgentCommand, AppError> {
         profile: deployment_profile,
         image_source,
         runtime_mode,
+        guest: guest_config(&trap.effective_config, deployment_profile)?,
     }))
 }

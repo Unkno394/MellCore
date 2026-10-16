@@ -55,6 +55,7 @@ LIBGUESTFS_BACKEND=direct virt-customize \
   --no-network \
   --mkdir /etc/systemd/network \
   --upload "$script_dir/../guest/05-honeyforge-high.network:/etc/systemd/network/05-honeyforge-high.network" \
+  --run-command 'chown root:root /etc/systemd/network/05-honeyforge-high.network' \
   --chmod 0644:/etc/systemd/network/05-honeyforge-high.network
 cloud-localds --network-config="$recipe_dir/cloud-init/network-config" "$instance_dir/seed.iso" "$instance_dir/user-data" "$instance_dir/meta-data"
 chmod 0600 "$instance_dir/disk.qcow2" "$instance_dir/seed.iso" "$instance_dir/user-data" "$password_file"

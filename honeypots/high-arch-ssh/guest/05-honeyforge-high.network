@@ -8,5 +8,6 @@ IPv6AcceptRA=no
 LinkLocalAddressing=no
 
 [DHCPv4]
+ClientIdentifier=mac
 UseDNS=no
 UseNTP=no

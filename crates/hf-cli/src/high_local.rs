@@ -1,7 +1,7 @@
 use std::{
     fs,
     io::Read,
-    net::{SocketAddr, TcpStream},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
@@ -13,8 +13,11 @@ use anyhow::{Context, bail};
 use serde_json::Value;
 
 use crate::{
-    HighArgs, HighOs, State, atomic_write, hash_password, validate_hostname, validate_username,
+    HighArgs, HighOs, State, atomic_write, guest, hash_password, validate_hostname,
+    validate_username,
 };
+
+const HIGH_LINUX_NETWORK_CONFIG: &[u8] = b"version: 2\nrenderer: networkd\nethernets:\n  all:\n    match:\n      name: \"*\"\n    dhcp4: true\n    dhcp-identifier: mac\n";
 
 pub(super) fn ensure_prepared_image(state: &State, os: HighOs) -> anyhow::Result<PathBuf> {
     let path = PathBuf::from(os.prepared_path());
@@ -57,6 +60,14 @@ pub(super) fn ensure_prepared_image(state: &State, os: HighOs) -> anyhow::Result
     };
     let scripts = state.root.join("recipes/high-images");
     fs::create_dir_all(&scripts)?;
+    if os == HighOs::Ubuntu {
+        let bundle_script = scripts.join("build-package-bundle.sh");
+        atomic_write(
+            &bundle_script,
+            include_str!("../recipes/high-ubuntu-ssh/offline/build-package-bundle.sh").as_bytes(),
+            0o700,
+        )?;
+    }
     let script_path = scripts.join(format!("{}.sh", os_name(os)));
     atomic_write(&script_path, script.as_bytes(), 0o700)?;
     let status = Command::new("sh")
@@ -269,7 +280,7 @@ pub(super) fn prepare_prepared(state: &State, id: &str, args: &HighArgs) -> anyh
         )?;
         atomic_write(
             &instance.join("network-config"),
-            b"version: 2\nethernets:\n  all:\n    match:\n      name: \"*\"\n    dhcp4: true\n",
+            HIGH_LINUX_NETWORK_CONFIG,
             0o600,
         )?;
         let output = Command::new("cloud-localds")
@@ -324,31 +335,42 @@ pub(super) fn run_launch(
     Ok(())
 }
 
-pub(super) fn wait_guest_service(id: &str, port: u16) -> anyhow::Result<()> {
+pub(super) fn wait_guest_service(id: &str, port: u16) -> anyhow::Result<IpAddr> {
     let domain = format!("hf-high-{id}");
-    let deadline = Instant::now() + Duration::from_secs(if port == 3389 { 300 } else { 180 });
+    let timeout = Duration::from_secs(if port == 3389 { 300 } else { 180 });
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut next_report = started + Duration::from_secs(15);
+    let mut last_addresses = String::new();
+    let mut reported_diagnostics = false;
+    eprintln!("High: waiting for guest service on port {port} inside the isolated network");
     while Instant::now() < deadline {
-        let leases = Command::new("virsh")
+        let addresses = Command::new("virsh")
             .env("LIBVIRT_DEFAULT_URI", "qemu:///system")
-            .args(["domifaddr", &domain, "--source", "lease"])
+            .args(["domifaddr", &domain, "--source", "agent"])
             .output()
-            .context("cannot inspect High guest DHCP lease")?;
-        if leases.status.success() {
-            for token in String::from_utf8_lossy(&leases.stdout).split_whitespace() {
+            .context("cannot inspect High guest network interfaces")?;
+        last_addresses = String::from_utf8_lossy(&addresses.stdout).into_owned();
+        if addresses.status.success() {
+            for token in String::from_utf8_lossy(&addresses.stdout).split_whitespace() {
                 if let Some((address, _prefix)) = token.split_once('/') {
-                    if let Ok(ip) = address.parse() {
-                        let endpoint = SocketAddr::new(ip, port);
+                    if let Ok(ip) = address.parse::<Ipv4Addr>() {
+                        let octets = ip.octets();
+                        if octets[..3] != [192, 168, 252] || !(100..=200).contains(&octets[3]) {
+                            continue;
+                        }
+                        let endpoint = SocketAddr::new(IpAddr::V4(ip), port);
                         if let Ok(mut stream) =
                             TcpStream::connect_timeout(&endpoint, Duration::from_secs(2))
                         {
                             if port != 22 {
-                                return Ok(());
+                                return Ok(IpAddr::V4(ip));
                             }
                             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                             let mut banner = [0_u8; 128];
                             if let Ok(count) = stream.read(&mut banner) {
                                 if is_ssh_banner(&banner[..count]) {
-                                    return Ok(());
+                                    return Ok(IpAddr::V4(ip));
                                 }
                             }
                         }
@@ -356,11 +378,33 @@ pub(super) fn wait_guest_service(id: &str, port: u16) -> anyhow::Result<()> {
                 }
             }
         }
+        let now = Instant::now();
+        if port == 22
+            && !reported_diagnostics
+            && now.duration_since(started) >= Duration::from_secs(45)
+        {
+            reported_diagnostics = true;
+            let diagnostics = guest::diagnose_ssh(id)
+                .unwrap_or_else(|error| format!("guest SSH diagnostics unavailable: {error:#}"));
+            eprintln!(
+                "High: SSH is still unavailable; guest interfaces: {last_addresses}; {diagnostics}"
+            );
+        }
+        if now >= next_report {
+            eprintln!(
+                "High: guest service on port {port} is not ready yet ({}/{} seconds)",
+                now.duration_since(started).as_secs(),
+                timeout.as_secs()
+            );
+            next_report = now + Duration::from_secs(15);
+        }
         thread::sleep(Duration::from_secs(5));
     }
     if port == 22 {
+        let diagnostics = guest::diagnose_ssh(id)
+            .unwrap_or_else(|error| format!("guest SSH diagnostics unavailable: {error:#}"));
         bail!(
-            "High guest SSH on port 22 did not return an SSH protocol banner inside the isolated network"
+            "High guest SSH on port 22 did not return an SSH protocol banner inside the isolated network; guest interfaces: {last_addresses}; {diagnostics}"
         )
     }
     bail!("High guest service on port {port} did not become reachable inside the isolated network")
@@ -372,7 +416,7 @@ fn is_ssh_banner(banner: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_ssh_banner;
+    use super::{HIGH_LINUX_NETWORK_CONFIG, is_ssh_banner};
 
     #[test]
     fn ssh_readiness_requires_an_ssh_protocol_banner() {
@@ -380,6 +424,12 @@ mod tests {
         assert!(is_ssh_banner(b"SSH-1.99-server\r\n"));
         assert!(!is_ssh_banner(b"HTTP/1.1 200 OK\r\n"));
         assert!(!is_ssh_banner(b""));
+    }
+
+    #[test]
+    fn cloud_guests_identify_dhcp_by_unique_interface_mac() {
+        let network_config = std::str::from_utf8(HIGH_LINUX_NETWORK_CONFIG).unwrap();
+        assert!(network_config.contains("dhcp-identifier: mac"));
     }
 }
 

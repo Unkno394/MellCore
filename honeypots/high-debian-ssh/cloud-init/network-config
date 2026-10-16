@@ -1,7 +1,10 @@
-version: 1
-config:
-  - type: physical
-    name: eth0
-    mac_address: '@@MAC_ADDRESS@@'
-    subnets:
-      - type: dhcp4
+version: 2
+ethernets:
+  uplink:
+    match:
+      macaddress: '@@MAC_ADDRESS@@'
+    dhcp4: true
+    dhcp-identifier: mac
+    dhcp6: false
+    accept-ra: false
+    link-local: []

@@ -33,22 +33,14 @@ const navItems = [
 
 type SidebarProps = {
   activePage: PageName
-  permissions: string[]
   onNavigate: (page: PageName) => void
 }
 
 export default function Sidebar({
   activePage,
-  permissions,
   onNavigate,
 }: SidebarProps) {
   const [isCliPanelOpen, setIsCliPanelOpen] = useState(false)
-  const visible = (page: PageName) => {
-    if (page === 'Infrastructure') return permissions.includes('servers.view') || permissions.includes('traps.view')
-    if (page === 'Baits' || page === 'Vulnerabilities') return permissions.includes('traps.view')
-    if (page === 'LiveFeed') return permissions.includes('attacks.view')
-    return true
-  }
   return (
     <aside className="flex w-60 shrink-0 flex-col border-r border-white/10 bg-[#100a09]/85 p-5 backdrop-blur-xl">
       <div className="mb-10 flex items-center gap-3">
@@ -72,7 +64,7 @@ export default function Sidebar({
       </div>
 
       <nav className="flex flex-col gap-1">
-        {navItems.filter((item) => visible(item.page)).map((item) => {
+        {navItems.map((item) => {
           const isActive = item.page === activePage
           const Icon = item.icon
 

@@ -28,7 +28,7 @@ for command in apt-get dpkg; do command -v "$command" >/dev/null; done
   echo 'HF_HIGH_ERROR code=OFFLINE_BUNDLE_ARCH_UNSUPPORTED stage=installation: Ubuntu offline packages require an amd64 host' >&2
   exit 1
 }
-keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+keyring=${HF_UBUNTU_ARCHIVE_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}
 [ -r "$keyring" ] || {
   echo "HF_HIGH_ERROR code=OFFLINE_BUNDLE_TRUST_MISSING stage=installation: trusted Ubuntu archive keyring is unavailable at $keyring" >&2
   exit 1

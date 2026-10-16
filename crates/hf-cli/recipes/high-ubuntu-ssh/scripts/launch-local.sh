@@ -123,16 +123,19 @@ if [ "$guest_os" != windows ]; then
       exit 1
     }
     if ! LIBGUESTFS_BACKEND=direct virt-customize -a "$instance_dir/disk.qcow2" --no-network \
+      --touch /etc/cloud/cloud-init.disabled \
       --mkdir /etc/systemd/network \
       --upload "$instance_dir/05-honeyforge-high.network:/etc/systemd/network/05-honeyforge-high.network" \
-      --run-command 'test -x /usr/bin/qemu-ga' \
+      --run-command 'chown root:root /etc/systemd/network/05-honeyforge-high.network && chmod 0644 /etc/systemd/network/05-honeyforge-high.network' \
+      --run-command 'test -x /usr/sbin/qemu-ga || test -x /usr/bin/qemu-ga' \
+      --run-command 'systemctl --root=/ mask systemd-time-wait-sync.service' \
       --run-command 'systemctl --root=/ enable qemu-guest-agent.service systemd-networkd.service sshd.service'; then
       echo 'could not prepare Arch guest disk; verify qemu-guest-agent is installed and systemd can enable qemu-guest-agent, systemd-networkd and sshd' >&2
       exit 1
     fi
   else
     if ! LIBGUESTFS_BACKEND=direct virt-customize -a "$instance_dir/disk.qcow2" --no-network \
-      --run-command 'test -x /usr/bin/qemu-ga' \
+      --run-command 'test -x /usr/sbin/qemu-ga || test -x /usr/bin/qemu-ga' \
       --run-command 'systemctl --root=/ enable qemu-guest-agent.service'; then
       echo "could not prepare $guest_os guest disk; qemu-guest-agent must be installed and its systemd unit must be enableable before VM launch" >&2
       exit 1

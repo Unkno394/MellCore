@@ -45,14 +45,8 @@ grep -q '@@[A-Z0-9_][A-Z0-9_]*@@' "$instance_dir/meta-data" "$instance_dir/netwo
   exit 1
 }
 qemu-img create -f qcow2 -F qcow2 -b "$base_image" "$instance_dir/disk.qcow2" 20G
-# Debian's official genericcloud image deliberately omits qemu-guest-agent.  The High guest is
-# isolated and cannot use apt after boot, so install both host integration and audit collection
-# into this disposable overlay.  virt-customize uses Debian's signed package repositories; the
-# verified backing image remains read-only and is never passed to libguestfs.
-LIBGUESTFS_BACKEND=direct virt-customize \
-  -a "$instance_dir/disk.qcow2" \
-  --network \
-  --install qemu-guest-agent,auditd
+# The verified base already contains qemu-guest-agent and auditd. The isolated overlay
+# never needs package mirrors or DNS during first boot.
 cloud-localds --network-config="$instance_dir/network-config" "$instance_dir/seed.iso" "$instance_dir/user-data" "$instance_dir/meta-data"
 printf '%s\n' "$guest_mac" > "$instance_dir/mac-address"
 chmod 0600 "$instance_dir/disk.qcow2" "$instance_dir/seed.iso" "$instance_dir/network-config" "$instance_dir/mac-address" "$instance_dir/user-data" "$password_file"

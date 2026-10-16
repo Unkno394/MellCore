@@ -11,8 +11,6 @@ type Props = { api: MellCoreApi; profiles: Profile[]; servers: Server[]; traps: 
 
 class ConfirmedTrapActionFailure extends Error {}
 
-const shellArg = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
-
 export default function CreateHoneypot({ api, profiles, servers, traps, readOnly, onCreated, notify, dismissToast }: Props) {
   const availableServers = servers
   const supported = useMemo(() => {
@@ -46,15 +44,10 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
   const [highCustomIsoOs, setHighCustomIsoOs] = useState<'ubuntu' | 'debian' | 'arch' | 'windows'>('ubuntu')
   const [highIsoFile, setHighIsoFile] = useState<File | null>(null)
   const [highRuntimeMode, setHighRuntimeMode] = useState<'public_kvm' | 'private_tcg_test'>('public_kvm')
-  const [localHighHostname, setLocalHighHostname] = useState('web-01')
-  const [localHighUsername, setLocalHighUsername] = useState('admin')
-  const [localHighShell, setLocalHighShell] = useState<'bash' | 'sh' | 'zsh'>('bash')
-  const [localHighPasswordFile, setLocalHighPasswordFile] = useState('/root/hf-password')
-  const [localHighImage, setLocalHighImage] = useState('/srv/iso/ubuntu-server.iso')
-  const [localHighSource, setLocalHighSource] = useState<'prepared' | 'iso'>('prepared')
-  const [localHighOs, setLocalHighOs] = useState<'ubuntu' | 'debian' | 'arch' | 'windows'>('ubuntu')
-  const [localHighBait, setLocalHighBait] = useState('')
-  const [localHighVulnerability, setLocalHighVulnerability] = useState('')
+  const [highHostname, setHighHostname] = useState('web-01')
+  const [highUsername, setHighUsername] = useState('admin')
+  const [highSshAuthMode, setHighSshAuthMode] = useState<MiddleSshAuthMode>('realistic')
+  const [highSshCredentials, setHighSshCredentials] = useState<SshCredential[]>(() => chooseDefaultSshCredentials('admin').slice(0, 1))
   const [hostPort, setHostPort] = useState<number | null>(null)
   const manualPort = useRef(false)
   const [sharedPort, setSharedPort] = useState<number | null>(null)
@@ -196,6 +189,15 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
         return
       }
     }
+    if (profile.honeypot_type === 'high_vm' && profile.service_type === 'ssh' && highUsername.trim() === 'root') return setError('Для High выберите обычного пользователя; root нельзя использовать как имя SSH-пользователя.')
+    if (profile.honeypot_type === 'high_vm' && profile.service_type === 'ssh' && highSshAuthMode === 'realistic') {
+      const credentialError = validateSshCredentials(highSshCredentials, highUsername.trim())
+      if (credentialError) {
+        setError(credentialError)
+        notify('error', 'Проверьте пары SSH', credentialError)
+        return
+      }
+    }
     if (profile.honeypot_type === 'kozyavka' && lowAuthMode === 'configured' && (!lowUsername.trim() || !lowPassword)) return setError('Для Low укажите логин и пароль, которые ловушка будет принимать.')
     if (profile.honeypot_type === 'high_vm' && highImageMode === 'custom_iso' && !highIsoFile) return setError('Выберите ISO-файл для собственной установки High.')
     if (profile.honeypot_type === 'high_vm' && highImageMode === 'custom_iso' && highIsoFile && highIsoFile.size > 8 * 1024 * 1024 * 1024) return setError('Размер ISO не должен превышать 8 ГиБ.')
@@ -276,11 +278,20 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
       } : profile.honeypot_type === 'kozyavka' ? {
         auth_mode: lowAuthMode,
         credentials: lowAuthMode === 'configured' ? [{ username: lowUsername.trim(), password: lowPassword }] : [],
-      } : isCustomIso ? {
-        high_image_mode: 'custom_iso',
-        custom_iso_os: highCustomIsoOs,
-        image_source: uploadedIso,
-      } : isPrivateTcgTest ? { high_runtime_mode: 'private_tcg_test' } : {}
+      } : profile.honeypot_type === 'high_vm' ? {
+        ...(isCustomIso ? {
+          high_image_mode: 'custom_iso',
+          custom_iso_os: highCustomIsoOs,
+          image_source: uploadedIso,
+        } : {}),
+        ...(isPrivateTcgTest ? { high_runtime_mode: 'private_tcg_test' } : {}),
+        hostname: highHostname.trim(),
+        ...(profile.service_type === 'ssh' ? {
+          username: highUsername.trim(),
+          ssh_auth_mode: highSshAuthMode,
+          ssh_credentials: highSshAuthMode === 'realistic' ? withFixedSshUsername(highSshCredentials, highUsername.trim()) : [],
+        } : {}),
+      } : {}
       const ports = isPrivateTcgTest ? [] : [{ transport: 'tcp' as const, host_port: deploymentPort, target_port: isHigh ? (profile.service_type === 'rdp' ? 3389 : 22) : 2222, route_mode: 'direct' as const }]
       const input = { name, profile_id: profile.id, config, resources, desired_state: 'stopped' as const, ports }
       try {
@@ -331,6 +342,7 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
       setName('')
       setMiddleSshAuthMode('realistic')
       setMiddleSshCredentials(chooseDefaultSshCredentials(middleUsername.trim()))
+      setHighSshCredentials(chooseDefaultSshCredentials(highUsername.trim()).slice(0, 1))
       await onCreated().catch(() => undefined)
     } catch (requestError) {
       const detail = requestError instanceof ApiError ? apiErrorMessage(requestError) : requestError instanceof Error ? requestError.message : 'Неожиданная ошибка приложения.'
@@ -397,24 +409,10 @@ export default function CreateHoneypot({ api, profiles, servers, traps, readOnly
           </div>}
         </div>}
         {profile.honeypot_type === 'high_vm' && <p className="mt-3 text-xs leading-5 text-white/45">{customHighIso ? `Свой ISO: ${windowsHigh ? 'Windows через RDP' : 'Linux через SSH'} устанавливается в отдельную VM на KVM; во время установки панель будет показывать этапы скачивания, проверки, установки и настройки.` : windowsHigh ? 'Готовый образ Windows публикует RDP на отдельном порту 3389 через изолированную сеть агента.' : 'Готовые образы Linux используют SSH: публичный KVM открывает собственный порт, приватный TCG не открывает порт; события передаются в Центр через агент.'}</p>}
-        {profile.honeypot_type === 'high_vm' && <div className="mt-4 rounded-xl border border-orange-300/20 bg-orange-300/[0.04] p-4">
-          <h4 className="text-sm font-medium text-orange-100">High через локальный CLI</h4>
-          <p className="mt-1 text-xs leading-5 text-white/50">Выберите готовый образ или путь к ISO на своём Linux-сервере. Эта команда запускается локально и не подключается к Центру.</p>
-          <div className="mt-3 grid gap-3 sm:grid-cols-2">
-            <label className="text-xs text-white/70">ОС<select value={localHighOs} onChange={(event) => setLocalHighOs(event.target.value as typeof localHighOs)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2"><option value="ubuntu">Ubuntu</option><option value="debian">Debian</option><option value="arch">Arch Linux</option><option value="windows">Windows Server 2022</option></select></label>
-            <label className="text-xs text-white/70">Источник<select value={localHighSource} onChange={(event) => setLocalHighSource(event.target.value as typeof localHighSource)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2"><option value="prepared">Готовый образ HoneyForge</option><option value="iso">Свой ISO на сервере</option></select></label>
-            {localHighSource === 'iso' && <label className="text-xs text-white/70 sm:col-span-2">Путь к ISO на сервере<input value={localHighImage} onChange={(event) => setLocalHighImage(event.target.value)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs" /></label>}
-            <label className="text-xs text-white/70">Hostname<input value={localHighHostname} onChange={(event) => setLocalHighHostname(event.target.value)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs" /></label>
-            {(localHighOs !== 'windows' || localHighSource === 'prepared') && <label className="text-xs text-white/70">Пользователь {localHighOs === 'windows' ? 'Windows' : 'SSH'}<input value={localHighUsername} onChange={(event) => setLocalHighUsername(event.target.value)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs" /></label>}
-            {localHighOs !== 'windows' && <label className="text-xs text-white/70">Shell<select value={localHighShell} onChange={(event) => setLocalHighShell(event.target.value as typeof localHighShell)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2"><option value="bash">/bin/bash</option><option value="sh">/bin/sh</option><option value="zsh">/bin/zsh</option></select></label>}
-            <label className="text-xs text-white/70">Файл пароля на сервере<input value={localHighPasswordFile} onChange={(event) => setLocalHighPasswordFile(event.target.value)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs" /></label>
-            {localHighOs !== 'windows' && <label className="text-xs text-white/70">Уязвимость<select value={localHighVulnerability} onChange={(event) => setLocalHighVulnerability(event.target.value)} className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2"><option value="">Без дополнительной уязвимости</option><option value="ssh_weak_credentials">Слабый пароль SSH</option><option value="ssh_root_login_enabled">Разрешить root по SSH</option><option value="sudo_nopasswd">sudo без пароля</option></select></label>}
-            {localHighOs !== 'windows' && <label className="text-xs text-white/70 sm:col-span-2">Приманка GUEST_PATH=HOST_FILE<input value={localHighBait} onChange={(event) => setLocalHighBait(event.target.value)} placeholder="/home/admin/.env=/root/decoy.env" className="mt-1 w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs" /></label>}
-          </div>
-          <pre className="mt-3 overflow-x-auto rounded-lg bg-black/30 p-3 text-xs text-orange-100/80">{`sudo hf deploy high --os ${localHighOs}${localHighSource === 'iso' ? ` --iso ${shellArg(localHighImage)}` : ''} --port ${hostPort ?? (localHighOs === 'windows' ? 3389 : 2224)} --hostname ${shellArg(localHighHostname)}${localHighOs !== 'windows' || localHighSource === 'prepared' ? ` --username ${shellArg(localHighUsername)}` : ''}${localHighOs !== 'windows' ? ` --shell ${localHighShell}` : ''} --password-file ${shellArg(localHighPasswordFile)}${localHighOs !== 'windows' && localHighVulnerability ? ` --vulnerability ${localHighVulnerability}` : ''}${localHighOs !== 'windows' && localHighBait ? ` --bait ${shellArg(localHighBait)}` : ''}`}</pre>
-        </div>}
         {profile.honeypot_type === 'high_ubuntu_ssh' && <p className="mt-3 text-xs leading-5 text-white/45">Старый профиль фиксирован на Ubuntu Server и публичном запуске через KVM.</p>}
       </section>}
+      {profile?.honeypot_type === 'high_vm' && <section className="rounded-xl border border-white/10 bg-black/10 p-4"><h3 className="text-sm font-medium text-white/80">Параметры гостевой системы High</h3><div className="mt-4 grid gap-3 sm:grid-cols-2"><label className="text-sm text-white/70">Hostname<input required disabled={readOnly || busy} maxLength={64} pattern="[A-Za-z0-9][A-Za-z0-9.-]*" value={highHostname} onChange={(event) => setHighHostname(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-4 py-3 outline-none focus:border-orange-500/50" /></label>{profile.service_type === 'ssh' && <label className="text-sm text-white/70">Пользователь SSH<input required disabled={readOnly || busy} maxLength={32} pattern="[a-z_][a-z0-9_-]*" value={highUsername} onChange={(event) => setHighUsername(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-4 py-3 outline-none focus:border-orange-500/50" /></label>}</div></section>}
+      {profile?.honeypot_type === 'high_vm' && profile.service_type === 'ssh' && <SshAuthSettings title="Авторизация SSH High" radioName="high-ssh-auth-mode" mode={highSshAuthMode} credentials={highSshCredentials} fixedUsername={highUsername.trim()} disabled={readOnly || busy} allowAdaptive={false} maxCredentials={1} onModeChange={setHighSshAuthMode} onCredentialsChange={setHighSshCredentials}/>}
       {profile?.honeypot_type === 'pritvoryashka' && <section className="rounded-xl border border-white/10 bg-black/10 p-4"><h3 className="text-sm font-medium text-white/80">Виртуальная SSH-система Middle</h3><p className="mt-1 text-xs text-white/40">Имя ловушки используется в панели. Эти значения увидит посетитель SSH-сессии.</p><div className="mt-4 grid gap-3 sm:grid-cols-2"><label className="text-sm text-white/70">Hostname<input required disabled={readOnly || busy} maxLength={64} pattern="[A-Za-z0-9][A-Za-z0-9.-]*" value={middleHostname} onChange={(event) => setMiddleHostname(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-4 py-3 outline-none focus:border-orange-500/50" /></label><label className="text-sm text-white/70">Пользователь SSH и shell<input required disabled={readOnly || busy} maxLength={32} pattern="[a-z_][a-z0-9_-]*" value={middleUsername} onChange={(event) => setMiddleUsername(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-4 py-3 outline-none focus:border-orange-500/50" /></label></div><p className="mt-3 font-mono text-xs text-orange-100/75">{middleDistribution === 'windows' ? `PS C:\\Users\\${middleUsername || 'admin'}>` : `${middleUsername || 'admin'}@${middleHostname || 'srv-app-01'}:~$`}</p>{middleDistribution === 'windows' ? <p className="mt-2 text-xs text-white/45">Виртуальный PowerShell по SSH. RDP, WinRM и настоящие программы Windows здесь не запускаются. Linux-профили уязвимостей недоступны.</p> : <p className="mt-2 text-xs text-white/45">После создания сценарии можно выбрать на отдельной странице «Сценарии уязвимостей».</p>}</section>}
       {profile?.honeypot_type === 'pritvoryashka' && <SshAuthSettings mode={middleSshAuthMode} credentials={middleSshCredentials} fixedUsername={middleUsername.trim()} disabled={readOnly || busy} onModeChange={setMiddleSshAuthMode} onCredentialsChange={setMiddleSshCredentials}/>}
       {profile?.honeypot_type === 'kozyavka' && <section className="rounded-xl border border-white/10 bg-black/10 p-4"><h3 className="text-sm font-medium text-white/80">Авторизация SSH Low</h3><label className="mt-3 block text-sm text-white/70">Режим<select disabled={readOnly || busy} value={lowAuthMode} onChange={(event) => setLowAuthMode(event.target.value as typeof lowAuthMode)} className="mt-2 w-full rounded-lg border border-white/10 bg-[#100a09] px-4 py-3"><option value="capture_credentials">Сбор попыток: отклонять все входы</option><option value="configured">Имитация входа: принимать указанную пару</option><option value="any_password">Имитация входа: принимать любой пароль</option><option value="passwordless">Имитация входа: без пароля</option></select></label>{lowAuthMode === 'configured' && <div className="mt-3 grid gap-3 sm:grid-cols-2"><label className="text-sm text-white/70">Логин<input disabled={readOnly || busy} maxLength={32} value={lowUsername} onChange={(event) => setLowUsername(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-4 py-3"/></label><label className="text-sm text-white/70">Пароль<input disabled={readOnly || busy} maxLength={128} value={lowPassword} onChange={(event) => setLowPassword(event.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-black/20 px-4 py-3"/></label></div>}<p className="mt-3 text-xs text-white/45">При успешном входе открывается простая виртуальная оболочка. Настоящие команды сервера не выполняются.</p></section>}

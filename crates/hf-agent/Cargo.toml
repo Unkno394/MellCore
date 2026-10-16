@@ -3,15 +3,21 @@ name = "hf-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "HoneyForge host agent for managing honeypots and sending telemetry to the control center."
+readme = "README.md"
+keywords = ["honeypot", "security", "agent"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 clap.workspace = true
-hf-core = { path = "../hf-core" }
-hf-services = { path = "../hf-services" }
-kazik-protocol = { path = "../kazik-protocol" }
+hf-core.workspace = true
+hf-services.workspace = true
+kazik-protocol.workspace = true
 libc.workspace = true
 reqwest.workspace = true
 serde.workspace = true

@@ -10,6 +10,7 @@ use std::{
 };
 
 mod emergency;
+mod high_guest;
 mod high_image;
 #[cfg(unix)]
 mod high_telemetry;
@@ -763,13 +764,15 @@ impl ComposeProjectStore {
     }
 
     fn high_vm(deployment: &HighVmDeployment) -> HighVm {
-        HighVm::with_source(
+        let mut vm = HighVm::with_source(
             deployment.trap_id,
             PathBuf::from(&deployment.base_image),
             deployment.external_service_port,
             deployment.profile,
             deployment.image_source.clone(),
-        )
+        );
+        vm.guest = deployment.guest.clone();
+        vm
     }
 
     /// High runtimes created before a manifest was persisted are Ubuntu-only.  Keep their
@@ -846,6 +849,8 @@ impl ComposeProjectStore {
                 || current.deployment.profile != deployment.profile
                 || current.deployment.image_source != deployment.image_source
                 || current.deployment.runtime_mode != deployment.runtime_mode
+                || serde_json::to_value(&current.deployment.guest).ok()
+                    != serde_json::to_value(&deployment.guest).ok()
         });
         let high_manager = self.high_manager_for_deployment(&deployment);
         self.persist_materialized_deployment(&mut manifest, &deployment)?;
@@ -3483,8 +3488,20 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
     if custom_image {
         required_tools.extend(["virt-inspector", "xorriso"]);
     }
-    if profile == HighOsProfile::arch_linux_ssh() || profile == HighOsProfile::debian_ssh() {
+    if profile == HighOsProfile::arch_linux_ssh() {
         required_tools.push("virt-customize");
+    }
+    if profile == HighOsProfile::ubuntu_ssh() || profile == HighOsProfile::debian_ssh() {
+        required_tools.extend([
+            "virt-customize",
+            "virt-cat",
+            "apt-get",
+            "dpkg-deb",
+            "dhcpcd",
+        ]);
+    }
+    if profile == HighOsProfile::debian_ssh() {
+        required_tools.push("sha512sum");
     }
     // Packer and libguestfs/WIM inspection are handled by the prepared-image recipe when
     // a cache miss requires building; cached prepared QCOW2s can boot without those tools.
@@ -3532,6 +3549,9 @@ fn high_vm_package_for_tool(platform: Platform, tool: &str) -> Option<&'static s
             "python3" => Some("python3"),
             "curl" => Some("curl"),
             "cloud-localds" => Some("cloud-image-utils"),
+            "apt-get" => Some("apt"),
+            "dpkg-deb" => Some("dpkg"),
+            "dhcpcd" => Some("dhcpcd-base"),
             "xorriso" => Some("xorriso"),
             "virt-inspector" | "virt-customize" | "virt-cat" | "virt-ls" => {
                 Some("libguestfs-tools")
@@ -4256,7 +4276,7 @@ mod tests {
         standalone_high_command, validate_standalone_high_args,
     };
     use clap::Parser;
-    use hf_core::{AgentCommand, HighUbuntuDeployment, HighVmDeployment};
+    use hf_core::{AgentCommand, HighUbuntuDeployment, HighVmDeployment, HighVmRuntimeMode};
     use kazik_protocol::{AckDisposition, AgentStatus, DurableOutbox, KazikBody, KazikEnvelope};
     use std::{cell::Cell, fs, os::unix::fs::PermissionsExt};
 
@@ -4634,6 +4654,7 @@ mod tests {
                     profile: HighOsProfile::arch_linux_ssh(),
                     image_source: None,
                     runtime_mode: HighVmRuntimeMode::PublicKvm,
+                    guest: Default::default(),
                 },
                 false,
             )
@@ -4653,6 +4674,7 @@ mod tests {
             profile: HighOsProfile::windows_rdp(),
             image_source: None,
             runtime_mode: HighVmRuntimeMode::PublicKvm,
+            guest: Default::default(),
         };
         ComposeProjectStore::validate_high_deployment(&deployment, false).unwrap();
 
@@ -4682,6 +4704,7 @@ mod tests {
                 architecture: hf_core::HighImageArchitecture::X86_64,
             }),
             runtime_mode: HighVmRuntimeMode::PublicKvm,
+            guest: Default::default(),
         };
         ComposeProjectStore::validate_high_deployment(&deployment, false).unwrap();
         deployment.image_source = None;
@@ -4708,6 +4731,8 @@ mod tests {
                     format: hf_core::HighImageFormat::Iso,
                     architecture: hf_core::HighImageArchitecture::X86_64,
                 }),
+                runtime_mode: HighVmRuntimeMode::PublicKvm,
+                guest: Default::default(),
             },
             desired_state: HighDesiredState::Running,
             lifecycle_state: HighLifecycleState::Downloading,
@@ -4744,6 +4769,8 @@ mod tests {
                 external_service_port: 0,
                 profile,
                 image_source: Some(source.clone()),
+                runtime_mode: HighVmRuntimeMode::PublicKvm,
+                guest: Default::default(),
             },
             desired_state: HighDesiredState::Running,
             lifecycle_state: HighLifecycleState::Downloading,
@@ -4819,6 +4846,8 @@ mod tests {
                 external_service_port: 0,
                 profile,
                 image_source: Some(crate::high_image::approved_iso(profile).unwrap().source),
+                runtime_mode: HighVmRuntimeMode::PublicKvm,
+                guest: Default::default(),
             },
             desired_state: HighDesiredState::Running,
             lifecycle_state: HighLifecycleState::Failed,
@@ -4844,6 +4873,8 @@ mod tests {
                 external_service_port: 0,
                 profile,
                 image_source: None,
+                runtime_mode: HighVmRuntimeMode::PublicKvm,
+                guest: Default::default(),
             });
             let mut command_file = serde_json::to_value(command).unwrap();
             command_file["image_source"] = serde_json::Value::Null;

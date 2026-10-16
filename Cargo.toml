@@ -16,6 +16,7 @@ resolver = "3"
 edition = "2024"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Unkno394/MellCore"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -37,3 +38,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
 uuid = { version = "1.13", features = ["v4", "serde"] }
+hf-core = { path = "crates/hf-core", version = "0.1.0" }
+hf-services = { path = "crates/hf-services", version = "0.1.0" }
+kazik-protocol = { path = "crates/kazik-protocol", version = "0.1.0" }

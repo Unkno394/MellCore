@@ -1,6 +1,7 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeSet,
     fs,
     net::{Ipv4Addr, TcpListener},
     path::Path,
@@ -32,6 +33,8 @@ struct Target {
     weight: u8,
     proxy_protocol: bool,
     proxy_secret: Option<String>,
+    #[serde(default)]
+    high_backend: bool,
 }
 
 fn config_path(state: &State) -> std::path::PathBuf {
@@ -49,7 +52,9 @@ fn load(state: &State) -> anyhow::Result<Config> {
 }
 fn save(state: &State, config: &Config) -> anyhow::Result<()> {
     if config.listeners.is_empty() {
-        service(&["stop", UNIT])?;
+        if service_active() {
+            service(&["stop", UNIT])?;
+        }
         match fs::remove_file(config_path(state)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -57,6 +62,18 @@ fn save(state: &State, config: &Config) -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    let previous = load(state)?;
+    let previous_ports: BTreeSet<_> = previous
+        .listeners
+        .iter()
+        .map(|listener| listener.listen.as_str())
+        .collect();
+    let next_ports: BTreeSet<_> = config
+        .listeners
+        .iter()
+        .map(|listener| listener.listen.as_str())
+        .collect();
+    let listener_set_changed = previous_ports != next_ports;
     atomic_write(
         &config_path(state),
         &serde_json::to_vec_pretty(config)?,
@@ -73,10 +90,20 @@ fn save(state: &State, config: &Config) -> anyhow::Result<()> {
         exe.display(),
         config_path(state).display()
     );
-    atomic_write(&unit_path, content.as_bytes(), 0o644)?;
-    service(&["daemon-reload"])?;
-    service(&["enable", UNIT])?;
-    service(&["restart", UNIT])?;
+    let unit_changed = match fs::read(&unit_path) {
+        Ok(existing) => existing != content.as_bytes(),
+        Err(_) => true,
+    };
+    if unit_changed {
+        atomic_write(&unit_path, content.as_bytes(), 0o644)?;
+        service(&["daemon-reload"])?;
+    }
+    if !service_active() {
+        service(&["enable", UNIT])?;
+        service(&["start", UNIT])?;
+    } else if listener_set_changed || unit_changed {
+        service(&["restart", UNIT])?;
+    }
     anyhow::ensure!(
         service_active(),
         "local dispatcher did not remain active after restart"
@@ -122,8 +149,11 @@ pub fn identity(state: &State, port: u16) -> anyhow::Result<std::path::PathBuf> 
             .output()
             .context("ssh-keygen is required for shared SSH identity")?;
         anyhow::ensure!(output.status.success(), "ssh-keygen failed");
-        set_owner_and_mode(&key, 65_532, 0o600)?;
     }
+    // The same key is bind-mounted into non-root Low and root Middle containers. Keep the
+    // enclosing state/identity directories private, while allowing either container UID to read
+    // the file even when Docker user-namespace remapping translates container UIDs.
+    set_owner_and_mode(&key, 65_532, 0o644)?;
     Ok(dir)
 }
 pub fn proxy_secret() -> String {
@@ -137,6 +167,53 @@ pub fn add(
     backend_port: u16,
     requested_weight: Option<u8>,
     proxy_secret: Option<String>,
+) -> anyhow::Result<()> {
+    add_target(
+        state,
+        port,
+        Target {
+            trap_id,
+            address: format!("127.0.0.1:{backend_port}"),
+            weight: 0,
+            proxy_protocol: proxy_secret.is_some(),
+            proxy_secret,
+            high_backend: false,
+        },
+        requested_weight,
+    )
+}
+
+pub fn add_high(
+    state: &State,
+    port: u16,
+    trap_id: Uuid,
+    guest_ip: Ipv4Addr,
+    requested_weight: Option<u8>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        guest_ip.octets()[..3] == [192, 168, 252] && (100..=200).contains(&guest_ip.octets()[3]),
+        "High dispatcher backend is outside the isolated guest address pool"
+    );
+    add_target(
+        state,
+        port,
+        Target {
+            trap_id,
+            address: format!("{guest_ip}:22"),
+            weight: 0,
+            proxy_protocol: false,
+            proxy_secret: None,
+            high_backend: true,
+        },
+        requested_weight,
+    )
+}
+
+fn add_target(
+    state: &State,
+    port: u16,
+    mut new_target: Target,
+    requested_weight: Option<u8>,
 ) -> anyhow::Result<()> {
     let mut config = load(state)?;
     let listen = format!("0.0.0.0:{port}");
@@ -152,6 +229,14 @@ pub fn add(
         .iter_mut()
         .find(|l| l.listen == listen)
         .unwrap();
+    anyhow::ensure!(
+        !listener
+            .targets
+            .iter()
+            .any(|target| target.address == new_target.address),
+        "shared port already has a trap using backend {}; refusing duplicate backend address",
+        new_target.address
+    );
     if listener.targets.is_empty() && requested_weight.is_some() {
         eprintln!(
             "Первый участник общего порта получает 100%; заданный --weight начнёт учитываться при добавлении следующей ловушки."
@@ -195,13 +280,8 @@ pub fn add(
             }
         }
     }
-    listener.targets.push(Target {
-        trap_id,
-        address: format!("127.0.0.1:{backend_port}"),
-        weight,
-        proxy_protocol: proxy_secret.is_some(),
-        proxy_secret,
-    });
+    new_target.weight = weight;
+    listener.targets.push(new_target);
     save(state, &config)
 }
 pub fn remove(state: &State, trap_id: Uuid) -> anyhow::Result<()> {

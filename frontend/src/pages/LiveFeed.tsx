@@ -293,7 +293,7 @@ export default function LiveFeed({ api, events, traps, initialTrapId = null, loa
         || a.event.event_id.localeCompare(b.event.event_id))
       const eventIds = new Set(sorted.map((item) => item.event.event_id))
       const match = matches.filter((candidate) => candidate.trap_id === sorted[0].event.trap_id
-        && (candidate.evidence_event_ids.some((id) => eventIds.has(id))
+        && ((Array.isArray(candidate.evidence_event_ids) && candidate.evidence_event_ids.some((id) => eventIds.has(id)))
           || (sorted[0].event.session_id && candidate.session_key.endsWith(`:session:${sorted[0].event.session_id}`))))
         .sort((a, b) => b.similarity - a.similarity)[0] ?? null
       return {

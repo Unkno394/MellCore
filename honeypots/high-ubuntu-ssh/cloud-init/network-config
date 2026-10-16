@@ -4,6 +4,7 @@ ethernets:
     match:
       driver: virtio_net
     dhcp4: true
+    dhcp-identifier: mac
     dhcp6: false
     accept-ra: false
     link-local: []
