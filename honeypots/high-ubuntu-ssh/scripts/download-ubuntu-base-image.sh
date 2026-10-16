@@ -55,7 +55,7 @@ LIBGUESTFS_BACKEND=direct virt-cat -a "$tmpdir/$image_name" \
 }
 bundle="$tmpdir/qemu-guest-agent-bundle"
 HF_UBUNTU_ARCHIVE_KEYRING="$keyring" \
-  "$script_dir/../offline/build-package-bundle.sh" "$bundle" || {
+  sh "$script_dir/../offline/build-package-bundle.sh" "$bundle" || {
   echo 'could not download verified Ubuntu packages on the host; VM was not started' >&2
   exit 1
 }

@@ -30,6 +30,14 @@ def run(*args, input_text=None, timeout_seconds=20):
 
 
 config = json.load(sys.stdin)
+config_digest = config.get("config_digest")
+marker = pathlib.Path("/var/lib/honeyforge/high-guest-config.sha256")
+if not isinstance(config_digest, str) or len(config_digest) != 64 or any(
+    character not in "0123456789abcdef" for character in config_digest
+):
+    raise ValueError("invalid High guest config digest")
+if marker.is_file() and marker.read_text(encoding="ascii").strip() == config_digest:
+    raise SystemExit(0)
 cloud_init = shutil.which("cloud-init")
 if cloud_init and not pathlib.Path("/etc/cloud/cloud-init.disabled").exists():
     try:
@@ -121,7 +129,7 @@ if ssh_host_key:
     public_path.write_text(public_key.stdout, encoding="utf-8")
     public_path.chmod(0o644)
 
-ssh_config = pathlib.Path("/etc/ssh/sshd_config.d/90-honeyforge-local.conf")
+ssh_config = pathlib.Path("/etc/ssh/sshd_config.d/00-honeyforge-high.conf")
 ssh_config.parent.mkdir(parents=True, exist_ok=True)
 ssh_config.write_text(
     "PasswordAuthentication yes\n"
@@ -234,3 +242,7 @@ if username or password_hash or vulnerabilities or ssh_host_key:
             break
     else:
         raise RuntimeError("could not restart SSH service")
+
+marker.parent.mkdir(parents=True, exist_ok=True)
+marker.write_text(config_digest + "\n", encoding="ascii")
+marker.chmod(0o600)

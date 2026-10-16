@@ -9,13 +9,20 @@ use anyhow::{Context, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hf_core::{BaitImplementation, BaitKind, HighGuestConfig};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::sandbox::HighVm;
 
 fn qga(domain: &str, request: &Value) -> anyhow::Result<Value> {
     let output = Command::new("virsh")
         .env("LC_ALL", "C")
-        .args(["-c", "qemu:///system", "qemu-agent-command", domain, &request.to_string()])
+        .args([
+            "-c",
+            "qemu:///system",
+            "qemu-agent-command",
+            domain,
+            &request.to_string(),
+        ])
         .output()
         .context("could not call QEMU Guest Agent")?;
     ensure!(
@@ -119,6 +126,10 @@ pub fn apply(vm: &HighVm) -> anyhow::Result<()> {
         .first()
         .map(|credential| password_hash(&credential.password))
         .transpose()?;
+    let mut digest = Sha256::new();
+    digest.update(include_bytes!("high_guest_apply.py"));
+    digest.update(serde_json::to_vec(guest)?);
+    let config_digest = format!("{:x}", digest.finalize());
     let baits: Vec<_> = guest
         .baits
         .iter()
@@ -131,6 +142,7 @@ pub fn apply(vm: &HighVm) -> anyhow::Result<()> {
         "password_hash": hash,
         "vulnerabilities": guest.vulnerability_profiles,
         "baits": baits,
+        "config_digest": config_digest,
     });
     let command = json!({
         "execute": "guest-exec",

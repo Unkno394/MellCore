@@ -3492,13 +3492,7 @@ fn high_vm_required_tools(profile: HighOsProfile, custom_image: bool) -> Vec<&'s
         required_tools.push("virt-customize");
     }
     if profile == HighOsProfile::ubuntu_ssh() || profile == HighOsProfile::debian_ssh() {
-        required_tools.extend([
-            "virt-customize",
-            "virt-cat",
-            "apt-get",
-            "dpkg-deb",
-            "dhcpcd",
-        ]);
+        required_tools.extend(["virt-customize", "virt-cat", "apt-get"]);
     }
     if profile == HighOsProfile::debian_ssh() {
         required_tools.push("sha512sum");

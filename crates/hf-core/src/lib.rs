@@ -238,7 +238,10 @@ impl std::fmt::Debug for PritvoryashkaDeployment {
             .field("dispatcher_proxy_secret", &"[REDACTED]")
             .field("resources", &self.resources)
             .field("max_connections", &self.max_connections)
-            .field("baits", &format_args!("{} files [contents redacted]", self.baits.len()))
+            .field(
+                "baits",
+                &format_args!("{} files [contents redacted]", self.baits.len()),
+            )
             .field("virtual_processes", &self.virtual_processes)
             .field("vulnerability_profiles", &self.vulnerability_profiles)
             .field("endpoints", &self.endpoints)

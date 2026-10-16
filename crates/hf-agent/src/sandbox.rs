@@ -667,13 +667,24 @@ impl LibvirtSandboxManager {
             }
             ReconcileAction::Start => {
                 self.virsh(&["start", &format!("hf-high-{}", vm.instance_id)])?;
+                if vm.profile.guest_os != HighGuestOs::Windows {
+                    crate::high_guest::apply(vm)?;
+                }
                 self.prepare_access_and_wait(vm)
             }
             ReconcileAction::Resume => {
                 self.virsh(&["resume", &format!("hf-high-{}", vm.instance_id)])?;
+                if vm.profile.guest_os != HighGuestOs::Windows {
+                    crate::high_guest::apply(vm)?;
+                }
                 self.prepare_access_and_wait(vm)
             }
-            ReconcileAction::Verify => self.prepare_access_and_wait(vm),
+            ReconcileAction::Verify => {
+                if vm.profile.guest_os != HighGuestOs::Windows {
+                    crate::high_guest::apply(vm)?;
+                }
+                self.prepare_access_and_wait(vm)
+            }
         }
     }
 

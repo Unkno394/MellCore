@@ -20,6 +20,7 @@ export default function HighGuestSettings({ api, traps, readOnly, onChanged, mod
   const [name, setName] = useState('')
   const [path, setPath] = useState('')
   const [content, setContent] = useState('')
+  const [editingId, setEditingId] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
@@ -29,6 +30,8 @@ export default function HighGuestSettings({ api, traps, readOnly, onChanged, mod
     setEnabled(Array.isArray(selected?.effective_config.vulnerability_profiles) ? selected.effective_config.vulnerability_profiles as string[] : [])
     setMessage('')
     setError('')
+    setEditingId(null)
+    setName(''); setPath(''); setContent('')
   }, [selected?.trap_id, selected?.version])
 
   async function save(config: Record<string, unknown>) {
@@ -70,14 +73,15 @@ export default function HighGuestSettings({ api, traps, readOnly, onChanged, mod
       setError('Путь должен находиться в /srv, /opt, /var/backups или домашнем каталоге SSH-пользователя.')
       return
     }
-    if (!name.trim() || !content || new TextEncoder().encode(content).length > 4096 || draft.length >= 32
-      || draft.some((bait) => bait.path === trimmedPath)) {
+    if (!name.trim() || new TextEncoder().encode(name.trim()).length > 80 || !content
+      || new TextEncoder().encode(content).length > 4096 || (!editingId && draft.length >= 32)
+      || draft.some((bait) => bait.path === trimmedPath && bait.id !== editingId)) {
       setError('Укажи уникальный путь, название и содержимое до 4096 байт; максимум 32 файла.')
       return
     }
-    setDraft([...draft, { id: crypto.randomUUID(), name: name.trim(), path: trimmedPath,
+    setDraft([...draft.filter((bait) => bait.id !== editingId), { id: editingId ?? crypto.randomUUID(), name: name.trim(), path: trimmedPath,
       content, category: 'file', implementation: 'virtual_file', config: {} }])
-    setName(''); setPath(''); setContent(''); setError('')
+    setEditingId(null); setName(''); setPath(''); setContent(''); setError('')
   }
 
   return <section className="space-y-4 rounded-xl border border-orange-300/20 bg-orange-300/[0.035] p-4 sm:p-5">
@@ -93,8 +97,8 @@ export default function HighGuestSettings({ api, traps, readOnly, onChanged, mod
       <input type="checkbox" disabled={readOnly || busy} checked={enabled.includes(profile.id)} onChange={(event) => setEnabled((current) => event.target.checked ? [...current, profile.id] : current.filter((id) => id !== profile.id))}/>{profile.label}
     </label>)}</div>}
     {selected && mode === 'baits' && <div className="space-y-3">
-      {draft.map((bait) => <div key={bait.id} className="flex items-center justify-between gap-3 rounded-lg border border-white/10 p-3 text-sm"><span>{bait.name} · {bait.path}</span><button disabled={readOnly || busy} type="button" onClick={() => setDraft((current) => current.filter((item) => item.id !== bait.id))}>Удалить</button></div>)}
-      {!readOnly && <div className="grid gap-2"><input value={name} onChange={(event) => setName(event.target.value)} placeholder="Название" className="rounded-lg border border-white/10 bg-[#100a09] px-3 py-2"/><input value={path} onChange={(event) => setPath(event.target.value)} placeholder="/opt/backup/.env" className="rounded-lg border border-white/10 bg-[#100a09] px-3 py-2"/><textarea value={content} onChange={(event) => setContent(event.target.value)} placeholder="Содержимое файла" className="rounded-lg border border-white/10 bg-[#100a09] px-3 py-2"/><button type="button" onClick={addBait} disabled={busy} className="justify-self-start text-orange-200">Добавить файл</button></div>}
+      {draft.map((bait) => <div key={bait.id} className="flex items-center justify-between gap-3 rounded-lg border border-white/10 p-3 text-sm"><span>{bait.name} · {bait.path}</span><span className="flex gap-3"><button disabled={readOnly || busy} type="button" onClick={() => { setEditingId(bait.id); setName(bait.name); setPath(bait.path ?? ''); setContent(bait.content) }}>Изменить</button><button disabled={readOnly || busy} type="button" onClick={() => setDraft((current) => current.filter((item) => item.id !== bait.id))}>Удалить</button></span></div>)}
+      {!readOnly && <div className="grid gap-2"><input value={name} onChange={(event) => setName(event.target.value)} placeholder="Название" className="rounded-lg border border-white/10 bg-[#100a09] px-3 py-2"/><input value={path} onChange={(event) => setPath(event.target.value)} placeholder="/opt/backup/.env" className="rounded-lg border border-white/10 bg-[#100a09] px-3 py-2"/><textarea value={content} onChange={(event) => setContent(event.target.value)} placeholder="Содержимое файла" className="rounded-lg border border-white/10 bg-[#100a09] px-3 py-2"/><button type="button" onClick={addBait} disabled={busy} className="justify-self-start text-orange-200">{editingId ? 'Обновить файл' : 'Добавить файл'}</button></div>}
     </div>}
     {selected && !readOnly && <button type="button" disabled={busy} onClick={() => void save(mode === 'baits' ? { baits: draft } : { vulnerability_profiles: enabled })} className="rounded-lg bg-orange-400 px-4 py-2 text-sm font-medium text-black disabled:opacity-40">{busy ? 'Сохраняем…' : 'Сохранить High'}</button>}
     {error && <p role="alert" className="text-sm text-red-200">{error}</p>}
